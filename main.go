@@ -45,8 +45,7 @@ type RateLimiter struct {
 }
 
 var billablePaths = map[string]bool{
-	"/api/execute-nft": true,
-	"/api/deploy-nft":  true,
+	"/rubix/v1/tx": true,
 }
 
 func isBillable(path string) bool {
@@ -174,6 +173,15 @@ func (rl *RateLimiter) adminAddUser(c *gin.Context) {
 	c.JSON(200, gin.H{"api_key": apiKey})
 }
 
+func (rl *RateLimiter) isNFTDeploy(nftID string) (bool, error) {
+	var count int
+	err := rl.db.QueryRow(`SELECT COUNT(1) FROM nfts WHERE nft_id = ?`, nftID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
 func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 	r := c.Request
 	w := c.Writer
@@ -213,62 +221,64 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 	agentDescription := r.Header.Get(agentDescriptionHeader)
 	agentRepo := r.Header.Get(agentRepoHeader)
 
-	// SPECIAL HANDLING: For /api/deploy-nft, extract and store NFT info
-	if strings.Contains(path, "/api/deploy-nft") && r.Method == http.MethodPost {
-		// Read and buffer the body
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, Response{
-				Status:  false,
-				Message: "failed to read request body",
-			})
-			return
-		}
-		r.Body.Close()
+	
+	// Extract Remote name and info
+	// Read and buffer the body
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
+		return
+	}
+	r.Body.Close()
 
-		// Reconstruct body for proxying downstream
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	// Reconstruct body for proxying downstream
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
-		// Parse NFT payload
-		var payload nftPayload
-		if err := json.Unmarshal(bodyBytes, &payload); err == nil {
-			// Extract agent_name from nftData
-			agentName := extractHostAgentName(payload.NFTData)
-			// Store in nfts table with email foreign key
-			if err := rl.storeNFT(user.Email, payload.NFT, agentName, payload.DID, agentDescription, agentRepo); err != nil {
-				log.Printf("Failed to store NFT for %s: %v", user.Email, err)
-				c.JSON(http.StatusInternalServerError, Response{
-					Status:  false,
-					Message: fmt.Sprintf("failed to store NFT: %v", err),
-				})
-				return
-			}
-		}
+	// Parse NFT payload
+	var payload txPayload
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Status:  false,
+			Message: "failed to unmarshal payload for Execute NFT API",
+		})
+		return
 	}
 
-	if strings.Contains(path, "/api/execute-nft") && r.Method == http.MethodPost {
-		// Extract Remote name and info
-		// Read and buffer the body
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
-			return
-		}
-		r.Body.Close()
+	// Extract NFT payload
+	var nftPayloadInfo NFTInfo
+	if len(payload.Tokens.NFT) != 0 {
+		nftPayloadInfo = payload.Tokens.NFT[0]
+	} else {
+		c.JSON(http.StatusInternalServerError, Response{
+			Status:  false,
+			Message: fmt.Sprintf("proxyhandler: no nft data present in tx body"),
+		})
+		return 
+	}
+	
+	// Check if the NFT is getting deployed or executed
+	isNFTDeploy, err := rl.isNFTDeploy(nftPayloadInfo.NFTId)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Status:  false,
+			Message: fmt.Sprintf("failed to check if NFT is deployed: %v", err),
+		})
+		return
+	}
 
-		// Reconstruct body for proxying downstream
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-		// Parse NFT payload
-		var payload nftPayload
-		if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+	if isNFTDeploy {
+		// Extract agent_name from nftData
+		agentName := extractHostAgentName(nftPayloadInfo.Data)
+		// Store in nfts table with email foreign key
+		if err := rl.storeNFT(user.Email, nftPayloadInfo.NFTId, agentName, payload.Initiator, agentDescription, agentRepo); err != nil {
+			log.Printf("Failed to store NFT for %s: %v", user.Email, err)
 			c.JSON(http.StatusInternalServerError, Response{
 				Status:  false,
-				Message: "failed to unmarshal payload for Execute NFT API",
+				Message: fmt.Sprintf("failed to store NFT: %v", err),
 			})
 			return
 		}
-
+	} else {
 		// Store remote info
 		remoteInfoList, err := extractRemoteInfo(payload)
 		if err != nil {
@@ -305,7 +315,7 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 			return
 		}
 
-		 if err := rl.storeInteractions(interactionList); err != nil {
+		if err := rl.storeInteractions(interactionList); err != nil {
 			c.JSON(http.StatusInternalServerError, Response{
 				Status:  false,
 				Message: fmt.Sprintf("failed to store agent interactions, err: %v", err),
@@ -367,7 +377,7 @@ func (rl *RateLimiter) getBalanceCredits(c *gin.Context) {
 	email := c.Query("email")
 	if email == "" {
 		c.JSON(400, Response{
-			Status: false,
+			Status:  false,
 			Message: "email is required",
 		})
 		return
@@ -438,17 +448,6 @@ func (rl *RateLimiter) storeNFT(email, nftID, nftName, nftDID, agentDescription,
 	return err
 }
 
-// nftPayload models the deploy-nft request body.
-type nftPayload struct {
-	NFT         string  `json:"nft"`
-	DID         string  `json:"did"`
-	QuorumType  int     `json:"quorum_type"`
-	NFTValue    float64 `json:"nft_value"`
-	NFTData     string  `json:"nft_data"`
-	NFTMetadata string  `json:"nft_metadata"`
-	NFTFileName string  `json:"nft_file_name"`
-}
-
 // agentInteraction stores the interaction information between agent
 // and other agents, tools, etc
 type agentInteraction struct {
@@ -479,14 +478,14 @@ func (rl *RateLimiter) storeInteractions(interactionList []*agentInteraction) er
 		return fmt.Errorf("storeInteractions: failed to begin transaction, err: %v", err)
 	}
 	defer tx.Rollback()
-	
+
 	for _, interaction := range interactionList {
 		_, err := tx.Exec(`
 			INSERT INTO interaction(host_id, host_did, host_name, remote_did, remote_name, intrusion_cause, epoch)
 			VALUES(?, ?, ?, ?, ?, ?, ?)
 		`, interaction.HostID, interaction.HostDID, interaction.HostName, interaction.RemoteDID,
 			interaction.RemoteName, interaction.IntrusionCause, interaction.Epoch)
-		
+
 		if err != nil {
 			return fmt.Errorf("storeInteractions: failed to execute query, err: %v", err)
 		}
@@ -498,7 +497,6 @@ func (rl *RateLimiter) storeInteractions(interactionList []*agentInteraction) er
 
 	return nil
 }
-
 
 func (rl *RateLimiter) getInteractions(c *gin.Context) {
 	w := http.ResponseWriter(c.Writer)
@@ -540,7 +538,7 @@ func (rl *RateLimiter) getInteractions(c *gin.Context) {
 
 	c.JSON(200, Response{
 		Status: true,
-		Data: agentInteractions,
+		Data:   agentInteractions,
 	})
 }
 
@@ -551,7 +549,7 @@ func (rl *RateLimiter) getToolInteractionsByDID(c *gin.Context) {
 	toolDID := c.Param("did")
 	if toolDID == "" {
 		c.JSON(400, Response{
-			Status: false,
+			Status:  false,
 			Message: "did is required",
 		})
 		return
@@ -593,7 +591,7 @@ func (rl *RateLimiter) getToolInteractionsByDID(c *gin.Context) {
 
 	c.JSON(200, Response{
 		Status: true,
-		Data: agentInteractions,
+		Data:   agentInteractions,
 	})
 }
 
@@ -707,7 +705,7 @@ func (rl *RateLimiter) getEcosystemMetricsByEmail(c *gin.Context) {
 	email := c.Param("email")
 	if email == "" {
 		c.JSON(400, Response{
-			Status: false,
+			Status:  false,
 			Message: "email is required",
 		})
 		return
@@ -719,7 +717,7 @@ func (rl *RateLimiter) getEcosystemMetricsByEmail(c *gin.Context) {
 	)
 	if err != nil {
 		c.JSON(500, Response{
-			Status: false,
+			Status:  false,
 			Message: fmt.Sprintf("failed to fetch agents from email: %v", email),
 		})
 		return
@@ -731,7 +729,7 @@ func (rl *RateLimiter) getEcosystemMetricsByEmail(c *gin.Context) {
 		var nftID string
 		if err := rows.Scan(&nftID); err != nil {
 			c.JSON(500, Response{
-				Status: false,
+				Status:  false,
 				Message: fmt.Sprintf("failed to scan agents from email: %v", email),
 			})
 			return
@@ -745,10 +743,10 @@ func (rl *RateLimiter) getEcosystemMetricsByEmail(c *gin.Context) {
 		totalInteractionClause := "(" + strings.Repeat("?,", len(agents)-1) + "?)"
 
 		// total_interactions
-		totalInteractionsRows, err := rl.db.Query("SELECT COUNT(*) from interaction WHERE host_id IN "+ totalInteractionClause, agents...)
+		totalInteractionsRows, err := rl.db.Query("SELECT COUNT(*) from interaction WHERE host_id IN "+totalInteractionClause, agents...)
 		if err != nil {
 			c.JSON(500, Response{
-				Status: false,
+				Status:  false,
 				Message: fmt.Sprintf("failed to fetch total interactions for email: %v", email),
 			})
 			return
@@ -758,7 +756,7 @@ func (rl *RateLimiter) getEcosystemMetricsByEmail(c *gin.Context) {
 		if totalInteractionsRows.Next() {
 			if err := totalInteractionsRows.Scan(&totalInteractions); err != nil {
 				c.JSON(500, Response{
-					Status: false,
+					Status:  false,
 					Message: fmt.Sprintf("failed to scan total interactions for email: %v", email),
 				})
 				return
@@ -773,7 +771,7 @@ func (rl *RateLimiter) getEcosystemMetricsByEmail(c *gin.Context) {
 		totalIntrusionsRows, err := rl.db.Query("SELECT COUNT(*) from interaction where host_id IN "+placeholderTotalIntrusions+" AND intrusion_cause != ''", agents...)
 		if err != nil {
 			c.JSON(500, Response{
-				Status: false,
+				Status:  false,
 				Message: fmt.Sprintf("failed to fetch total intrusions for email: %v", email),
 			})
 			return
@@ -783,7 +781,7 @@ func (rl *RateLimiter) getEcosystemMetricsByEmail(c *gin.Context) {
 		if totalIntrusionsRows.Next() {
 			if err := totalIntrusionsRows.Scan(&totalIntrusions); err != nil {
 				c.JSON(500, Response{
-					Status: false,
+					Status:  false,
 					Message: fmt.Sprintf("failed to scan total intrusions for email: %v", email),
 				})
 				return
@@ -797,10 +795,10 @@ func (rl *RateLimiter) getEcosystemMetricsByEmail(c *gin.Context) {
 	var totalInteractedTools int = 0
 	if len(agents) > 0 {
 		placeholderInteractedTools := "(" + strings.Repeat("?,", len(agents)-1) + "?)"
-		interactedToolsRows, err := rl.db.Query("SELECT COUNT(*) FROM (SELECT DISTINCT remote_did AS tools FROM interaction WHERE host_id IN "+placeholderInteractedTools +") AS t", agents...)
+		interactedToolsRows, err := rl.db.Query("SELECT COUNT(*) FROM (SELECT DISTINCT remote_did AS tools FROM interaction WHERE host_id IN "+placeholderInteractedTools+") AS t", agents...)
 		if err != nil {
 			c.JSON(500, Response{
-				Status: false,
+				Status:  false,
 				Message: fmt.Sprintf("failed to fetch interacted tools for email: %v, err: %v", email, err),
 			})
 			return
@@ -810,7 +808,7 @@ func (rl *RateLimiter) getEcosystemMetricsByEmail(c *gin.Context) {
 		if interactedToolsRows.Next() {
 			if err := interactedToolsRows.Scan(&totalInteractedTools); err != nil {
 				c.JSON(500, Response{
-					Status: false,
+					Status:  false,
 					Message: fmt.Sprintf("failed to scan interacted tools for email: %v", email),
 				})
 				return
@@ -829,8 +827,6 @@ func (rl *RateLimiter) getEcosystemMetricsByEmail(c *gin.Context) {
 	})
 }
 
-
-
 func (rl *RateLimiter) getUserAgents(c *gin.Context) {
 	w := http.ResponseWriter(c.Writer)
 	enableCors(&w)
@@ -838,19 +834,19 @@ func (rl *RateLimiter) getUserAgents(c *gin.Context) {
 	email := c.Param("email")
 	if email == "" {
 		c.JSON(400, Response{
-			Status: false,
+			Status:  false,
 			Message: "did is required",
 		})
 		return
 	}
-	
+
 	rows, err := rl.db.Query(
 		`SELECT nft_id FROM nfts WHERE email = ?`,
 		email,
 	)
 	if err != nil {
 		c.JSON(500, Response{
-			Status: false,
+			Status:  false,
 			Message: fmt.Sprintf("failed to fetch agents from email: %v", email),
 		})
 		return
@@ -862,7 +858,7 @@ func (rl *RateLimiter) getUserAgents(c *gin.Context) {
 		var nftID string
 		if err := rows.Scan(&nftID); err != nil {
 			c.JSON(500, Response{
-				Status: false,
+				Status:  false,
 				Message: fmt.Sprintf("failed to fetch agents from email: %v", email),
 			})
 			return
@@ -884,7 +880,7 @@ func (rl *RateLimiter) getUserAgents(c *gin.Context) {
 	userAgentsRow, err := rl.db.Query("SELECT * from interaction WHERE host_id IN "+totalInteractionClause+" ORDER BY epoch DESC", agents...)
 	if err != nil {
 		c.JSON(500, Response{
-			Status: false,
+			Status:  false,
 			Message: fmt.Sprintf("failed to fetch user's interaction by email: %v, err: %v", email, err),
 		})
 		return
@@ -916,7 +912,7 @@ func (rl *RateLimiter) getUserAgents(c *gin.Context) {
 
 	c.JSON(200, Response{
 		Status: true,
-		Data: agentInteractions,
+		Data:   agentInteractions,
 	})
 }
 
@@ -927,7 +923,7 @@ func (rl *RateLimiter) getAgentInteractionsByDID(c *gin.Context) {
 	agentDID := c.Param("did")
 	if agentDID == "" {
 		c.JSON(400, Response{
-			Status: false,
+			Status:  false,
 			Message: "did is required",
 		})
 		return
@@ -969,16 +965,16 @@ func (rl *RateLimiter) getAgentInteractionsByDID(c *gin.Context) {
 
 	c.JSON(200, Response{
 		Status: true,
-		Data: agentInteractions,
+		Data:   agentInteractions,
 	})
 }
 
 type agentInteractionMetric struct {
-	AgentName string `json:"agent_name"`
-	AgentDid string `json:"agent_did"`
-	TotatInteractions int `json:"total_interactions"`
-	TotalIntrusions int `json:"total_intrusions"`
-	ToolsInteracted int `json:"tools_interacted"`
+	AgentName         string `json:"agent_name"`
+	AgentDid          string `json:"agent_did"`
+	TotatInteractions int    `json:"total_interactions"`
+	TotalIntrusions   int    `json:"total_intrusions"`
+	ToolsInteracted   int    `json:"tools_interacted"`
 }
 
 func (rl *RateLimiter) getAgentInteractions(c *gin.Context) {
@@ -1039,26 +1035,26 @@ func (rl *RateLimiter) getAgentInteractions(c *gin.Context) {
 		}
 
 		agentInteractions = append(agentInteractions, &agentInteractionMetric{
-			AgentName: agentName,
-			AgentDid:  agentDid,
-			TotalIntrusions: totalIntrusions,
-			ToolsInteracted: toolsIntracted,
+			AgentName:         agentName,
+			AgentDid:          agentDid,
+			TotalIntrusions:   totalIntrusions,
+			ToolsInteracted:   toolsIntracted,
 			TotatInteractions: totalInteractions,
 		})
 	}
 
 	c.JSON(200, Response{
 		Status: true,
-		Data: agentInteractions,
+		Data:   agentInteractions,
 	})
 }
 
 type toolInteractionMetric struct {
-	ToolName string `json:"tool_name"`
-	ToolDid string `json:"tool_did"`
-	TotalInteractions int `json:"total_interactions"`
-	TotalIntrusions int `json:"total_intrusions"`
-	AgentsInteracted int `json:"agents_interacted"`
+	ToolName          string `json:"tool_name"`
+	ToolDid           string `json:"tool_did"`
+	TotalInteractions int    `json:"total_interactions"`
+	TotalIntrusions   int    `json:"total_intrusions"`
+	AgentsInteracted  int    `json:"agents_interacted"`
 }
 
 func (rl *RateLimiter) getToolsInteractions(c *gin.Context) {
@@ -1117,17 +1113,17 @@ func (rl *RateLimiter) getToolsInteractions(c *gin.Context) {
 		}
 
 		toolInteractions = append(toolInteractions, &toolInteractionMetric{
-			ToolName: toolName,
-			ToolDid: toolDid,
+			ToolName:          toolName,
+			ToolDid:           toolDid,
 			TotalInteractions: totalInteractions,
-			TotalIntrusions: totalIntrusions,
-			AgentsInteracted: agentsInteracted,
+			TotalIntrusions:   totalIntrusions,
+			AgentsInteracted:  agentsInteracted,
 		})
 	}
 
 	c.JSON(200, Response{
 		Status: true,
-		Data: toolInteractions,
+		Data:   toolInteractions,
 	})
 }
 
@@ -1150,9 +1146,9 @@ func main() {
 	r.GET("/tools", rl.getToolsInteractions)
 	r.GET("/metrics", rl.getEcosystemMetrics)
 	r.GET("/metrics/:email", rl.getEcosystemMetricsByEmail)
-	
+
 	// Proxy Rubix related endpoints
-	api := r.Group("/api")
+	api := r.Group("/rubix")
 	api.Any("/*path", rl.proxyHandler)
 
 	log.Printf("Starting on :%s", serverPort)

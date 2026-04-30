@@ -30,8 +30,15 @@ type remoteInfo struct {
 	Did  string `json:"did"`
 }
 
-func extractRemoteInfo(payload nftPayload) ([]*remoteInfo, error) {
-	normalized := strings.ReplaceAll(payload.NFTData, "'", "\"")
+func extractRemoteInfo(payload txPayload) ([]*remoteInfo, error) {
+	var nftPayloadInfo NFTInfo
+	if len(payload.Tokens.NFT) != 0 {
+		nftPayloadInfo = payload.Tokens.NFT[0]
+	} else {
+		return nil, fmt.Errorf("extractRemoteInfo: no nft data present in tx body")
+	}
+	
+	normalized := strings.ReplaceAll(nftPayloadInfo.Data, "'", "\"")
 
 	var obj map[string]interface{}
 	if err := json.Unmarshal([]byte(normalized), &obj); err != nil {
@@ -86,13 +93,21 @@ func extractRemoteInfo(payload nftPayload) ([]*remoteInfo, error) {
 	return remoteInfoList, nil
 }
 
-func extractAgentInteractions(payload nftPayload, db *sql.DB) ([]*agentInteraction, error) {
+func extractAgentInteractions(payload txPayload, db *sql.DB) ([]*agentInteraction, error) {
 	var interactionList []*agentInteraction = make([]*agentInteraction, 0)
 
-	agentID := payload.NFT
+	// Extract info from payload
+	var nftPayloadInfo NFTInfo
+	if len(payload.Tokens.NFT) == 0 {
+		nftPayloadInfo = payload.Tokens.NFT[0]
+	} else {
+		return nil, fmt.Errorf("extractAgentInteractions: no nft data present in tx body")
+	}
+
+	agentID := nftPayloadInfo.NFTId
 	epoch := time.Now().Unix()
 
-	normalized := strings.ReplaceAll(payload.NFTData, "'", "\"")
+	normalized := strings.ReplaceAll(nftPayloadInfo.Data, "'", "\"")
 	var obj map[string]interface{}
 	if err := json.Unmarshal([]byte(normalized), &obj); err != nil {
 		return nil, fmt.Errorf("extractAgentInteractions: failed to unmarshall nft data, err: %v", err)
