@@ -221,106 +221,107 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 	agentDescription := r.Header.Get(agentDescriptionHeader)
 	agentRepo := r.Header.Get(agentRepoHeader)
 
-	
-	// Extract Remote name and info
-	// Read and buffer the body
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
-		return
-	}
-	r.Body.Close()
+	if path == "/rubix/v1/tx" {
+		// Extract Remote name and info
+		// Read and buffer the body
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
+			return
+		}
+		r.Body.Close()
 
-	// Reconstruct body for proxying downstream
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		// Reconstruct body for proxying downstream
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
-	// Parse NFT payload
-	var payload txPayload
-	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
-		c.JSON(http.StatusInternalServerError, Response{
-			Status:  false,
-			Message: "failed to unmarshal payload for Execute NFT API",
-		})
-		return
-	}
-
-	// Extract NFT payload
-	var nftPayloadInfo NFTInfo
-	if len(payload.Tokens.NFT) != 0 {
-		nftPayloadInfo = payload.Tokens.NFT[0]
-	} else {
-		c.JSON(http.StatusInternalServerError, Response{
-			Status:  false,
-			Message: fmt.Sprintf("proxyhandler: no nft data present in tx body"),
-		})
-		return 
-	}
-	
-	// Check if the NFT is getting deployed or executed
-	isNFTDeploy, err := rl.isNFTDeploy(nftPayloadInfo.NFTId)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{
-			Status:  false,
-			Message: fmt.Sprintf("failed to check if NFT is deployed: %v", err),
-		})
-		return
-	}
-
-	if isNFTDeploy {
-		// Extract agent_name from nftData
-		agentName := extractHostAgentName(nftPayloadInfo.Data)
-		// Store in nfts table with email foreign key
-		if err := rl.storeNFT(user.Email, nftPayloadInfo.NFTId, agentName, payload.Initiator, agentDescription, agentRepo); err != nil {
-			log.Printf("Failed to store NFT for %s: %v", user.Email, err)
+		// Parse NFT payload
+		var payload txPayload
+		if err := json.Unmarshal(bodyBytes, &payload); err != nil {
 			c.JSON(http.StatusInternalServerError, Response{
 				Status:  false,
-				Message: fmt.Sprintf("failed to store NFT: %v", err),
+				Message: "failed to unmarshal payload for Execute NFT API",
 			})
 			return
 		}
-	} else {
-		// Store remote info
-		remoteInfoList, err := extractRemoteInfo(payload)
+
+		// Extract NFT payload
+		var nftPayloadInfo NFTInfo
+		if len(payload.Tokens.NFT) != 0 {
+			nftPayloadInfo = payload.Tokens.NFT[0]
+		} else {
+			c.JSON(http.StatusInternalServerError, Response{
+				Status:  false,
+				Message: fmt.Sprintf("proxyhandler: no nft data present in tx body"),
+			})
+			return 
+		}
+		
+		// Check if the NFT is getting deployed or executed
+		isNFTDeploy, err := rl.isNFTDeploy(nftPayloadInfo.NFTId)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, Response{
 				Status:  false,
-				Message: fmt.Sprintf("failed to fetch remote info, err: %v", err),
+				Message: fmt.Sprintf("failed to check if NFT is deployed: %v", err),
 			})
 			return
 		}
 
-		for _, remoteInfo := range remoteInfoList {
-			err := rl.storeRemote(remoteInfo.Did, remoteInfo.Name)
-			if err != nil {
-				errMsg := fmt.Sprintf(
-					"failed to store remote details, remote_name: %v, remote_did: %v",
-					remoteInfo.Name,
-					remoteInfo.Did,
-				)
+		if isNFTDeploy {
+			// Extract agent_name from nftData
+			agentName := extractHostAgentName(nftPayloadInfo.Data)
+			// Store in nfts table with email foreign key
+			if err := rl.storeNFT(user.Email, nftPayloadInfo.NFTId, agentName, payload.Initiator, agentDescription, agentRepo); err != nil {
+				log.Printf("Failed to store NFT for %s: %v", user.Email, err)
 				c.JSON(http.StatusInternalServerError, Response{
 					Status:  false,
-					Message: errMsg,
+					Message: fmt.Sprintf("failed to store NFT: %v", err),
 				})
 				return
 			}
-		}
+		} else {
+			// Store remote info
+			remoteInfoList, err := extractRemoteInfo(payload)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, Response{
+					Status:  false,
+					Message: fmt.Sprintf("failed to fetch remote info, err: %v", err),
+				})
+				return
+			}
 
-		// Store interactions
-		interactionList, err := extractAgentInteractions(payload, rl.db)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, Response{
-				Status:  false,
-				Message: fmt.Sprintf("failed to fetch agent interactions, err: %v", err),
-			})
-			return
-		}
+			for _, remoteInfo := range remoteInfoList {
+				err := rl.storeRemote(remoteInfo.Did, remoteInfo.Name)
+				if err != nil {
+					errMsg := fmt.Sprintf(
+						"failed to store remote details, remote_name: %v, remote_did: %v",
+						remoteInfo.Name,
+						remoteInfo.Did,
+					)
+					c.JSON(http.StatusInternalServerError, Response{
+						Status:  false,
+						Message: errMsg,
+					})
+					return
+				}
+			}
 
-		if err := rl.storeInteractions(interactionList); err != nil {
-			c.JSON(http.StatusInternalServerError, Response{
-				Status:  false,
-				Message: fmt.Sprintf("failed to store agent interactions, err: %v", err),
-			})
-			return
+			// Store interactions
+			interactionList, err := extractAgentInteractions(payload, rl.db)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, Response{
+					Status:  false,
+					Message: fmt.Sprintf("failed to fetch agent interactions, err: %v", err),
+				})
+				return
+			}
+
+			if err := rl.storeInteractions(interactionList); err != nil {
+				c.JSON(http.StatusInternalServerError, Response{
+					Status:  false,
+					Message: fmt.Sprintf("failed to store agent interactions, err: %v", err),
+				})
+				return
+			}
 		}
 	}
 
