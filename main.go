@@ -237,6 +237,7 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 		// Parse NFT payload
 		var payload txPayload
 		if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+			log.Printf("proxyhandler: failed to unmarshal payload for Execute NFT API, err: %v", err)
 			c.JSON(http.StatusInternalServerError, Response{
 				Status:  false,
 				Message: "failed to unmarshal payload for Execute NFT API",
@@ -249,6 +250,7 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 		if len(payload.Tokens.NFT) != 0 {
 			nftPayloadInfo = payload.Tokens.NFT[0]
 		} else {
+			log.Printf("proxyhandler: no nft data present in tx body")
 			c.JSON(http.StatusInternalServerError, Response{
 				Status:  false,
 				Message: fmt.Sprintf("proxyhandler: no nft data present in tx body"),
@@ -259,6 +261,7 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 		// Check if the NFT is getting deployed or executed
 		isNFTDeploy, err := rl.isNFTDeploy(nftPayloadInfo.NFTId)
 		if err != nil {
+			log.Printf("failed to check if NFT %v is deployed: %v", nftPayloadInfo.NFTId, err)
 			c.JSON(http.StatusInternalServerError, Response{
 				Status:  false,
 				Message: fmt.Sprintf("failed to check if NFT is deployed: %v", err),
@@ -267,6 +270,7 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 		}
 
 		if isNFTDeploy {
+			log.Printf("proxyhandler: deploy: %v", nftPayloadInfo.NFTId)
 			// Extract agent_name from nftData
 			agentName := extractHostAgentName(nftPayloadInfo.Data)
 			// Store in nfts table with email foreign key
@@ -279,9 +283,11 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 				return
 			}
 		} else {
+			log.Printf("proxyhandler: execute: %v", nftPayloadInfo.NFTId)
 			// Store remote info
 			remoteInfoList, err := extractRemoteInfo(payload)
 			if err != nil {
+				log.Printf("failed to fetch remote info, err: %v", err)
 				c.JSON(http.StatusInternalServerError, Response{
 					Status:  false,
 					Message: fmt.Sprintf("failed to fetch remote info, err: %v", err),
@@ -297,6 +303,7 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 						remoteInfo.Name,
 						remoteInfo.Did,
 					)
+					log.Println(errMsg)
 					c.JSON(http.StatusInternalServerError, Response{
 						Status:  false,
 						Message: errMsg,
@@ -308,6 +315,7 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 			// Store interactions
 			interactionList, err := extractAgentInteractions(payload, rl.db)
 			if err != nil {
+				log.Printf("failed to fetch agent interactions, err: %v", err)
 				c.JSON(http.StatusInternalServerError, Response{
 					Status:  false,
 					Message: fmt.Sprintf("failed to fetch agent interactions, err: %v", err),
@@ -316,6 +324,7 @@ func (rl *RateLimiter) proxyHandler(c *gin.Context) {
 			}
 
 			if err := rl.storeInteractions(interactionList); err != nil {
+				log.Printf("failed to store agent interactions, err: %v", err)
 				c.JSON(http.StatusInternalServerError, Response{
 					Status:  false,
 					Message: fmt.Sprintf("failed to store agent interactions, err: %v", err),
