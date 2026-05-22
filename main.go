@@ -1163,6 +1163,7 @@ func main() {
 	r.Use(gin.Recovery())
 
 	r.GET("/healthz", rl.healthz)
+	r.OPTIONS("/admin/add-user", func(c *gin.Context) { c.AbortWithStatus(http.StatusNoContent) })
 	r.POST("/admin/add-user", rl.adminAddUser)
 	r.GET("/get-balance-credits", rl.getBalanceCredits)
 	r.GET("/interactions", rl.getInteractions)
