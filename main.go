@@ -160,8 +160,9 @@ func (rl *RateLimiter) adminAddUser(c *gin.Context) {
 
 	var req struct {
 		Email string `json:"email"`
+		Name  string `json:"name"`
 	}
-	if err := c.BindJSON(&req); err != nil || req.Email == "" {
+	if err := c.BindJSON(&req); err != nil || req.Email == "" || req.Name == "" {
 		c.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
@@ -173,7 +174,7 @@ func (rl *RateLimiter) adminAddUser(c *gin.Context) {
 		return
 	}
 
-	if msg, mErr := email.APIKeyDelivery(req.Email, apiKey); mErr != nil {
+	if msg, mErr := email.APIKeyDelivery(req.Email, req.Name, apiKey); mErr != nil {
 		log.Printf("build api-key email for %s: %v", req.Email, mErr)
 	} else if sErr := rl.mailer.Send(msg); sErr != nil {
 		log.Printf("send api-key email to %s: %v", req.Email, sErr)
