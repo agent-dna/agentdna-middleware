@@ -21,6 +21,8 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
+
+	"agentdna-ratelimit-auth/email"
 )
 
 const (
@@ -42,6 +44,7 @@ type RateLimiter struct {
 	proxy   *httputil.ReverseProxy
 	mu      sync.RWMutex
 	baseURL *url.URL
+	mailer  *email.Mailer
 }
 
 var billablePaths = map[string]bool{
@@ -82,7 +85,7 @@ func initConfig() (string, *url.URL, string) {
 	return dbFile, parsedRubixNodeURL, serverPort
 }
 
-func NewRateLimiter(dbFile string, backendURL *url.URL) *RateLimiter {
+func NewRateLimiter(dbFile string, backendURL *url.URL, mailer *email.Mailer) *RateLimiter {
 	db, err := sql.Open("sqlite3", dbFile)
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)
@@ -130,7 +133,7 @@ func NewRateLimiter(dbFile string, backendURL *url.URL) *RateLimiter {
 
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
 
-	return &RateLimiter{db: db, proxy: proxy, baseURL: backendURL}
+	return &RateLimiter{db: db, proxy: proxy, baseURL: backendURL, mailer: mailer}
 }
 
 func (rl *RateLimiter) healthz(c *gin.Context) {
@@ -168,6 +171,12 @@ func (rl *RateLimiter) adminAddUser(c *gin.Context) {
 	if err != nil {
 		c.AbortWithStatus(http.StatusInternalServerError)
 		return
+	}
+
+	if msg, mErr := email.APIKeyDelivery(req.Email, apiKey); mErr != nil {
+		log.Printf("build api-key email for %s: %v", req.Email, mErr)
+	} else if sErr := rl.mailer.Send(msg); sErr != nil {
+		log.Printf("send api-key email to %s: %v", req.Email, sErr)
 	}
 
 	c.JSON(200, gin.H{"api_key": apiKey})
@@ -1139,7 +1148,14 @@ func (rl *RateLimiter) getToolsInteractions(c *gin.Context) {
 
 func main() {
 	dbFile, backendURL, serverPort := initConfig()
-	rl := NewRateLimiter(dbFile, backendURL)
+
+	mailCfg, err := email.LoadConfigFromEnv()
+	if err != nil {
+		log.Fatalf("email config: %v", err)
+	}
+	mailer := email.New(mailCfg)
+
+	rl := NewRateLimiter(dbFile, backendURL, mailer)
 	defer rl.db.Close()
 
 	r := gin.New()
