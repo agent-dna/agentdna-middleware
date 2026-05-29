@@ -1,82 +1,52 @@
 package router
 
 import (
-	"net/http"
-
+	"agentdna-ratelimit-auth/handler"
 	"github.com/gin-gonic/gin"
 )
 
-type Handler struct{}
+func Register(r *gin.Engine, h *handler.Handler) {
 
-func NewHandler() *Handler {
-	return &Handler{}
-}
+	r.GET("/healthz", h.Healthz)
 
-func (h *Handler) RegisterRoutes(r *gin.Engine) {
-	// Dashboard
-	r.GET("/home-metrics", h.homeMetrics)
-	r.GET("/interactions-list", h.interactionsList)
+	// Dashboard — public
+	r.POST("/login", h.Login)
+	r.POST("/signup", h.Signup)
+	r.POST("/create-admin", h.CreateAdmin)
 
-	// Agent metrics & listing
-	r.GET("/agent-metrics", h.agentMetrics)
-	r.GET("/agents-list", h.agentsList)
+	// Dashboard — JWT protected
+	dashboard := r.Group("/", h.JWTAuthMiddleware())
+	dashboard.GET("/home-metrics", h.HomeMetrics)
+	dashboard.GET("/interactions-list", h.InteractionsList)
+	dashboard.GET("/agent-metrics", h.AgentMetrics)
+	dashboard.GET("/agents-list", h.AgentsList)
+	dashboard.GET("/users-list", h.UsersList)
+	dashboard.GET("/search-user", h.SearchUser)
+	dashboard.GET("/agent-interactions", h.AgentInteractions)
+	dashboard.GET("/agent-intents", h.AgentIntents)
+	dashboard.GET("/user-intents", h.UserIntents)
+	dashboard.GET("/agent-info", h.AgentInfo)
+	dashboard.GET("/intent-info", h.IntentInfo)
+	dashboard.GET("/tools-list", h.ToolsList)
+	dashboard.GET("/tool-info", h.ToolInfo)
+	dashboard.GET("/intent-list", h.IntentList)
 
-	// Authorization & user management
-	r.GET("/users-list", h.usersList)
-	r.GET("/search-user", h.searchUser)
+	dashboard.GET("/agents-creation-requests-list", h.AgentsCreationRequestsList)
+	dashboard.POST("/agents-creation-requests-create", h.AgentsCreationRequestsCreate)
+	dashboard.POST("/agents-creation-requests-edit", h.AgentsCreationRequestsEdit)
 
-	// Agent creation requests
-	r.GET("/agents-creation-requests-list", h.agentsCreationRequestsList)
-	r.GET("/agent-creation-request-edit", h.agentCreationRequestEdit)
-	r.GET("/agent-creation-request-submit", h.agentCreationRequestSubmit)
+	dashboard.POST("/agent-creation-request-result-submit", h.AgentCreationRequestSubmit)
+	dashboard.POST("/agent-info-edit", h.AgentInfoEdit)
 
-	// Agent access requests
-	r.GET("/agent-access-requests-list", h.agentAccessRequestsList)
-	r.GET("/agent-access-request-submit", h.agentAccessRequestSubmit)
-
+	dashboard.GET("/agent-access-requests-list-org", h.AgentAccessRequestsListOrg)
+	dashboard.GET("/agent-access-requests-list-user", h.AgentAccessRequestsListUser)
 	
-}
+	dashboard.POST("/agent-access-request-submit", h.AgentAccessRequestSubmit)
 
-func (h *Handler) homeMetrics(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
-}
+	// Policy file upload / retrieval
+	dashboard.POST("/upload-user-policy", h.UploadUserPolicy)
+	dashboard.GET("/user-policy", h.GetUserPolicy)
+	dashboard.POST("/upload-agent-policy", h.UploadAgentPolicy)
+	dashboard.GET("/agent-policy", h.GetAgentPolicy)
 
-func (h *Handler) interactionsList(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
-}
-
-func (h *Handler) agentMetrics(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
-}
-
-func (h *Handler) agentsList(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
-}
-
-func (h *Handler) usersList(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
-}
-
-func (h *Handler) searchUser(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
-}
-
-func (h *Handler) agentsCreationRequestsList(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
-}
-
-func (h *Handler) agentCreationRequestEdit(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
-}
-
-func (h *Handler) agentCreationRequestSubmit(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
-}
-
-func (h *Handler) agentAccessRequestsList(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
-}
-
-func (h *Handler) agentAccessRequestSubmit(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
 }

@@ -5,6 +5,7 @@ import "time"
 type Admin struct {
 	DID             string `json:"id" db:"did"`
 	OrganizationID  string `json:"organizationID" db:"organization_id"`
+	APIKey		  string `json:"apiKey" db:"api_key"`
 	Email          string `json:"email" db:"email"`
 	Password       string `json:"password" db:"password"`
 	AgentCount     int    `json:"agentCount" db:"agent_count"`
@@ -13,9 +14,12 @@ type Admin struct {
 	TotalUsers     int    `json:"totalUsers" db:"total_users"`
 }
 
-type User struct {
+type OrgUser struct {
 	DID             string   `json:"id" db:"did"`
 	OrganizationID  string   `json:"organizationID" db:"organization_id"`
+	APIKey		  string   `json:"apiKey" db:"api_key"`
+	
+	NFTID 		 string   `json:"nftID" db:"nft_id"`	
 	Email          string   `json:"email" db:"email"`
 	Password        string   `json:"password" db:"password"`
 	AgentCount      int      `json:"agentCount" db:"agent_count"`
@@ -28,6 +32,7 @@ type Agent struct {
 	DID                string `json:"id" db:"did"`
 	DeployerDID        string `json:"deployerDID" db:"deployer_did"`
 	OrganizationID    string `json:"organizationID" db:"organization_id"`
+	NFTID 		 string `json:"nftID" db:"nft_id"`	
 	Policy            string `json:"policy" db:"policy"`
 	InteractionsCount int    `json:"interactionsCount" db:"interactions_count"`
 	IntentCount       int    `json:"intentCount" db:"intent_count"`
