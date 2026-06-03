@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -73,6 +74,7 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 		if jsonErr := json.Unmarshal(bodyBytes, &payload); jsonErr == nil && len(payload.Tokens.NFT) > 0 {
 			nftInfo := payload.Tokens.NFT[0]
 			nftType, typeErr := parseNFTType(nftInfo.Data)
+			log.Printf("[NFT] received nft_id=%s type=%s data=%s", nftInfo.NFTId, nftType, nftInfo.Data)
 			if typeErr == nil {
 				switch nftType {
 				case NFTTypeUser:
@@ -99,7 +101,7 @@ func (h *Handler) handleUserNFT(nftInfo NFTInfo) error {
 	if err != nil {
 		return fmt.Errorf("handleUserNFT: hash default password: %v", err)
 	}
-	return h.db.StoreOrgUser(nftInfo.NFTId, data.UserDID, data.Metadata.OrgID, data.Metadata.Email, string(hash))
+	return h.db.StoreOrgUser(nftInfo.NFTId, data.UserDID, data.Metadata.OrgID, data.Metadata.Name, data.Metadata.Email, string(hash))
 }
 
 func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
@@ -171,10 +173,10 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 		initiatorDID = blocks[0].Agent
 	}
     
-	log.Printf("test1", len(blocks), orgID, initiatorDID)
+	log.Printf("[intentNFT] blocks=%d org=%s initiator=%s", len(blocks), orgID, initiatorDID)
 	// ── 4. Ensure agents exist (create with defaults if missing) ─────────────
 	for _, b := range blocks {
-		log.Printf("test2", b.Agent, b.Type, b.Name )
+		log.Printf("[intentNFT] block did=%s type=%s name=%s", b.Agent, b.Type, b.Name)
 		
 
 		agentName := b.Name
@@ -194,7 +196,7 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 	// ── 5. Ensure initiator user exists ──────────────────────────────────────
 	if initiatorDID != "" {
 		hash, _ := bcrypt.GenerateFromPassword([]byte("test123"), bcrypt.DefaultCost)
-		_ = h.db.StoreOrgUser(uuid.New().String(), initiatorDID, orgID, "", string(hash))
+		_ = h.db.StoreOrgUser(uuid.New().String(), initiatorDID, orgID, "", "", string(hash))
 	}
 
 	// ── 6. Store interactions ────────────────────────────────────────────────
@@ -841,6 +843,7 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 		entry := gin.H{
 			"intentID":       i.IntentID,
 			"initiatorDID":   i.InitiatorDID,
+			"initiatorName":  i.InitiatorName,
 			"startedAt":      i.StartedAt,
 			"status":         i.Status,
 			"threatDetected": i.ThreatDetected,
@@ -939,6 +942,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 	data := gin.H{
 		"intentID":       intent.IntentID,
 		"initiatorDID":   intent.InitiatorDID,
+		"initiatorName":  intent.InitiatorName,
 		"startedAt":      intent.StartedAt,
 		"status":         intent.Status,
 		"threatDetected": intent.ThreatDetected,
@@ -1098,20 +1102,23 @@ func (h *Handler) callRegisterAdmin(username string) (string, error) {
 }
 
 // callCreateAgent POSTs multipart form-data to CREATE_AGENT_ENDPOINT.
-// Returns the created agent DID (response.message) on success.
-func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (string, error) {
+// The agent DID is known upfront; the API returns the NFT ID for that agent.
+func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (nftID string, err error) {
+	if policy == "" {
+		policy = "default policy"
+	}
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	fw, err := mw.CreateFormFile("policy", "policy.txt")
-	if err != nil {
-		return "", fmt.Errorf("callCreateAgent: create form file: %v", err)
-	}
-	if _, err = fw.Write([]byte(policy)); err != nil {
-		return "", fmt.Errorf("callCreateAgent: write policy: %v", err)
-	}
 	mw.WriteField("creator_did", creatorDID)
 	mw.WriteField("org_id", orgID)
 	mw.WriteField("agent_name", agentName)
+	fw, fwErr := mw.CreateFormFile("policy", "policy.txt")
+	if fwErr != nil {
+		return "", fmt.Errorf("callCreateAgent: create form file: %v", fwErr)
+	}
+	if _, fwErr = fw.Write([]byte(policy)); fwErr != nil {
+		return "", fmt.Errorf("callCreateAgent: write policy: %v", fwErr)
+	}
 	mw.Close()
 
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/create-agent"
@@ -1121,22 +1128,30 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (
 	}
 	defer resp.Body.Close()
 
+	rawBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[callCreateAgent] response status=%d body=%s", resp.StatusCode, string(rawBody))
+
 	var result struct {
 		Status  bool   `json:"status"`
 		Message string `json:"message"`
+		NFTID   string `json:"agent_id"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	json.Unmarshal(rawBody, &result)
 
 	if !result.Status {
 		return "", fmt.Errorf("create agent failed: %s", result.Message)
 	}
-	return result.Message, nil // message = agent DID on success
+	return result.NFTID, nil
 }
 
 // callUpdateAgent POSTs multipart form-data to UPDATE_AGENT_ENDPOINT.
-func (h *Handler) callUpdateAgent(agentName, policy, creatorDID, orgID string) error {
+func (h *Handler) callUpdateAgent(agentName, agentID, policy, creatorDID, orgID string) error {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
+	mw.WriteField("creator_did", creatorDID)
+	mw.WriteField("org_id", orgID)
+	mw.WriteField("agent_name", agentName)
+	mw.WriteField("agent_id", agentID)
 	fw, err := mw.CreateFormFile("policy", "policy.txt")
 	if err != nil {
 		return fmt.Errorf("callUpdateAgent: create form file: %v", err)
@@ -1144,9 +1159,6 @@ func (h *Handler) callUpdateAgent(agentName, policy, creatorDID, orgID string) e
 	if _, err = fw.Write([]byte(policy)); err != nil {
 		return fmt.Errorf("callUpdateAgent: write policy: %v", err)
 	}
-	mw.WriteField("creator_did", creatorDID)
-	mw.WriteField("org_id", orgID)
-	mw.WriteField("agent_name", agentName)
 	mw.Close()
 
 	endpoint := h.updateAgentEndpoint + "agent-admin/v1/update-agent-policies"
@@ -1246,15 +1258,14 @@ func (h *Handler) UploadAgentPolicy(c *gin.Context) {
 		return
 	}
 
-	// Fetch agent info to get name and org for the external service call.
 	agentInfo, err := h.db.GetAgentInfo(agentDID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "agent not found"})
 		return
 	}
-
 	orgID, _ := h.db.GetAgentOrgID(agentDID)
-	if err := h.callUpdateAgent(agentInfo.AgentName, content, agentInfo.DeployerDID, orgID); err != nil {
+	nftID, _ := h.db.GetAgentNFTID(agentDID)
+	if err := h.callUpdateAgent(agentInfo.AgentName, nftID, content, agentInfo.DeployerDID, orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
 	}
@@ -1287,6 +1298,126 @@ func (h *Handler) GetAgentPolicy(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"agentDID": agentDID, "policy": policy}})
+}
+
+// fetchAgentChain is a shared helper that calls the Rubix node and returns
+// all chain entries (skipping index 0 which is the initial deployment).
+func (h *Handler) fetchAgentChain(nftID string) ([]struct {
+	TransactionID string
+	Epoch         int64
+	Data          string
+}, error) {
+	chainURL := fmt.Sprintf("%s://%s/rubix/v1/nfts/%s/chain", h.baseURL.Scheme, h.baseURL.Host, nftID)
+	resp, err := http.Get(chainURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var chainResp struct {
+		Result []struct {
+			TransactionID string `json:"transactionId"`
+			Epoch         int64  `json:"epoch"`
+			Data          string `json:"data"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&chainResp); err != nil {
+		return nil, err
+	}
+
+	if len(chainResp.Result) <= 1 {
+		return nil, nil
+	}
+
+	var out []struct {
+		TransactionID string
+		Epoch         int64
+		Data          string
+	}
+	for _, e := range chainResp.Result[1:] {
+		out = append(out, struct {
+			TransactionID string
+			Epoch         int64
+			Data          string
+		}{e.TransactionID, e.Epoch, e.Data})
+	}
+	return out, nil
+}
+
+// GetAgentPolicyHistory returns only updateID + time for each policy update.
+// Call GetAgentPolicyUpdate with a specific updateID to get the full policy text.
+func (h *Handler) GetAgentPolicyHistory(c *gin.Context) {
+	agentDID := c.Query("agentDID")
+	if agentDID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
+		return
+	}
+
+	nftID, err := h.db.GetAgentNFTID(agentDID)
+	if err != nil || nftID == "" {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "agent NFT not found"})
+		return
+	}
+
+	entries, err := h.fetchAgentChain(nftID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch chain: %v", err)})
+		return
+	}
+
+	type historyItem struct {
+		UpdateID string `json:"updateID"`
+		Time     int64  `json:"time"`
+	}
+	var history []historyItem
+	for _, e := range entries {
+		history = append(history, historyItem{UpdateID: e.TransactionID, Time: e.Epoch})
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"agentDID": agentDID, "nftID": nftID, "history": history}})
+}
+
+// GetAgentPolicyUpdate returns the full decoded policy for a specific updateID.
+func (h *Handler) GetAgentPolicyUpdate(c *gin.Context) {
+	agentDID := c.Query("agentDID")
+	updateID := c.Query("updateID")
+	if agentDID == "" || updateID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID and updateID are required"})
+		return
+	}
+
+	nftID, err := h.db.GetAgentNFTID(agentDID)
+	if err != nil || nftID == "" {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "agent NFT not found"})
+		return
+	}
+
+	entries, err := h.fetchAgentChain(nftID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch chain: %v", err)})
+		return
+	}
+
+	for _, e := range entries {
+		if e.TransactionID != updateID {
+			continue
+		}
+		var data struct {
+			Policy string `json:"policy"`
+		}
+		if err := json.Unmarshal([]byte(e.Data), &data); err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to parse entry data"})
+			return
+		}
+		policyText := data.Policy
+		if decoded, decErr := base64.StdEncoding.DecodeString(data.Policy); decErr == nil {
+			policyText = string(decoded)
+		}
+		c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"updateID": updateID, "time": e.Epoch, "policy": policyText}})
+		return
+	}
+
+	c.JSON(http.StatusNotFound, Response{Status: false, Message: "updateID not found in chain"})
 }
 
 // readPolicyFile reads a multipart "file" field from the request,
@@ -1382,18 +1513,30 @@ func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
 		return
 	}
 
-	var req struct {
-		AgentName   string `json:"agentName"`
-		Policy      string `json:"policy"`
-		RequestInfo string `json:"requestInfo"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.AgentName == "" {
+	agentName := c.PostForm("agentName")
+	agentID := c.PostForm("agentID")
+	requestInfo := c.PostForm("requestInfo")
+	if agentName == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentName is required"})
 		return
 	}
 
+	// Read policy from uploaded file if present, else fall back to form field.
+	policy := ""
+	if fh, err := c.FormFile("policy"); err == nil {
+		f, err := fh.Open()
+		if err == nil {
+			defer f.Close()
+			raw, _ := io.ReadAll(f)
+			policy = string(raw)
+		}
+	}
+	if policy == "" {
+		policy = c.PostForm("policy")
+	}
+
 	id := uuid.New().String()
-	if err := h.db.CreateRequest(id, "deploy_agent", req.Policy, creatorDID, "", req.AgentName, req.RequestInfo, orgID); err != nil {
+	if err := h.db.CreateRequest(id, "deploy_agent", policy, creatorDID, agentID, agentName, requestInfo, orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to create request: %v", err)})
 		return
 	}
@@ -1473,16 +1616,27 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 	}
 
 	if req.Status == "approved" {
-		agentDID, err := h.callCreateAgent(existing.AgentName, existing.Policy, existing.CreatorDID, existing.OrgID)
+		policy := existing.Policy
+		if policy == "" {
+			policy = "default policy"
+		}
+		log.Printf("[AgentCreationRequestSubmit] calling create-agent requestID=%s agentDID=%s agentName=%s", req.RequestID, existing.AgentDID, existing.AgentName)
+		nftID, err := h.callCreateAgent(existing.AgentName, policy, existing.CreatorDID, existing.OrgID)
 		if err != nil {
+			log.Printf("[AgentCreationRequestSubmit] create-agent error: %v", err)
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 			return
 		}
-		nftID := uuid.New().String()
-		if err := h.db.StoreNewAgent(nftID, agentDID, existing.CreatorDID, existing.OrgID, existing.Policy, existing.AgentName); err != nil {
+		log.Printf("[AgentCreationRequestSubmit] create-agent returned nftID=%s", nftID)
+		if nftID == "" {
+			nftID = uuid.New().String()
+		}
+		if err := h.db.StoreNewAgent(nftID, existing.AgentDID, existing.CreatorDID, existing.OrgID, policy, existing.AgentName); err != nil {
+			log.Printf("[AgentCreationRequestSubmit] StoreNewAgent error: %v", err)
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to store agent: %v", err)})
 			return
 		}
+		log.Printf("[AgentCreationRequestSubmit] agent stored agentDID=%s nftID=%s", existing.AgentDID, nftID)
 	}
 
 	if err := h.db.UpdateRequestStatus(req.RequestID, req.Status); err != nil {
@@ -1513,9 +1667,10 @@ func (h *Handler) AgentInfoEdit(c *gin.Context) {
 	}
 
 
-	// Look up org for the agent to pass to the update endpoint.
+	// Look up org and NFT ID for the agent to pass to the update endpoint.
 	orgID, _ := h.db.GetAgentOrgID(req.AgentDID)
-	if err := h.callUpdateAgent(req.AgentName, req.Policy, req.AgentDID, orgID); err != nil {
+	nftID, _ := h.db.GetAgentNFTID(req.AgentDID)
+	if err := h.callUpdateAgent(req.AgentName, nftID, req.Policy, req.AgentDID, orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
 	}

@@ -224,7 +224,7 @@ func (d *DB) GetUsersByOrg(orgID string, limit, offset int) ([]*UserDetailRecord
 	rows, err := d.conn.Query(`
 		SELECT
 			u.did,
-			COALESCE(u.email, ''),
+			COALESCE(u.name, ''),
 			COALESCE(u.created_at, NOW()),
 			COUNT(DISTINCT ni.intent_id)                                                AS total_intents,
 			COUNT(DISTINCT CASE WHEN i.threat = 1 THEN i.interaction_id END)            AS total_threats,
@@ -381,10 +381,10 @@ func (d *DB) GetOrgUserByEmail(email string) (*OrgUserRecord, error) {
 		accessListRaw                            string
 	)
 	err := d.conn.QueryRow(`
-		SELECT did, organization_id, api_key, nft_id, email, password,
+		SELECT did, organization_id, api_key, nft_id, COALESCE(name, ''), email, password,
 		       agent_count, intent_count, threat_count, COALESCE(agent_access_list, '[]')
 		FROM new_org_users WHERE email = $1`, email,
-	).Scan(&did, &orgID, &apiKey, &nftID, &u.Email, &passwordHash,
+	).Scan(&did, &orgID, &apiKey, &nftID, &u.Name, &u.Email, &passwordHash,
 		&u.AgentCount, &u.IntentCount, &u.ThreatCount, &accessListRaw)
 	if err != nil {
 		return nil, err
@@ -430,10 +430,10 @@ func (d *DB) UpdateAgentPolicy(did, policy string) error {
 	return err
 }
 
-func (d *DB) StoreOrgUser(nftID, did, orgID, email, passwordHash string) error {
+func (d *DB) StoreOrgUser(nftID, did, orgID, name, email, passwordHash string) error {
 	_, err := d.conn.Exec(
-		`INSERT INTO new_org_users (nft_id, did, organization_id, email, password) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`,
-		nftID, did, orgID, email, passwordHash,
+		`INSERT INTO new_org_users (nft_id, did, organization_id, name, email, password) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
+		nftID, did, orgID, name, email, passwordHash,
 	)
 	return err
 }
@@ -456,6 +456,12 @@ func (d *DB) GetAgentOrgID(agentDID string) (string, error) {
 	var orgID sql.NullString
 	err := d.conn.QueryRow(`SELECT organization_id FROM new_agents WHERE did = $1`, agentDID).Scan(&orgID)
 	return orgID.String, err
+}
+
+func (d *DB) GetAgentNFTID(agentDID string) (string, error) {
+	var nftID sql.NullString
+	err := d.conn.QueryRow(`SELECT nft_id FROM new_agents WHERE did = $1`, agentDID).Scan(&nftID)
+	return nftID.String, err
 }
 
 func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, blockType string, threat bool, intentID, orgID string) error {
@@ -546,12 +552,13 @@ func (d *DB) CountIntentsByOrg(orgID string) (int, error) {
 
 func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT intent_id, initiator_did, COALESCE(organization_id, ''),
-		       started_at, ended_at, status, threat_detected,
-		       COALESCE(flow_type, ''), COALESCE(executor, 'user'), COALESCE(chain_depth, 0)
-		FROM new_intents
-		WHERE organization_id = $1
-		ORDER BY started_at DESC
+		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), COALESCE(ni.organization_id, ''),
+		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0)
+		FROM new_intents ni
+		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		WHERE ni.organization_id = $1
+		ORDER BY ni.started_at DESC
 		LIMIT $2 OFFSET $3`,
 		orgID, limit, offset,
 	)
@@ -565,7 +572,7 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 		var endedAt sql.NullTime
 		var threatInt int
 		if err := rows.Scan(
-			&r.IntentID, &r.InitiatorDID, &r.OrgID,
+			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
 			&r.StartedAt, &endedAt, &r.Status, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
 		); err != nil {
@@ -594,11 +601,12 @@ func (d *DB) CountAgentIntents(agentDID, orgID string) (int, error) {
 
 func (d *DB) GetAgentIntents(agentDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT DISTINCT ni.intent_id, ni.initiator_did, ni.started_at,
+		SELECT DISTINCT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at,
 		       ni.ended_at, ni.status, ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0)
 		FROM new_intents ni
 		JOIN new_interactions i ON i.intent_id = ni.intent_id
+		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		WHERE i.initiator_did = $1 AND ni.organization_id = $2
 		ORDER BY ni.started_at DESC
 		LIMIT $3 OFFSET $4`,
@@ -622,11 +630,13 @@ func (d *DB) CountUserIntents(userDID, orgID string) (int, error) {
 
 func (d *DB) GetUserIntents(userDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT intent_id, initiator_did, started_at, ended_at, status, threat_detected,
-		       COALESCE(flow_type, ''), COALESCE(executor, 'user'), COALESCE(chain_depth, 0)
-		FROM new_intents
-		WHERE initiator_did = $1 AND organization_id = $2
-		ORDER BY started_at DESC
+		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at, ni.ended_at,
+		       ni.status, ni.threat_detected,
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0)
+		FROM new_intents ni
+		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		WHERE ni.initiator_did = $1 AND ni.organization_id = $2
+		ORDER BY ni.started_at DESC
 		LIMIT $3 OFFSET $4`,
 		userDID, orgID, limit, offset,
 	)
@@ -644,7 +654,7 @@ func scanIntentRows(rows *sql.Rows) ([]*IntentRecord, error) {
 		var endedAt sql.NullTime
 		var threatInt int
 		if err := rows.Scan(
-			&r.IntentID, &r.InitiatorDID, &r.StartedAt, &endedAt,
+			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.StartedAt, &endedAt,
 			&r.Status, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
 		); err != nil {
@@ -695,12 +705,14 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 	var orgID sql.NullString
 	var threatInt int
 	err := d.conn.QueryRow(`
-		SELECT intent_id, initiator_did, COALESCE(organization_id, ''),
-		       started_at, ended_at, status, threat_detected,
-		       COALESCE(flow_type, ''), COALESCE(executor, 'user'), COALESCE(chain_depth, 0)
-		FROM new_intents WHERE intent_id = $1`, intentID,
+		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), COALESCE(ni.organization_id, ''),
+		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0)
+		FROM new_intents ni
+		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		WHERE ni.intent_id = $1`, intentID,
 	).Scan(
-		&r.IntentID, &r.InitiatorDID, &orgID,
+		&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &orgID,
 		&r.StartedAt, &endedAt, &r.Status, &threatInt,
 		&r.FlowType, &r.Executor, &r.ChainDepth,
 	)
@@ -733,7 +745,7 @@ func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, err
 
 func (d *DB) StoreNewTool(did, name, orgID string) error {
 	_, err := d.conn.Exec(
-		`INSERT INTO new_tools (did, name, organization_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+		`INSERT INTO new_tools (did, name, organization_id) VALUES ($1, $2, $3) ON CONFLICT (did) DO NOTHING`,
 		did, name, orgID,
 	)
 	return err
@@ -741,7 +753,11 @@ func (d *DB) StoreNewTool(did, name, orgID string) error {
 
 func (d *DB) CountToolsByOrg(orgID string) (int, error) {
 	var total int
-	err := d.conn.QueryRow(`SELECT COUNT(*) FROM new_tools WHERE organization_id = $1`, orgID).Scan(&total)
+	err := d.conn.QueryRow(`
+		SELECT COUNT(DISTINCT t.did) FROM new_tools t
+		INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1`,
+		orgID,
+	).Scan(&total)
 	return total, err
 }
 
@@ -760,12 +776,11 @@ func (d *DB) GetToolsByOrg(orgID string, limit, offset int) ([]*ToolRecord, erro
 					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
 			END                                              AS score
 		FROM new_tools t
-		LEFT JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1
-		WHERE t.organization_id = $2
+		INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1
 		GROUP BY t.did, t.name
 		ORDER BY total_interactions DESC
-		LIMIT $3 OFFSET $4`,
-		orgID, orgID, limit, offset,
+		LIMIT $2 OFFSET $3`,
+		orgID, limit, offset,
 	)
 	if err != nil {
 		return nil, err
@@ -791,9 +806,9 @@ func (d *DB) GetToolInfo(toolDID, orgID string) (*ToolRecord, error) {
 			END                                              AS score
 		FROM new_tools t
 		LEFT JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1
-		WHERE t.did = $2 AND t.organization_id = $3
+		WHERE t.did = $2
 		GROUP BY t.did, t.name`,
-		orgID, toolDID, orgID,
+		orgID, toolDID,
 	).Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.Score)
 	if err != nil {
 		return nil, err
