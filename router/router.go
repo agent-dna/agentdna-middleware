@@ -6,7 +6,6 @@ import (
 )
 
 func Register(r *gin.Engine, h *handler.Handler) {
-
 	r.GET("/healthz", h.Healthz)
 
 	// Dashboard — public
@@ -51,5 +50,6 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/user-policy", h.GetUserPolicy)
 	dashboard.POST("/upload-agent-policy", h.UploadAgentPolicy)
 	dashboard.GET("/agent-policy", h.GetAgentPolicy)
-
+	dashboard.GET("/agent-policy-history", h.GetAgentPolicyHistory)
+	dashboard.GET("/agent-policy-update", h.GetAgentPolicyUpdate)
 }

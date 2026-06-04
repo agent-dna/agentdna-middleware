@@ -71,6 +71,7 @@ type InteractionRecord struct {
 type IntentRecord struct {
 	IntentID       string
 	InitiatorDID   string
+	InitiatorName  string
 	OrgID          string
 	StartedAt      time.Time
 	EndedAt        *time.Time
@@ -103,6 +104,7 @@ type OrgUserRecord struct {
 	OrganizationID  string
 	APIKey          string
 	NFTID           string
+	Name            string
 	Email           string
 	PasswordHash    string
 	Policy          string
@@ -143,6 +145,7 @@ func New(dsn string) *DB {
 			organization_id   TEXT,
 			api_key           TEXT,
 			nft_id            TEXT,
+			name              TEXT DEFAULT '',
 			email             TEXT,
 			password          TEXT,
 			policy            TEXT DEFAULT '',
@@ -202,18 +205,23 @@ func New(dsn string) *DB {
 			chain_depth      INTEGER DEFAULT 0
 		);
 		CREATE TABLE IF NOT EXISTS new_tools (
-			did             TEXT,
+			did             TEXT PRIMARY KEY,
 			name            TEXT,
-			organization_id TEXT,
-			PRIMARY KEY (did, organization_id)
+			organization_id TEXT
 		);
 	`)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Runtime migration: add created_at column to new_agents for existing databases.
+	// Runtime migrations for existing databases.
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
+	conn.Exec(`ALTER TABLE new_org_users ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''`)
+	// Migrate new_tools primary key from (did, organization_id) → did.
+	conn.Exec(`DELETE FROM new_tools WHERE ctid NOT IN (SELECT MIN(ctid) FROM new_tools GROUP BY did)`)
+	conn.Exec(`ALTER TABLE new_tools DROP CONSTRAINT IF EXISTS new_tools_pkey`)
+	conn.Exec(`ALTER TABLE new_tools ADD PRIMARY KEY (did) `)
+	conn.Exec(`ALTER TABLE new_tools ALTER COLUMN organization_id DROP NOT NULL`)
 
 	return &DB{conn: conn}
 }

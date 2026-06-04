@@ -64,6 +64,7 @@ type userNFTData struct {
 }
 
 type userNFTMetadata struct {
+	Name            string   `json:"name"`
 	Email           string   `json:"email"`
 	OrgID           string   `json:"orgId"`
 	AgentAccessList []string `json:"agentAccessList"`
