@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 )
 
 func (d *DB) StoreAdmin(did, orgID, apiKey, email, passwordHash string) error {
@@ -431,6 +432,20 @@ func (d *DB) UpdateAgentPolicy(did, policy string) error {
 }
 
 func (d *DB) StoreOrgUser(nftID, did, orgID, name, email, passwordHash string) error {
+	if name == "" {
+		// Find the next available user_N name.
+		var n int
+		for {
+			n++
+			candidate := fmt.Sprintf("user_%d", n)
+			var exists bool
+			d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM new_org_users WHERE name = $1)`, candidate).Scan(&exists)
+			if !exists {
+				name = candidate
+				break
+			}
+		}
+	}
 	_, err := d.conn.Exec(
 		`INSERT INTO new_org_users (nft_id, did, organization_id, name, email, password) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
 		nftID, did, orgID, name, email, passwordHash,
@@ -552,12 +567,24 @@ func (d *DB) CountIntentsByOrg(orgID string) (int, error) {
 
 func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), COALESCE(ni.organization_id, ''),
+		SELECT ni.intent_id, ni.initiator_did,
+		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
+		       COALESCE(ni.organization_id, ''),
 		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
-		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0)
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
+		       COUNT(i.interaction_id)                                                AS interactions_count,
+		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
+		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN i.interacted_to_did END) AS tools_count,
+		       MIN(i.time)                                                             AS first_interaction_at,
+		       MAX(i.time)                                                             AS last_interaction_at
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
+		LEFT JOIN new_interactions i ON i.intent_id = ni.intent_id
+		LEFT JOIN new_agents a ON a.did = i.interacted_to_did
+		LEFT JOIN new_tools t ON t.did = i.interacted_to_did
 		WHERE ni.organization_id = $1
+		GROUP BY ni.intent_id, u.name, ag_init.name
 		ORDER BY ni.started_at DESC
 		LIMIT $2 OFFSET $3`,
 		orgID, limit, offset,
@@ -569,18 +596,29 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 	var result []*IntentRecord
 	for rows.Next() {
 		r := &IntentRecord{}
-		var endedAt sql.NullTime
+		var endedAt, firstAt, lastAt sql.NullTime
 		var threatInt int
 		if err := rows.Scan(
 			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
 			&r.StartedAt, &endedAt, &r.Status, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
+			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount,
+			&firstAt, &lastAt,
 		); err != nil {
 			return nil, err
 		}
 		r.ThreatDetected = threatInt == 1
 		if endedAt.Valid {
 			r.EndedAt = &endedAt.Time
+		}
+		if firstAt.Valid {
+			r.FirstInteractionAt = &firstAt.Time
+		}
+		if lastAt.Valid {
+			r.LastInteractionAt = &lastAt.Time
+			if firstAt.Valid {
+				r.RuntimeSeconds = lastAt.Time.Sub(firstAt.Time).Seconds()
+			}
 		}
 		result = append(result, r)
 	}
@@ -701,20 +739,34 @@ func (d *DB) GetAgentInfo(agentDID string) (*AgentDetailRecord, error) {
 
 func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 	r := &IntentRecord{}
-	var endedAt sql.NullTime
+	var endedAt, firstAt, lastAt sql.NullTime
 	var orgID sql.NullString
 	var threatInt int
 	err := d.conn.QueryRow(`
-		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), COALESCE(ni.organization_id, ''),
+		SELECT ni.intent_id, ni.initiator_did,
+		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
+		       COALESCE(ni.organization_id, ''),
 		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
-		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0)
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
+		       COUNT(i.interaction_id)                                                AS interactions_count,
+		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
+		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN i.interacted_to_did END) AS tools_count,
+		       MIN(i.time)                                                             AS first_interaction_at,
+		       MAX(i.time)                                                             AS last_interaction_at
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
-		WHERE ni.intent_id = $1`, intentID,
+		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
+		LEFT JOIN new_interactions i ON i.intent_id = ni.intent_id
+		LEFT JOIN new_agents a ON a.did = i.interacted_to_did
+		LEFT JOIN new_tools t ON t.did = i.interacted_to_did
+		WHERE ni.intent_id = $1
+		GROUP BY ni.intent_id, u.name, ag_init.name`, intentID,
 	).Scan(
 		&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &orgID,
 		&r.StartedAt, &endedAt, &r.Status, &threatInt,
 		&r.FlowType, &r.Executor, &r.ChainDepth,
+		&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount,
+		&firstAt, &lastAt,
 	)
 	if err != nil {
 		return nil, err
@@ -723,6 +775,15 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 	r.ThreatDetected = threatInt == 1
 	if endedAt.Valid {
 		r.EndedAt = &endedAt.Time
+	}
+	if firstAt.Valid {
+		r.FirstInteractionAt = &firstAt.Time
+	}
+	if lastAt.Valid {
+		r.LastInteractionAt = &lastAt.Time
+		if firstAt.Valid {
+			r.RuntimeSeconds = lastAt.Time.Sub(firstAt.Time).Seconds()
+		}
 	}
 	return r, nil
 }

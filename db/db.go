@@ -69,17 +69,23 @@ type InteractionRecord struct {
 }
 
 type IntentRecord struct {
-	IntentID       string
-	InitiatorDID   string
-	InitiatorName  string
-	OrgID          string
-	StartedAt      time.Time
-	EndedAt        *time.Time
-	Status         string
-	ThreatDetected bool
-	FlowType       string
-	Executor       string
-	ChainDepth     int
+	IntentID             string
+	InitiatorDID         string
+	InitiatorName        string
+	OrgID                string
+	StartedAt            time.Time
+	EndedAt              *time.Time
+	Status               string
+	ThreatDetected       bool
+	FlowType             string
+	Executor             string
+	ChainDepth           int
+	InteractionsCount    int
+	AgentsCount          int
+	ToolsCount           int
+	FirstInteractionAt   *time.Time
+	LastInteractionAt    *time.Time
+	RuntimeSeconds       float64
 }
 
 type ToolRecord struct {

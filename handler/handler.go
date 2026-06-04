@@ -128,7 +128,10 @@ func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 }
 
 func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
+
 	data, err := parseChainNFT(nftInfo.Data)
+	fmt.Printf("test1", nftInfo)
+	fmt.Printf("test %+v\n", data )
 	if err != nil {
 		return err
 	}
@@ -841,15 +844,21 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 	list := make([]gin.H, 0, len(intents))
 	for _, i := range intents {
 		entry := gin.H{
-			"intentID":       i.IntentID,
-			"initiatorDID":   i.InitiatorDID,
-			"initiatorName":  i.InitiatorName,
-			"startedAt":      i.StartedAt,
-			"status":         i.Status,
-			"threatDetected": i.ThreatDetected,
-			"flowType":       i.FlowType,
-			"executor":       i.Executor,
-			"chainDepth":     i.ChainDepth,
+			"intentID":          i.IntentID,
+			"initiatorDID":      i.InitiatorDID,
+			"initiatorName":     i.InitiatorName,
+			"startedAt":         i.StartedAt,
+			"status":            i.Status,
+			"threatDetected":    i.ThreatDetected,
+			"flowType":          i.FlowType,
+			"executor":          i.Executor,
+			"chainDepth":        i.ChainDepth,
+			"interactionsCount":  i.InteractionsCount,
+			"agentsCount":        i.AgentsCount,
+			"toolsCount":         i.ToolsCount,
+			"firstInteractionAt": i.FirstInteractionAt,
+			"lastInteractionAt":  i.LastInteractionAt,
+			"runtimeSeconds":     i.RuntimeSeconds,
 		}
 		if i.EndedAt != nil {
 			entry["endedAt"] = i.EndedAt
@@ -940,16 +949,22 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 	}
 
 	data := gin.H{
-		"intentID":       intent.IntentID,
-		"initiatorDID":   intent.InitiatorDID,
-		"initiatorName":  intent.InitiatorName,
-		"startedAt":      intent.StartedAt,
-		"status":         intent.Status,
-		"threatDetected": intent.ThreatDetected,
-		"flowType":       intent.FlowType,
-		"executor":       intent.Executor,
-		"chainDepth":     intent.ChainDepth,
-		"interactions":   txns,
+		"intentID":          intent.IntentID,
+		"initiatorDID":      intent.InitiatorDID,
+		"initiatorName":     intent.InitiatorName,
+		"startedAt":         intent.StartedAt,
+		"status":            intent.Status,
+		"threatDetected":    intent.ThreatDetected,
+		"flowType":          intent.FlowType,
+		"executor":          intent.Executor,
+		"chainDepth":        intent.ChainDepth,
+		"interactionsCount": intent.InteractionsCount,
+		"agentsCount":       intent.AgentsCount,
+		"toolsCount":        intent.ToolsCount,
+		"firstInteractionAt": intent.FirstInteractionAt,
+		"lastInteractionAt":  intent.LastInteractionAt,
+		"runtimeSeconds":     intent.RuntimeSeconds,
+		"interactions":      txns,
 	}
 	if intent.EndedAt != nil {
 		data["endedAt"] = intent.EndedAt
