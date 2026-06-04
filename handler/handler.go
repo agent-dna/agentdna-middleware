@@ -32,19 +32,19 @@ type Handler struct {
 	proxy               *httputil.ReverseProxy
 	baseURL             *url.URL
 	jwtSecret           string
-	agentServiceURL     string
+	adminServiceURL     string
 	createAgentEndpoint string
 	updateAgentEndpoint string
 }
 
-func New(database *db.DB, backendURL *url.URL, jwtSecret, agentServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
+func New(database *db.DB, backendURL *url.URL, jwtSecret, adminServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
 	return &Handler{
 		db:                  database,
 		proxy:               proxy,
 		baseURL:             backendURL,
 		jwtSecret:           jwtSecret,
-		agentServiceURL:     agentServiceURL,
+		adminServiceURL:     adminServiceURL,
 		createAgentEndpoint: createAgentEndpoint,
 		updateAgentEndpoint: updateAgentEndpoint,
 	}
