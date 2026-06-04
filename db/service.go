@@ -458,6 +458,20 @@ func (d *DB) GetAgentOrgID(agentDID string) (string, error) {
 	return orgID.String, err
 }
 
+// GetAgentNFTIDByDID looks up a registered agent by its DID and returns the
+// agent's nft_id. The bool reports whether an agent with that DID exists.
+func (d *DB) GetAgentNFTIDByDID(agentDID string) (string, bool, error) {
+	var nftID sql.NullString
+	err := d.conn.QueryRow(`SELECT nft_id FROM new_agents WHERE did = $1`, agentDID).Scan(&nftID)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return nftID.String, true, nil
+}
+
 func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, blockType string, threat bool, intentID, orgID string) error {
 	threatInt := 0
 	if threat {

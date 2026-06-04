@@ -14,6 +14,9 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	r.POST("/signup", h.Signup)
 	r.POST("/create-admin", h.CreateAdmin)
 
+	// CBAC authorization gate — called by the agent runtime / SDK.
+	r.POST("/authorize-action", h.AuthorizeAction)
+
 	// Dashboard — JWT protected
 	dashboard := r.Group("/", h.JWTAuthMiddleware())
 	dashboard.GET("/home-metrics", h.HomeMetrics)

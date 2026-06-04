@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+*.db*
+.claude
+Dockerfile
+.dockerignore
+docker-compose.yml
+README.md
+*.md
+postman
