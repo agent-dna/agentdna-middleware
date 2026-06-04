@@ -19,7 +19,7 @@ func initConfig() (string, *url.URL, string, string, string, string, string) {
 	backendURLStr := os.Getenv("RUBIX_NODE_URL")
 	serverPort := os.Getenv("SERVER_PORT")
 	jwtSecret := os.Getenv("JWT_SECRET")
-	agentServiceURL := os.Getenv("AGENT_SERVICE_URL")
+	adminServiceURL := os.Getenv("ADMIN_SERVICE_URL")
 	createAgentEndpoint := os.Getenv("CREATE_AGENT_ENDPOINT")
 	updateAgentEndpoint := os.Getenv("UPDATE_AGENT_ENDPOINT")
 
@@ -41,16 +41,16 @@ func initConfig() (string, *url.URL, string, string, string, string, string) {
 		log.Fatalf("RUBIX_NODE_URL invalid format: %s", backendURLStr)
 	}
 
-	return dsn, parsedURL, serverPort, jwtSecret, agentServiceURL, createAgentEndpoint, updateAgentEndpoint
+	return dsn, parsedURL, serverPort, jwtSecret, adminServiceURL, createAgentEndpoint, updateAgentEndpoint
 }
 
 func main() {
-	dsn, backendURL, serverPort, jwtSecret, agentServiceURL, createAgentEndpoint, updateAgentEndpoint := initConfig()
+	dsn, backendURL, serverPort, jwtSecret, adminServiceURL, createAgentEndpoint, updateAgentEndpoint := initConfig()
 
 	database := db.New(dsn)
 	defer database.Close()
 
-	h := handler.New(database, backendURL, jwtSecret, agentServiceURL, createAgentEndpoint, updateAgentEndpoint)
+	h := handler.New(database, backendURL, jwtSecret, adminServiceURL, createAgentEndpoint, updateAgentEndpoint)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
