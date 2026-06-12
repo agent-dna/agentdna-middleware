@@ -29,6 +29,7 @@ type authorizeActionRequest struct {
 	AgentID      string      `json:"agent_id"`
 	ActionIntent string      `json:"action_intent"`
 	AppRequest   *appRequest `json:"app_request"`
+	AgentEnvelope *gin.H      `json:"envelope"` // for future use: the middleware can pass the agent's
 }
 
 // AuthorizeAction is the CBAC gate that sits in the Agent -> Middleware -> App
@@ -82,7 +83,7 @@ func (h *Handler) AuthorizeAction(c *gin.Context) {
 	}
 
 	// Pass the resolved nft_id (not the DID) to the admin server as the agent_id.
-	authorized, message, err := h.callAuthorizeAction(nftID, req.ActionIntent)
+	authorized, message, err := h.callAuthorizeAction(nftID, req.ActionIntent, req.AgentEnvelope)
 	if err != nil {
 		// Fail closed: if we can't get a decision, do not touch the App.
 		c.Header("X-CBAC-Decision", "error")
@@ -140,10 +141,14 @@ func relayHeaders(c *gin.Context, header http.Header) {
 
 // callAuthorizeAction POSTs {agent_id, action_intent} to the admin server's
 // authorize-action endpoint and returns its (authorized, message) decision.
-func (h *Handler) callAuthorizeAction(agentID, actionIntent string) (bool, string, error) {
+func (h *Handler) callAuthorizeAction(agentID, actionIntent string, agentEnvelope *gin.H) (bool, string, error) {
 	endpoint := h.adminServiceURL + "agent-admin/v1/authorize-action"
 
-	b, err := json.Marshal(map[string]string{"agent_id": agentID, "action_intent": actionIntent})
+	b, err := json.Marshal(map[string]any{
+		"agent_id": agentID,
+		"action_intent": actionIntent,
+		"agent_envelope": agentEnvelope,
+	})
 	if err != nil {
 		return false, "", fmt.Errorf("callAuthorizeAction: marshal request: %v", err)
 	}
