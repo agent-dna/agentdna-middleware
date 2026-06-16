@@ -12,6 +12,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	r.POST("/login", h.Login)
 	r.POST("/signup", h.Signup)
 	r.POST("/create-admin", h.CreateAdmin)
+	r.POST("/register-admin", h.RegisterAdminMiddleware)
 
 	// CBAC authorization gate — called by the agent runtime / SDK.
 	r.POST("/authorize-action", h.AuthorizeAction)
@@ -24,6 +25,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/agents-list", h.AgentsList)
 	dashboard.GET("/users-list", h.UsersList)
 	dashboard.GET("/search-user", h.SearchUser)
+	dashboard.POST("/create-user", h.CreateUser)
 	dashboard.GET("/agent-interactions", h.AgentInteractions)
 	dashboard.GET("/agent-intents", h.AgentIntents)
 	dashboard.GET("/user-intents", h.UserIntents)
@@ -34,6 +36,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/intent-list", h.IntentList)
 
 	dashboard.GET("/agents-creation-requests-list", h.AgentsCreationRequestsList)
+	dashboard.GET("/agents-creation-requests-list-user", h.AgentsCreationRequestsListUser)
 	dashboard.POST("/agents-creation-requests-create", h.AgentsCreationRequestsCreate)
 	dashboard.POST("/agents-creation-requests-edit", h.AgentsCreationRequestsEdit)
 
@@ -42,7 +45,6 @@ func Register(r *gin.Engine, h *handler.Handler) {
 
 	dashboard.GET("/agent-access-requests-list-org", h.AgentAccessRequestsListOrg)
 	dashboard.GET("/agent-access-requests-list-user", h.AgentAccessRequestsListUser)
-	
 	dashboard.POST("/agent-access-request-submit", h.AgentAccessRequestSubmit)
 
 	// Policy file upload / retrieval
@@ -52,4 +54,6 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/agent-policy", h.GetAgentPolicy)
 	dashboard.GET("/agent-policy-history", h.GetAgentPolicyHistory)
 	dashboard.GET("/agent-policy-update", h.GetAgentPolicyUpdate)
+
+
 }

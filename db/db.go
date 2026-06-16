@@ -62,7 +62,8 @@ type InteractionRecord struct {
 	FromName      string
 	To            string
 	ToName        string
-	BlockType     string
+	Type          string
+	Direction     string
 	Threat        bool
 	IntentID      string
 	Time          time.Time
@@ -191,12 +192,25 @@ func New(dsn string) *DB {
 			initiator_name    TEXT DEFAULT '',
 			interacted_to_did TEXT DEFAULT '',
 			interacted_to_name TEXT DEFAULT '',
-			block_type        TEXT DEFAULT '',
+			type              TEXT DEFAULT '',
+			direction         TEXT DEFAULT '',
 			threat            INTEGER DEFAULT 0,
 			intent_id         TEXT DEFAULT '',
 			organization_id   TEXT DEFAULT '',
 			time              TIMESTAMPTZ DEFAULT NOW()
 		);
+		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS type TEXT DEFAULT '';
+		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS direction TEXT DEFAULT '';
+		DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_name='new_interactions' AND column_name='block_type'
+			) THEN
+				UPDATE new_interactions SET type = block_type WHERE type = '' OR type IS NULL;
+				ALTER TABLE new_interactions DROP COLUMN block_type;
+			END IF;
+		END $$;
 		CREATE TABLE IF NOT EXISTS new_intents (
 			intent_id        TEXT PRIMARY KEY,
 			interaction_ids  TEXT DEFAULT '[]',

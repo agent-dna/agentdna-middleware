@@ -102,27 +102,12 @@ func detectFlowType(blocks []*chainBlock) string {
 }
 
 // extractInteractions returns one interactionExtract per hop in the chain.
-// Every consecutive block pair is recorded regardless of direction.
-// Response blocks with cbac → additional tool_call hops.
+// Every consecutive block pair is recorded. When the direction transitions from
+// inbound to outbound on the same agent, any cbac tool_call for that agent is
+// inserted at that position rather than at the end.
 func extractInteractions(blocks []*chainBlock) []interactionExtract {
-	var result []interactionExtract
-
-	// One interaction per consecutive block pair (covers inbound + outbound).
-	for i := 0; i < len(blocks)-1; i++ {
-		from := blocks[i]
-		to := blocks[i+1]
-		threat := !from.Verification.SignatureValid || len(from.Verification.TrustIssues) > 0
-		result = append(result, interactionExtract{
-			FromDID:   from.Agent,
-			FromName:  from.Name,
-			ToDID:     to.Agent,
-			ToName:    to.Name,
-			BlockType: from.Type,
-			Threat:    threat,
-		})
-	}
-
-	// Tool calls: response blocks that carry a cbac decision.
+	// Pre-collect cbac app entries keyed by agent DID.
+	cbacApps := map[string]interactionExtract{}
 	for _, b := range blocks {
 		if b.Type != "response" {
 			continue
@@ -136,17 +121,56 @@ func extractInteractions(blocks []*chainBlock) []interactionExtract {
 			continue
 		}
 		app, _ := cbacMap["app"].(string)
-		decision, _ := cbacMap["decision"].(string)
 		if app == "" {
 			continue
 		}
+		decision, _ := cbacMap["decision"].(string)
 		threat := decision == "deny" || !b.Verification.SignatureValid || len(b.Verification.TrustIssues) > 0
-		result = append(result, interactionExtract{
+		cbacApps[b.Agent] = interactionExtract{
 			FromDID:   b.Agent,
 			FromName:  b.Name,
 			ToDID:     app,
 			ToName:    app,
-			BlockType: "tool_call",
+			Type:      "tool_call",
+			Direction: "outbound",
+			Threat:    threat,
+		}
+	}
+
+	var result []interactionExtract
+
+	for i := 0; i < len(blocks)-1; i++ {
+		from := blocks[i]
+		to := blocks[i+1]
+
+		// Same agent in consecutive blocks — insert agent→app and app→agent, skip the self-hop.
+		if from.Agent == to.Agent {
+			if toolCall, ok := cbacApps[from.Agent]; ok {
+				// Agent → Application
+				result = append(result, toolCall)
+				// Application → Agent
+				result = append(result, interactionExtract{
+					FromDID:   toolCall.ToDID,
+					FromName:  toolCall.ToName,
+					ToDID:     from.Agent,
+					ToName:    from.Name,
+					Type:      "tool_response",
+					Direction: "inbound",
+					Threat:    toolCall.Threat,
+				})
+				delete(cbacApps, from.Agent)
+			}
+			continue
+		}
+
+		threat := !from.Verification.SignatureValid || len(from.Verification.TrustIssues) > 0
+		result = append(result, interactionExtract{
+			FromDID:   from.Agent,
+			FromName:  from.Name,
+			ToDID:     to.Agent,
+			ToName:    to.Name,
+			Type:      from.Type,
+			Direction: from.Direction,
 			Threat:    threat,
 		})
 	}

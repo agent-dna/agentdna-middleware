@@ -148,7 +148,7 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 
 	for i, ix := range interactions {
 		log.Printf("[intentNFT] interaction[%d] from=%s(%s) to=%s(%s) type=%s threat=%v",
-			i, ix.FromName, ix.FromDID, ix.ToName, ix.ToDID, ix.BlockType, ix.Threat)
+			i, ix.FromName, ix.FromDID, ix.ToName, ix.ToDID, ix.Type, ix.Threat)
 	}
 
 	for _, b := range blocks {
@@ -216,11 +216,11 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 		iid := uuid.New().String()
 		interactionIDs = append(interactionIDs, iid)
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.BlockType, ix.Threat, intentID, orgID,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID,
 		); err != nil {
 			return fmt.Errorf("handleIntentNFT: StoreNewInteraction: %v", err)
 		}
-		if ix.BlockType == "tool_call" {
+		if ix.Type == "tool_call" {
 			_ = h.db.StoreNewTool(ix.ToDID, ix.ToName, orgID)
 		}
 	}
@@ -320,6 +320,65 @@ func (h *Handler) Login(c *gin.Context) {
 
 func (h *Handler) Signup(c *gin.Context) {
 	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
+}
+
+func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
+	var req struct {
+		DID   string `json:"did"`
+		OrgID string `json:"org_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.DID == "" || req.OrgID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did and org_id are required"})
+		return
+	}
+
+	if err := h.db.StoreAdmin(req.DID, req.OrgID, "", "", ""); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register admin: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"did": req.DID, "org_id": req.OrgID}})
+}
+
+func (h *Handler) CreateUser(c *gin.Context) {
+	w := http.ResponseWriter(c.Writer)
+	enableCors(&w)
+
+	if !c.GetBool(CtxIsAdmin) {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
+		return
+	}
+
+	var req struct {
+		DID      string `json:"did"`
+		Name     string `json:"name"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		OrgID    string `json:"orgID"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.DID == "" || req.Email == "" || req.Password == "" || req.OrgID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did, email, password and orgID are required"})
+		return
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
+		return
+	}
+
+	nftID := uuid.New().String()
+	if err := h.db.StoreOrgUser(nftID, req.DID, req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to create user: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
+		"did":   req.DID,
+		"name":  req.Name,
+		"email": req.Email,
+		"orgID": req.OrgID,
+	}})
 }
 
 func (h *Handler) CreateAdmin(c *gin.Context) {
@@ -450,7 +509,8 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 			"fromName":      i.FromName,
 			"to":            i.To,
 			"toName":        i.ToName,
-			"blockType":     i.BlockType,
+			"type":          i.Type,
+			"direction":     i.Direction,
 			"threat":        i.Threat,
 			"intentID":      i.IntentID,
 			"time":          i.Time,
@@ -731,7 +791,8 @@ func (h *Handler) AgentInteractions(c *gin.Context) {
 			"fromName":      i.FromName,
 			"to":            i.To,
 			"toName":        i.ToName,
-			"blockType":     i.BlockType,
+			"type":          i.Type,
+			"direction":     i.Direction,
 			"threat":        i.Threat,
 			"intentID":      i.IntentID,
 			"time":          i.Time,
@@ -942,7 +1003,8 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 			"fromName":      i.FromName,
 			"to":            i.To,
 			"toName":        i.ToName,
-			"blockType":     i.BlockType,
+			"type":          i.Type,
+			"direction":     i.Direction,
 			"threat":        i.Threat,
 			"time":          i.Time,
 		})
@@ -1068,7 +1130,8 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 			"interactionID": i.InteractionID,
 			"from":          i.From,
 			"fromName":      i.FromName,
-			"blockType":     i.BlockType,
+			"type":          i.Type,
+			"direction":     i.Direction,
 			"threat":        i.Threat,
 			"intentID":      i.IntentID,
 			"time":          i.Time,
@@ -1500,6 +1563,47 @@ func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
 	}
 
 	requests, err := h.db.GetRequestsByOrg(orgID, "deploy_agent", pageSize, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch requests: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Status: true,
+		Data: gin.H{
+			"requestsList": h.buildRequestList(requests),
+			"total":        total,
+			"page":         page,
+			"pageSize":     pageSize,
+			"totalPages":   (total + pageSize - 1) / pageSize,
+		},
+	})
+}
+
+func (h *Handler) AgentsCreationRequestsListUser(c *gin.Context) {
+	w := http.ResponseWriter(c.Writer)
+	enableCors(&w)
+
+	creatorDID := c.GetString(CtxDID)
+	if creatorDID == "" {
+		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
+		return
+	}
+
+	const pageSize = 10
+	page := 1
+	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
+		page = p
+	}
+	offset := (page - 1) * pageSize
+
+	total, err := h.db.CountRequestsByUser(creatorDID, "deploy_agent")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count requests: %v", err)})
+		return
+	}
+
+	requests, err := h.db.GetRequestsByUser(creatorDID, "deploy_agent", pageSize, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch requests: %v", err)})
 		return

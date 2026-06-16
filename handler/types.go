@@ -125,7 +125,8 @@ type interactionExtract struct {
 	FromName  string
 	ToDID     string
 	ToName    string
-	BlockType string
+	Type      string
+	Direction string
 	Threat    bool
 }
 
