@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"agentdna-ratelimit-auth/db"
@@ -199,7 +200,8 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 	// ── 5. Ensure initiator user exists ──────────────────────────────────────
 	if initiatorDID != "" {
 		hash, _ := bcrypt.GenerateFromPassword([]byte("test123"), bcrypt.DefaultCost)
-		_ = h.db.StoreOrgUser(uuid.New().String(), initiatorDID, orgID, "", "", string(hash))
+		userNFTID, _ := GetID(initiatorDID)
+		_ = h.db.StoreOrgUser(userNFTID, initiatorDID, orgID, "", "", string(hash))
 	}
 
 	// ── 6. Store interactions ────────────────────────────────────────────────
@@ -341,6 +343,7 @@ func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
 }
 
 func (h *Handler) CreateUser(c *gin.Context) {
+	fmt.Printf("test create user")
 	w := http.ResponseWriter(c.Writer)
 	enableCors(&w)
 
@@ -356,22 +359,29 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		Password string `json:"password"`
 		OrgID    string `json:"orgID"`
 	}
+
 	if err := c.ShouldBindJSON(&req); err != nil || req.DID == "" || req.Email == "" || req.Password == "" || req.OrgID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did, email, password and orgID are required"})
 		return
 	}
-
+    fmt.Printf("test102: %+v\n", req)
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
 		return
 	}
 
-	nftID := uuid.New().String()
+	nftID, err := GetID(req.DID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate user nft id"})
+		return
+	}
 	if err := h.db.StoreOrgUser(nftID, req.DID, req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to create user: %v", err)})
 		return
 	}
+		println("test104: user stored in DB with DID=", req.DID)
+
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
 		"did":   req.DID,
@@ -1158,6 +1168,7 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 
 // callRegisterAdmin calls the external agent service to register an admin and get their DID.
 func (h *Handler) callRegisterAdmin(username string) (string, error) {
+	fmt.Printf("test111:%s\n", username)
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/register-admin"
 
 	b, _ := json.Marshal(map[string]string{"username": username})
@@ -1632,26 +1643,44 @@ func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
 		return
 	}
 
+	// Support both JSON and multipart/form-data.
 	agentName := c.PostForm("agentName")
 	agentID := c.PostForm("agentID")
 	requestInfo := c.PostForm("requestInfo")
+	policy := ""
+
+	contentType := c.GetHeader("Content-Type")
+	if strings.Contains(contentType, "application/json") {
+		var body struct {
+			AgentName   string `json:"agentName"`
+			AgentID     string `json:"agentID"`
+			RequestInfo string `json:"requestInfo"`
+			Policy      string `json:"policy"`
+		}
+		if err := c.ShouldBindJSON(&body); err == nil {
+			agentName = body.AgentName
+			agentID = body.AgentID
+			requestInfo = body.RequestInfo
+			policy = body.Policy
+		}
+	} else {
+		// Multipart: try file upload first, then plain form field.
+		if fh, err := c.FormFile("policy"); err == nil {
+			f, err := fh.Open()
+			if err == nil {
+				defer f.Close()
+				raw, _ := io.ReadAll(f)
+				policy = string(raw)
+			}
+		}
+		if policy == "" {
+			policy = c.PostForm("policy")
+		}
+	}
+
 	if agentName == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentName is required"})
 		return
-	}
-
-	// Read policy from uploaded file if present, else fall back to form field.
-	policy := ""
-	if fh, err := c.FormFile("policy"); err == nil {
-		f, err := fh.Open()
-		if err == nil {
-			defer f.Close()
-			raw, _ := io.ReadAll(f)
-			policy = string(raw)
-		}
-	}
-	if policy == "" {
-		policy = c.PostForm("policy")
 	}
 
 	id := uuid.New().String()
@@ -1739,8 +1768,9 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 		if policy == "" {
 			policy = "default policy"
 		}
-		log.Printf("[AgentCreationRequestSubmit] calling create-agent requestID=%s agentDID=%s agentName=%s", req.RequestID, existing.AgentDID, existing.AgentName)
-		nftID, err := h.callCreateAgent(existing.AgentName, policy, existing.CreatorDID, existing.OrgID)
+		adminDID := c.GetString(CtxDID)
+		log.Printf("[AgentCreationRequestSubmit] calling create-agent requestID=%s agentDID=%s agentName=%s adminDID=%s", req.RequestID, existing.AgentDID, existing.AgentName, adminDID)
+		nftID, err := h.callCreateAgent(existing.AgentName, policy, adminDID, existing.OrgID)
 		if err != nil {
 			log.Printf("[AgentCreationRequestSubmit] create-agent error: %v", err)
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})

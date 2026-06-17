@@ -1,9 +1,23 @@
 package handler
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+
+	cid "github.com/ipfs/go-cid"
+	mh "github.com/multiformats/go-multihash"
 )
+
+// GetID generates a deterministic CIDv0 from a name string.
+func GetID(name string) (string, error) {
+	digest := sha256.Sum256([]byte(name))
+	multihash, err := mh.Encode(digest[:], mh.SHA2_256)
+	if err != nil {
+		return "", err
+	}
+	return cid.NewCidV0(multihash).String(), nil
+}
 
 func parseNFTType(data string) (string, error) {
 	var base struct {
