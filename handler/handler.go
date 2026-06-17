@@ -78,8 +78,8 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 			log.Printf("[NFT] received nft_id=%s type=%s data=%s", nftInfo.NFTId, nftType, nftInfo.Data)
 			if typeErr == nil {
 				switch nftType {
-				case NFTTypeUser:
-					h.handleUserNFT(nftInfo)
+				// case NFTTypeUser:
+				// 	h.handleUserNFT(nftInfo)
 				case NFTTypeAgent:
 					h.handleAgentNFT(nftInfo)
 				case NFTTypeIntent:
