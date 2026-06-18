@@ -59,31 +59,8 @@ func (h *Handler) AuthorizeAction(c *gin.Context) {
 		return
 	}
 
-	// agent_id is an agent DID. Resolve it to the agent's nft_id, which is the
-	// identifier the admin server expects. An unknown DID is denied (fail
-	// closed); a lookup failure is a fail-closed error.
-	nftID, found, err := h.db.GetAgentNFTIDByDID(req.AgentID)
-	if err != nil {
-		c.Header("X-CBAC-Decision", "error")
-		c.JSON(http.StatusBadGateway, Response{Status: false, Message: fmt.Sprintf("agent lookup failed: %v", err)})
-		return
-	}
-	if !found {
-		c.Header("X-CBAC-Decision", "deny")
-		c.JSON(http.StatusForbidden, Response{
-			Status: false,
-			Data:   gin.H{"authorized": false, "message": fmt.Sprintf("unknown agent_id: %q is not a registered agent", req.AgentID)},
-		})
-		return
-	}
-	if nftID == "" {
-		c.Header("X-CBAC-Decision", "error")
-		c.JSON(http.StatusBadGateway, Response{Status: false, Message: fmt.Sprintf("agent %q has no nft_id on record", req.AgentID)})
-		return
-	}
-
 	// Pass the resolved nft_id (not the DID) to the admin server as the agent_id.
-	authorized, message, err := h.callAuthorizeAction(nftID, req.ActionIntent, req.AgentEnvelope)
+	authorized, message, err := h.callAuthorizeAction(req.AgentID, req.ActionIntent, req.AgentEnvelope)
 	if err != nil {
 		// Fail closed: if we can't get a decision, do not touch the App.
 		c.Header("X-CBAC-Decision", "error")

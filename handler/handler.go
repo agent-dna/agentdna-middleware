@@ -1353,8 +1353,7 @@ func (h *Handler) UploadAgentPolicy(c *gin.Context) {
 		return
 	}
 	orgID, _ := h.db.GetAgentOrgID(agentDID)
-	nftID, _ := h.db.GetAgentNFTID(agentDID)
-	if err := h.callUpdateAgent(agentInfo.AgentName, nftID, content, agentInfo.DeployerDID, orgID); err != nil {
+	if err := h.callUpdateAgent(agentInfo.AgentName, agentDID, content, agentInfo.DeployerDID, orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
 	}
