@@ -31,9 +31,12 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/user-intents", h.UserIntents)
 	dashboard.GET("/agent-info", h.AgentInfo)
 	dashboard.GET("/intent-info", h.IntentInfo)
+	dashboard.GET("/intent-diagram", h.IntentDiagram)
 	dashboard.GET("/tools-list", h.ToolsList)
 	dashboard.GET("/tool-info", h.ToolInfo)
 	dashboard.GET("/intent-list", h.IntentList)
+	dashboard.GET("/threats-list", h.ThreatsList)
+	dashboard.GET("/top-threat-agents", h.TopThreatAgents)
 
 	dashboard.GET("/agents-creation-requests-list", h.AgentsCreationRequestsList)
 	dashboard.GET("/agents-creation-requests-list-user", h.AgentsCreationRequestsListUser)

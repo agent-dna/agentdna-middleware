@@ -84,6 +84,7 @@ type IntentRecord struct {
 	InteractionsCount    int
 	AgentsCount          int
 	ToolsCount           int
+	ThreatCount          int
 	FirstInteractionAt   *time.Time
 	LastInteractionAt    *time.Time
 	RuntimeSeconds       float64

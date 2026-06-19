@@ -214,8 +214,8 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 	threatDetected := data.Verification.Status != "ok" || len(data.Verification.TrustIssues) > 0
 
 	interactionIDs := make([]string, 0, len(interactions))
-	for _, ix := range interactions {
-		iid := uuid.New().String()
+	for idx, ix := range interactions {
+		iid := fmt.Sprintf("%s-%d", intentID, idx+1)
 		interactionIDs = append(interactionIDs, iid)
 		if err := h.db.StoreNewInteraction(
 			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID,
@@ -492,6 +492,8 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 		return
 	}
 
+	intentID := c.Query("intentID")
+
 	const pageSize = 10
 	page := 1
 	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
@@ -499,13 +501,25 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountInteractionsByOrg(orgID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count interactions: %v", err)})
-		return
-	}
+	var total int
+	var interactions []*db.InteractionRecord
+	var err error
 
-	interactions, err := h.db.GetInteractionsByOrg(orgID, pageSize, offset)
+	if intentID != "" {
+		total, err = h.db.CountInteractionsByOrgAndIntent(orgID, intentID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count interactions: %v", err)})
+			return
+		}
+		interactions, err = h.db.GetInteractionsByOrgAndIntent(orgID, intentID, pageSize, offset)
+	} else {
+		total, err = h.db.CountInteractionsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count interactions: %v", err)})
+			return
+		}
+		interactions, err = h.db.GetInteractionsByOrg(orgID, pageSize, offset)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch interactions: %v", err)})
 		return
@@ -537,6 +551,113 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 			"page":            page,
 			"pageSize":        pageSize,
 			"totalPages":      totalPages,
+		},
+	})
+}
+
+func (h *Handler) ThreatsList(c *gin.Context) {
+	w := http.ResponseWriter(c.Writer)
+	enableCors(&w)
+
+	orgID := c.GetString(CtxOrgID)
+	if orgID == "" {
+		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
+		return
+	}
+
+	const pageSize = 10
+	page := 1
+	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
+		page = p
+	}
+	offset := (page - 1) * pageSize
+
+	total, err := h.db.CountThreatsByOrg(orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count threats: %v", err)})
+		return
+	}
+
+	threats, err := h.db.GetThreatsByOrg(orgID, pageSize, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch threats: %v", err)})
+		return
+	}
+
+	list := make([]gin.H, 0, len(threats))
+	for _, t := range threats {
+		list = append(list, gin.H{
+			"interactionID": t.InteractionID,
+			"from":          t.From,
+			"fromName":      t.FromName,
+			"to":            t.To,
+			"toName":        t.ToName,
+			"type":          t.Type,
+			"direction":     t.Direction,
+			"intentID":      t.IntentID,
+			"time":          t.Time,
+		})
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Status: true,
+		Data: gin.H{
+			"threatsList": list,
+			"total":       total,
+			"page":        page,
+			"pageSize":    pageSize,
+			"totalPages":  (total + pageSize - 1) / pageSize,
+		},
+	})
+}
+
+func (h *Handler) TopThreatAgents(c *gin.Context) {
+	w := http.ResponseWriter(c.Writer)
+	enableCors(&w)
+
+	orgID := c.GetString(CtxOrgID)
+	if orgID == "" {
+		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
+		return
+	}
+
+	const pageSize = 5
+	page := 1
+	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
+		page = p
+	}
+	offset := (page - 1) * pageSize
+
+	total, err := h.db.CountTopThreatAgentsByOrg(orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count threat agents: %v", err)})
+		return
+	}
+
+	agents, err := h.db.GetTopThreatAgentsByOrg(orgID, pageSize, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch threat agents: %v", err)})
+		return
+	}
+
+	list := make([]gin.H, 0, len(agents))
+	for _, a := range agents {
+		list = append(list, gin.H{
+			"agentDID":          a.AgentDID,
+			"agentName":         a.AgentName,
+			"totalInteractions": a.TotalInteractions,
+			"totalThreats":      a.TotalThreats,
+		})
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Status: true,
+		Data: gin.H{
+			"agentsList": list,
+			"total":      total,
+			"page":       page,
+			"pageSize":   pageSize,
+			"totalPages": (total + pageSize - 1) / pageSize,
 		},
 	})
 }
@@ -927,6 +1048,7 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 			"interactionsCount":  i.InteractionsCount,
 			"agentsCount":        i.AgentsCount,
 			"toolsCount":         i.ToolsCount,
+			"threatCount":        i.ThreatCount,
 			"firstInteractionAt": i.FirstInteractionAt,
 			"lastInteractionAt":  i.LastInteractionAt,
 			"runtimeSeconds":     i.RuntimeSeconds,
@@ -937,6 +1059,84 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 		list = append(list, entry)
 	}
 	return list
+}
+
+func (h *Handler) IntentDiagram(c *gin.Context) {
+	intentID := c.Query("intentID")
+	w := http.ResponseWriter(c.Writer)
+	enableCors(&w)
+
+	orgID := c.GetString(CtxOrgID)
+	if intentID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intentID is required"})
+		return
+	}
+
+	intent, err := h.db.GetIntentInfo(intentID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "intent not found"})
+		return
+	}
+	if intent.OrgID != orgID {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+		return
+	}
+
+	interactions, err := h.db.GetInteractionsByIntent(intentID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch interactions: %v", err)})
+		return
+	}
+
+	type DiagramNode struct {
+		DID             string         `json:"did"`
+		Name            string         `json:"name"`
+		InteractionID   string         `json:"interactionID,omitempty"`
+		InteractionType string         `json:"interactionType,omitempty"`
+		Direction       string         `json:"direction,omitempty"`
+		Threat          bool           `json:"threat"`
+		Children        []*DiagramNode `json:"children"`
+	}
+
+	root := &DiagramNode{
+		DID:      intent.InitiatorDID,
+		Name:     intent.InitiatorName,
+		Children: []*DiagramNode{},
+	}
+
+	// Stack tracks the current path from root to the active node.
+	stack := []*DiagramNode{root}
+
+	for _, ix := range interactions {
+		current := stack[len(stack)-1]
+
+		if ix.Direction == "outbound" {
+			child := &DiagramNode{
+				DID:             ix.To,
+				Name:            ix.ToName,
+				InteractionID:   ix.InteractionID,
+				InteractionType: ix.Type,
+				Direction:       ix.Direction,
+				Threat:          ix.Threat,
+				Children:        []*DiagramNode{},
+			}
+			current.Children = append(current.Children, child)
+			stack = append(stack, child)
+		} else {
+			// inbound — pop back up, but keep at least root on the stack
+			if len(stack) > 1 {
+				stack = stack[:len(stack)-1]
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Status: true,
+		Data: gin.H{
+			"intentID":  intentID,
+			"diagram":   root,
+		},
+	})
 }
 
 func (h *Handler) AgentInfo(c *gin.Context) {
@@ -962,6 +1162,8 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 		return
 	}
 
+	deployerName, _ := h.db.GetOrgUserNameByDID(agent.DeployerDID)
+
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
@@ -969,6 +1171,7 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 			"agentName":         agent.AgentName,
 			"createdAt":         agent.CreatedAt,
 			"deployerDID":       agent.DeployerDID,
+			"deployerName":      deployerName,
 			"policy":            agent.Policy,
 			"orgID":             orgID,
 			"totalInteractions": agent.TotalInteractions,
