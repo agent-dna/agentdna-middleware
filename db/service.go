@@ -1061,3 +1061,58 @@ func scanToolRows(rows *sql.Rows) ([]*ToolRecord, error) {
 	return result, nil
 }
 
+func (d *DB) StoreIntentBlockData(r *IntentBlockRecord) error {
+	trustJSON, _ := json.Marshal(r.TrustIssues)
+	threatInt := 0
+	if r.ThreatDetected {
+		threatInt = 1
+	}
+	_, err := d.conn.Exec(`
+		INSERT INTO intent_block_data
+		  (id, intent_id, block_index, agent_did, agent_name, direction, block_type,
+		   message, response, delegate_to, received_from, cbac_app, cbac_decision,
+		   threat_detected, trust_issues)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+		ON CONFLICT (id) DO NOTHING`,
+		r.ID, r.IntentID, r.BlockIndex, r.AgentDID, r.AgentName, r.Direction, r.BlockType,
+		r.Message, r.Response, r.DelegateTo, r.ReceivedFrom, r.CbacApp, r.CbacDecision,
+		threatInt, string(trustJSON),
+	)
+	return err
+}
+
+func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, error) {
+	rows, err := d.conn.Query(`
+		SELECT id, intent_id, block_index, agent_did, agent_name, direction, block_type,
+		       message, response, delegate_to, received_from, cbac_app, cbac_decision,
+		       threat_detected, trust_issues, created_at
+		FROM intent_block_data
+		WHERE intent_id = $1
+		ORDER BY block_index ASC`,
+		intentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []*IntentBlockRecord
+	for rows.Next() {
+		r := &IntentBlockRecord{}
+		var threatInt int
+		var trustJSON string
+		if err := rows.Scan(
+			&r.ID, &r.IntentID, &r.BlockIndex, &r.AgentDID, &r.AgentName,
+			&r.Direction, &r.BlockType, &r.Message, &r.Response,
+			&r.DelegateTo, &r.ReceivedFrom, &r.CbacApp, &r.CbacDecision,
+			&threatInt, &trustJSON, &r.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		r.ThreatDetected = threatInt == 1
+		_ = json.Unmarshal([]byte(trustJSON), &r.TrustIssues)
+		result = append(result, r)
+	}
+	return result, nil
+}
+

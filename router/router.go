@@ -32,6 +32,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/agent-info", h.AgentInfo)
 	dashboard.GET("/intent-info", h.IntentInfo)
 	dashboard.GET("/intent-diagram", h.IntentDiagram)
+	dashboard.GET("/intent-block-data", h.GetIntentBlockData)
 	dashboard.GET("/tools-list", h.ToolsList)
 	dashboard.GET("/tool-info", h.ToolInfo)
 	dashboard.GET("/intent-list", h.IntentList)

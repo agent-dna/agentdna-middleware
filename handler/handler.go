@@ -129,21 +129,26 @@ func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 }
 
 func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
+	log.Printf("[intentNFT] received nft_id=%s", nftInfo)
 
 	data, err := parseChainNFT(nftInfo.Data)
-	fmt.Printf("test1", nftInfo)
-	fmt.Printf("test %+v\n", data )
 	if err != nil {
+		log.Printf("[intentNFT] failed to parse chain nft_id=%s: %v", nftInfo.NFTId, err)
 		return err
 	}
 	if data.Chain == nil {
+		log.Printf("[intentNFT] chain is nil nft_id=%s", nftInfo.NFTId)
 		return fmt.Errorf("handleIntentNFT: chain is nil")
 	}
+
+	log.Printf("[intentNFT] parsed ok — type=%s executor=%s chain_depth=%d trust_status=%s trust_issues=%v",
+		data.Type, data.Executor, data.Verification.ChainDepth, data.Verification.Status, data.Verification.TrustIssues)
 
 	blocks := walkChain(data.Chain)
 	intentID := nftInfo.NFTId
 	interactions := extractInteractions(blocks)
 
+	log.Printf("[intentNFT] extracted blocks=%d interactions=%d", len(blocks), len(interactions))
 	// ── Log extracted content ────────────────────────────────────────────────
 
 
@@ -227,6 +232,58 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 		}
 	}
 
+	// ── 6b. Store per-block payload data ────────────────────────────────────
+	for idx, b := range blocks {
+		getString := func(m map[string]any, key string) string {
+			if v, ok := m[key]; ok {
+				switch s := v.(type) {
+				case string:
+					return s
+				default:
+					bs, _ := json.Marshal(v)
+					return string(bs)
+				}
+			}
+			return ""
+		}
+
+		msg := getString(b.Envelope.Payload, "original_message")
+		if msg == "" {
+			msg = getString(b.Envelope.Payload, "message")
+		}
+
+		cbacApp, cbacDecision := "", ""
+		if cbacRaw, ok := b.Envelope.Payload["cbac"]; ok && cbacRaw != nil {
+			if cbacMap, ok := cbacRaw.(map[string]any); ok {
+				cbacApp, _ = cbacMap["app"].(string)
+				cbacDecision, _ = cbacMap["decision"].(string)
+			}
+		}
+
+		threat := cbacDecision == "deny" || !b.Verification.SignatureValid || len(b.Verification.TrustIssues) > 0
+
+		rec := &db.IntentBlockRecord{
+			ID:             fmt.Sprintf("%s-block-%d", intentID, idx),
+			IntentID:       intentID,
+			BlockIndex:     idx,
+			AgentDID:       b.Agent,
+			AgentName:      b.Name,
+			Direction:      b.Direction,
+			BlockType:      b.Type,
+			Message:        msg,
+			Response:       getString(b.Envelope.Payload, "response"),
+			DelegateTo:     getString(b.Envelope.Payload, "delegate_to"),
+			ReceivedFrom:   getString(b.Envelope.Payload, "received_from"),
+			CbacApp:        cbacApp,
+			CbacDecision:   cbacDecision,
+			ThreatDetected: threat,
+			TrustIssues:    b.Verification.TrustIssues,
+		}
+		if err := h.db.StoreIntentBlockData(rec); err != nil {
+			log.Printf("[intentNFT] block data save error idx=%d: %v", idx, err)
+		}
+	}
+
 	// ── 7. Store intent ──────────────────────────────────────────────────────
 	if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, chainDepth, threatDetected, interactionIDs); err != nil {
 		log.Printf("[intentNFT] intent save error: %v", err)
@@ -234,6 +291,59 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 	}
 	log.Printf("[intentNFT] saved intent_id=%s interactions=%d", intentID, len(interactionIDs))
 	return nil
+}
+
+func (h *Handler) GetIntentBlockData(c *gin.Context) {
+	intentID := c.Query("intent_id")
+	if intentID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intent_id is required"})
+		return
+	}
+	blocks, err := h.db.GetIntentBlocksByIntent(intentID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
+		return
+	}
+	type blockOut struct {
+		ID             string   `json:"id"`
+		BlockIndex     int      `json:"block_index"`
+		AgentDID       string   `json:"agent_did"`
+		AgentName      string   `json:"agent_name"`
+		Direction      string   `json:"direction"`
+		BlockType      string   `json:"block_type"`
+		Message        string   `json:"message"`
+		Response       string   `json:"response"`
+		DelegateTo     string   `json:"delegate_to"`
+		ReceivedFrom   string   `json:"received_from"`
+		CbacApp        string   `json:"cbac_app"`
+		CbacDecision   string   `json:"cbac_decision"`
+		ThreatDetected bool     `json:"threat_detected"`
+		TrustIssues    []string `json:"trust_issues"`
+	}
+	out := make([]blockOut, 0, len(blocks))
+	for _, b := range blocks {
+		issues := b.TrustIssues
+		if issues == nil {
+			issues = []string{}
+		}
+		out = append(out, blockOut{
+			ID:             b.ID,
+			BlockIndex:     b.BlockIndex,
+			AgentDID:       b.AgentDID,
+			AgentName:      b.AgentName,
+			Direction:      b.Direction,
+			BlockType:      b.BlockType,
+			Message:        b.Message,
+			Response:       b.Response,
+			DelegateTo:     b.DelegateTo,
+			ReceivedFrom:   b.ReceivedFrom,
+			CbacApp:        b.CbacApp,
+			CbacDecision:   b.CbacDecision,
+			ThreatDetected: b.ThreatDetected,
+			TrustIssues:    issues,
+		})
+	}
+	c.JSON(http.StatusOK, Response{Status: true, Data: out})
 }
 
 func (h *Handler) issueToken(claims JWTClaims) (string, error) {

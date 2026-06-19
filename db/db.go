@@ -122,6 +122,25 @@ type OrgUserRecord struct {
 	AgentAccessList []string
 }
 
+type IntentBlockRecord struct {
+	ID            string
+	IntentID      string
+	BlockIndex    int
+	AgentDID      string
+	AgentName     string
+	Direction     string
+	BlockType     string
+	Message       string
+	Response      string
+	DelegateTo    string
+	ReceivedFrom  string
+	CbacApp       string
+	CbacDecision  string
+	ThreatDetected bool
+	TrustIssues   []string
+	CreatedAt     time.Time
+}
+
 type DB struct {
 	conn *sql.DB
 }
@@ -229,6 +248,30 @@ func New(dsn string) *DB {
 			did             TEXT PRIMARY KEY,
 			name            TEXT,
 			organization_id TEXT
+		);
+	`)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = conn.Exec(`
+		CREATE TABLE IF NOT EXISTS intent_block_data (
+			id             TEXT PRIMARY KEY,
+			intent_id      TEXT NOT NULL,
+			block_index    INTEGER,
+			agent_did      TEXT DEFAULT '',
+			agent_name     TEXT DEFAULT '',
+			direction      TEXT DEFAULT '',
+			block_type     TEXT DEFAULT '',
+			message        TEXT DEFAULT '',
+			response       TEXT DEFAULT '',
+			delegate_to    TEXT DEFAULT '',
+			received_from  TEXT DEFAULT '',
+			cbac_app       TEXT DEFAULT '',
+			cbac_decision  TEXT DEFAULT '',
+			threat_detected INTEGER DEFAULT 0,
+			trust_issues   TEXT DEFAULT '[]',
+			created_at     TIMESTAMPTZ DEFAULT NOW()
 		);
 	`)
 	if err != nil {
