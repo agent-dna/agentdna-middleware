@@ -60,26 +60,47 @@ func (h *Handler) JWTAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// If is_admin is not in the JWT, fall back to a DB lookup by DID or email.
-		isAdmin := claims.IsAdmin
-		if !isAdmin {
-			did := claims.DID
-			if did == "" {
-				did = claims.Subject // some servers put identity in sub
-			}
-			if did != "" {
-				if _, err := h.db.GetAdminByDID(did); err == nil {
-					isAdmin = true
-					log.Printf("[JWT] is_admin not in token, confirmed admin via DB DID lookup did=%s", did)
-				}
-			}
-			if !isAdmin && claims.Email != "" {
-				if _, err := h.db.GetAdminByEmail(claims.Email); err == nil {
-					isAdmin = true
-					log.Printf("[JWT] is_admin not in token, confirmed admin via DB email lookup email=%s", claims.Email)
-				}
+		// Always verify admin status from the DB — never trust the token claim.
+		isAdmin := false
+		log.Printf("[JWT:admin-check] did=%q email=%q org_id=%q", claims.DID, claims.Email, claims.OrgID)
+		if claims.DID != "" {
+			_, err := h.db.GetAdminByDID(claims.DID)
+			log.Printf("[JWT:admin-check] GetAdminByDID did=%q err=%v", claims.DID, err)
+			if err == nil {
+				isAdmin = true
 			}
 		}
+		if !isAdmin && claims.Email != "" {
+			_, err := h.db.GetAdminByEmail(claims.Email)
+			log.Printf("[JWT:admin-check] GetAdminByEmail email=%q err=%v", claims.Email, err)
+			if err == nil {
+				isAdmin = true
+			}
+		}
+		// Fallback: check by org_id — if an admin record exists and DID matches, it's admin.
+		if !isAdmin && claims.OrgID != "" {
+			admin, err := h.db.GetAdminByOrgID(claims.OrgID)
+			log.Printf("[JWT:admin-check] GetAdminByOrgID org_id=%q foundDID=%q err=%v", claims.OrgID, func() string {
+				if admin != nil {
+					return admin.DID
+				}
+				return ""
+			}(), err)
+			if err == nil && admin.DID == claims.DID {
+				isAdmin = true
+			}
+		}
+		// Auto-register: if JWT is valid, has a DID + org_id, but no admin record
+		// exists yet for this org, store the admin so subsequent requests work.
+		if !isAdmin && claims.DID != "" && claims.OrgID != "" {
+			if err := h.db.StoreAdmin(claims.DID, claims.OrgID, "", "", ""); err == nil {
+				log.Printf("[JWT:admin-check] auto-registered admin did=%q org_id=%q", claims.DID, claims.OrgID)
+				isAdmin = true
+			} else {
+				log.Printf("[JWT:admin-check] auto-register failed: %v", err)
+			}
+		}
+		log.Printf("[JWT:admin-check] result is_admin=%v", isAdmin)
 
 		log.Printf("[JWT] verified ok — sub=%s did=%s org_id=%s is_admin=%v", claims.Subject, claims.DID, claims.OrgID, isAdmin)
 

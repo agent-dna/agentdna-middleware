@@ -45,6 +45,98 @@ func parseAgentNFT(data string) (*agentNFTData, error) {
 	return &d, nil
 }
 
+func parseIntentWorkflow(data string) (*intentWorkflowData, error) {
+	var d intentWorkflowData
+	if err := json.Unmarshal([]byte(data), &d); err != nil {
+		return nil, fmt.Errorf("parseIntentWorkflow: %v", err)
+	}
+	return &d, nil
+}
+
+// walkEnvelopes unrolls the parent_envelope chain into chronological order (oldest first).
+func walkEnvelopes(root *workflowEnvelope) []*workflowEnvelope {
+	var envs []*workflowEnvelope
+	for e := root; e != nil; e = e.ParentEnvelope {
+		envs = append(envs, e)
+	}
+	for i, j := 0, len(envs)-1; i < j; i, j = i+1, j-1 {
+		envs[i], envs[j] = envs[j], envs[i]
+	}
+	return envs
+}
+
+// extractInteractionsFromEnvelopes maps each envelope directly to one interaction hop.
+// Type is derived from actor types and position in chain (no direction field needed).
+func extractInteractionsFromEnvelopes(envs []*workflowEnvelope) []interactionExtract {
+	seenAsFrom := map[string]bool{}
+	var result []interactionExtract
+	for _, e := range envs {
+		result = append(result, interactionExtract{
+			FromDID:  e.From.ID,
+			FromName: e.From.Name,
+			ToDID:    e.To.ID,
+			ToName:   e.To.Name,
+			Type:     deriveWorkflowInteractionType(e, seenAsFrom),
+			Threat:   len(e.Issues) > 0,
+		})
+		seenAsFrom[e.From.ID] = true
+	}
+	return result
+}
+
+func deriveWorkflowInteractionType(e *workflowEnvelope, seenAsFrom map[string]bool) string {
+	if e.From.Type == "human" {
+		return "trigger"
+	}
+	if e.To.Type == "app" {
+		return "tool_call"
+	}
+	if e.From.ID == e.To.ID {
+		return "tool_response"
+	}
+	// agent→agent: if the destination was already a sender earlier, we're going back up
+	if seenAsFrom[e.To.ID] {
+		return "response"
+	}
+	return "delegate"
+}
+
+func detectFlowTypeFromExtracts(interactions []interactionExtract) string {
+	hasTrigger, hasToolCall, hasResponse := false, false, false
+	delegateCount := 0
+	for _, ix := range interactions {
+		switch ix.Type {
+		case "trigger":
+			hasTrigger = true
+		case "tool_call":
+			hasToolCall = true
+		case "delegate":
+			delegateCount++
+		case "response":
+			hasResponse = true
+		}
+	}
+	_ = hasResponse
+	switch {
+	case hasTrigger && hasToolCall && delegateCount > 1:
+		return "delegated_cbac"
+	case hasTrigger && hasToolCall:
+		return "cbac"
+	case hasTrigger && delegateCount > 1:
+		return "delegated"
+	case hasTrigger:
+		return "external_trigger"
+	case hasToolCall && delegateCount > 1:
+		return "delegated_cbac"
+	case hasToolCall:
+		return "cbac"
+	case delegateCount > 1:
+		return "delegated"
+	default:
+		return "simple"
+	}
+}
+
 func parseChainNFT(data string) (*chainNFTData, error) {
 	var d chainNFTData
 	if err := json.Unmarshal([]byte(data), &d); err != nil {

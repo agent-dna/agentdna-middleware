@@ -29,6 +29,22 @@ func (d *DB) GetAdminByEmail(email string) (*AdminRecord, error) {
 	return &a, nil
 }
 
+func (d *DB) GetAdminEmailByOrgID(orgID string) (name, email string, err error) {
+	err = d.conn.QueryRow(
+		`SELECT COALESCE(did,''), COALESCE(email,'') FROM new_admins WHERE organization_id = $1 LIMIT 1`,
+		orgID,
+	).Scan(&name, &email)
+	return
+}
+
+func (d *DB) GetOrgUserEmailByDID(did string) (name, email string, err error) {
+	err = d.conn.QueryRow(
+		`SELECT COALESCE(name,''), COALESCE(email,'') FROM new_org_users WHERE did = $1`,
+		did,
+	).Scan(&name, &email)
+	return
+}
+
 func (d *DB) GetAdminByDID(did string) (*AdminRecord, error) {
 	var a AdminRecord
 	var orgID, apiKey sql.NullString
@@ -39,6 +55,19 @@ func (d *DB) GetAdminByDID(did string) (*AdminRecord, error) {
 		return nil, err
 	}
 	a.OrganizationID = orgID.String
+	a.APIKey = apiKey.String
+	return &a, nil
+}
+
+func (d *DB) GetAdminByOrgID(orgID string) (*AdminRecord, error) {
+	var a AdminRecord
+	var apiKey sql.NullString
+	err := d.conn.QueryRow(
+		`SELECT did, organization_id, api_key, email, password FROM new_admins WHERE organization_id = $1 LIMIT 1`, orgID,
+	).Scan(&a.DID, &a.OrganizationID, &apiKey, &a.Email, &a.PasswordHash)
+	if err != nil {
+		return nil, err
+	}
 	a.APIKey = apiKey.String
 	return &a, nil
 }
@@ -465,6 +494,30 @@ func (d *DB) GetOrgMetrics(orgID string) (*OrgMetrics, error) {
 	return m, nil
 }
 
+type GlobalStats struct {
+	TotalUsers        int `json:"totalUsers"`
+	TotalAgents       int `json:"totalAgents"`
+	TotalInteractions int `json:"totalInteractions"`
+	TotalIntents      int `json:"totalIntents"`
+	TotalThreats      int `json:"totalThreats"`
+}
+
+func (d *DB) GetGlobalStats() (*GlobalStats, error) {
+	s := &GlobalStats{}
+	err := d.conn.QueryRow(`
+		SELECT
+			(SELECT COUNT(*) FROM new_org_users),
+			(SELECT COUNT(*) FROM new_agents),
+			(SELECT COUNT(*) FROM new_interactions),
+			(SELECT COUNT(*) FROM new_intents),
+			(SELECT COUNT(*) FROM new_interactions WHERE threat = 1)
+	`).Scan(&s.TotalUsers, &s.TotalAgents, &s.TotalInteractions, &s.TotalIntents, &s.TotalThreats)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
 func (d *DB) GetTopAgentsByOrg(orgID string, limit, offset int) ([]*AgentVolumeRecord, error) {
 	rows, err := d.conn.Query(`
 		SELECT
@@ -498,6 +551,75 @@ func (d *DB) GetTopAgentsByOrg(orgID string, limit, offset int) ([]*AgentVolumeR
 	return result, nil
 }
 
+type UserProfile struct {
+	Name          string `json:"name"`
+	Email         string `json:"email"`
+	APIKey        string `json:"apiKey"`
+	OrganizationID string `json:"organizationID"`
+	CreatedAt     string `json:"createdAt"`
+	AdminEmail    string `json:"adminEmail"`
+}
+
+func (d *DB) GetUserProfile(email string) (*UserProfile, error) {
+	p := &UserProfile{}
+	err := d.conn.QueryRow(`
+		SELECT
+			COALESCE(u.name, ''),
+			u.email,
+			COALESCE(u.api_key, ''),
+			COALESCE(u.organization_id, ''),
+			COALESCE(u.created_at::TEXT, ''),
+			COALESCE(a.email, '')
+		FROM new_org_users u
+		LEFT JOIN new_admins a ON a.organization_id = u.organization_id
+		WHERE u.email = $1`,
+		email,
+	).Scan(&p.Name, &p.Email, &p.APIKey, &p.OrganizationID, &p.CreatedAt, &p.AdminEmail)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+type AdminProfile struct {
+	Name           string `json:"name"`
+	Email          string `json:"email"`
+	OrganizationID string `json:"organizationID"`
+	APIKey         string `json:"apiKey"`
+	AgentCount     int    `json:"agentCount"`
+	IntentCount    int    `json:"intentCount"`
+	ThreatCount    int    `json:"threatCount"`
+	TotalUsers     int    `json:"totalUsers"`
+	CreatedAt      int64  `json:"createdAt"`
+}
+
+func (d *DB) GetAdminProfile(email string) (*AdminProfile, error) {
+	p := &AdminProfile{}
+	var createdAt sql.NullTime
+	err := d.conn.QueryRow(`
+		SELECT
+			COALESCE(name, ''),
+			email,
+			COALESCE(organization_id, ''),
+			COALESCE(api_key, ''),
+			agent_count,
+			intent_count,
+			threat_count,
+			total_users,
+			created_at
+		FROM new_admins
+		WHERE email = $1`,
+		email,
+	).Scan(&p.Name, &p.Email, &p.OrganizationID, &p.APIKey, &p.AgentCount, &p.IntentCount, &p.ThreatCount, &p.TotalUsers, &createdAt)
+	if err != nil {
+		return nil, err
+	}
+	if createdAt.Valid {
+		p.CreatedAt = createdAt.Time.Unix()
+	}
+	return p, nil
+}
+
 func (d *DB) GetOrgUserByEmail(email string) (*OrgUserRecord, error) {
 	var u OrgUserRecord
 	var (
@@ -522,6 +644,37 @@ func (d *DB) GetOrgUserByEmail(email string) (*OrgUserRecord, error) {
 		u.AgentAccessList = []string{}
 	}
 	return &u, nil
+}
+
+func (d *DB) GetOrgUserByAPIKey(apiKey string) (*OrgUserRecord, error) {
+	u := &OrgUserRecord{}
+	var accessListJSON string
+	err := d.conn.QueryRow(`
+		SELECT did, organization_id, COALESCE(api_key,''), COALESCE(nft_id,''),
+		       COALESCE(name,''), email, password, COALESCE(policy,''),
+		       agent_count, intent_count, threat_count,
+		       COALESCE(agent_access_list,'[]'), COALESCE(key,'')
+		FROM new_org_users WHERE api_key = $1`,
+		apiKey,
+	).Scan(
+		&u.DID, &u.OrganizationID, &u.APIKey, &u.NFTID,
+		&u.Name, &u.Email, &u.PasswordHash, &u.Policy,
+		&u.AgentCount, &u.IntentCount, &u.ThreatCount,
+		&accessListJSON, &u.Key,
+	)
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal([]byte(accessListJSON), &u.AgentAccessList)
+	return u, nil
+}
+
+func (d *DB) UpdateUserDIDByAPIKey(apiKey, did string) error {
+	_, err := d.conn.Exec(
+		`UPDATE new_org_users SET did = $1 WHERE api_key = $2`,
+		did, apiKey,
+	)
+	return err
 }
 
 func (d *DB) GetUserPolicy(did string) (string, error) {
@@ -580,6 +733,61 @@ func (d *DB) StoreOrgUser(nftID, did, orgID, name, email, passwordHash string) e
 		nftID, did, orgID, name, email, passwordHash,
 	)
 	return err
+}
+
+// RegisterOrgUser creates a new user with a generated api_key and a temporary
+// placeholder DID. The real DID is populated later via UpdateUserDIDByAPIKey.
+func (d *DB) RegisterOrgUser(apiKey, orgID, name, email, passwordHash string) error {
+	if name == "" {
+		var n int
+		for {
+			n++
+			candidate := fmt.Sprintf("user_%d", n)
+			var exists bool
+			d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM new_org_users WHERE name = $1)`, candidate).Scan(&exists)
+			if !exists {
+				name = candidate
+				break
+			}
+		}
+	}
+	_, err := d.conn.Exec(
+		`INSERT INTO new_org_users ( api_key, organization_id, name, email, password)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		 apiKey, orgID, name, email, passwordHash,
+	)
+	return err
+}
+
+func (d *DB) SetUserKey(did, key string) error {
+	_, err := d.conn.Exec(
+		`UPDATE new_org_users SET key = $1 WHERE did = $2`,
+		key, did,
+	)
+	return err
+}
+
+func (d *DB) GetUserByKey(key string) (*OrgUserRecord, error) {
+	u := &OrgUserRecord{}
+	var accessListJSON string
+	err := d.conn.QueryRow(
+		`SELECT did, organization_id, COALESCE(api_key,''), COALESCE(nft_id,''),
+		        COALESCE(name,''), email, password, COALESCE(policy,''),
+		        agent_count, intent_count, threat_count,
+		        COALESCE(agent_access_list,'[]'), COALESCE(key,'')
+		 FROM new_org_users WHERE key = $1 LIMIT 1`,
+		key,
+	).Scan(
+		&u.DID, &u.OrganizationID, &u.APIKey, &u.NFTID,
+		&u.Name, &u.Email, &u.PasswordHash, &u.Policy,
+		&u.AgentCount, &u.IntentCount, &u.ThreatCount,
+		&accessListJSON, &u.Key,
+	)
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal([]byte(accessListJSON), &u.AgentAccessList)
+	return u, nil
 }
 
 func (d *DB) CountAgentsWithNamePrefix(prefix string) (int, error) {

@@ -42,19 +42,18 @@ type SmartContractInfo struct {
 }
 
 type JWTClaims struct {
-	DID     string `json:"did"`
-	Email   string `json:"email"`
-	OrgID   string `json:"org_id"`
-	NFTID   string `json:"nft_id"`
-	APIKey  string `json:"api_key"`
-	IsAdmin bool   `json:"is_admin"`
+	DID    string `json:"did"`
+	Email  string `json:"email"`
+	OrgID  string `json:"org_id"`
+	NFTID  string `json:"nft_id"`
+	APIKey string `json:"api_key"`
 	jwt.RegisteredClaims
 }
 
 const (
 	NFTTypeUser   = "user_nft"
 	NFTTypeAgent  = "agent_nft"
-	NFTTypeIntent = "intent_nft"
+	NFTTypeIntent = "intent_workflow"
 )
 
 type userNFTData struct {
@@ -81,6 +80,38 @@ type agentNFTMetadata struct {
 	OrgID     string `json:"orgId"`
 	Deployer  string `json:"deployer"`
 	AgentName string `json:"agent_name"`
+}
+
+// intentWorkflowData is the top-level structure for the intent_workflow format.
+type intentWorkflowData struct {
+	Type     string            `json:"type"`
+	Version  string            `json:"version"`
+	Remarks  string            `json:"remarks"`
+	Info     map[string]any    `json:"info"`
+	Envelope *workflowEnvelope `json:"envelope"`
+}
+
+type workflowActor struct {
+	ID       string         `json:"id"`
+	Name     string         `json:"name"`
+	Type     string         `json:"type"` // "human", "agent", "app"
+	Metadata map[string]any `json:"metadata"`
+}
+
+type workflowIssue struct {
+	Depth  int    `json:"depth"`
+	Reason string `json:"reason"`
+}
+
+type workflowEnvelope struct {
+	From           workflowActor     `json:"from_"`
+	To             workflowActor     `json:"to"`
+	Payload        string            `json:"payload"`
+	Epoch          int64             `json:"epoch"`
+	Metadata       map[string]any    `json:"metadata"`
+	Signature      string            `json:"signature"`
+	Issues         []workflowIssue   `json:"issues"`
+	ParentEnvelope *workflowEnvelope `json:"parent_envelope"`
 }
 
 // chainNFTData is the top-level structure of an intent NFT using the chain spec.
@@ -129,4 +160,3 @@ type interactionExtract struct {
 	Direction string
 	Threat    bool
 }
-

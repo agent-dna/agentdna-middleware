@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"agentdna-ratelimit-auth/db"
+	"agentdna-ratelimit-auth/email"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -36,11 +37,12 @@ type Handler struct {
 	adminServiceURL     string
 	createAgentEndpoint string
 	updateAgentEndpoint string
+	mailer              *email.Mailer
 }
 
 func New(database *db.DB, backendURL *url.URL, jwtSecret, adminServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
-	return &Handler{
+	h := &Handler{
 		db:                  database,
 		proxy:               proxy,
 		baseURL:             backendURL,
@@ -49,6 +51,25 @@ func New(database *db.DB, backendURL *url.URL, jwtSecret, adminServiceURL, creat
 		createAgentEndpoint: createAgentEndpoint,
 		updateAgentEndpoint: updateAgentEndpoint,
 	}
+	if cfg, err := email.LoadConfigFromEnv(); err == nil {
+		h.mailer = email.New(cfg)
+	} else {
+		log.Printf("[email] mailer disabled: %v", err)
+	}
+	return h
+}
+
+// sendMail fires an email in a goroutine so it never blocks the request path.
+// It is a no-op when no mailer is configured.
+func (h *Handler) sendMail(msg email.Message, err error) {
+	if err != nil || h.mailer == nil {
+		return
+	}
+	go func() {
+		if sendErr := h.mailer.Send(msg); sendErr != nil {
+			log.Printf("[email] send to %s failed: %v", msg.To, sendErr)
+		}
+	}()
 }
 
 func (h *Handler) Healthz(c *gin.Context) {
@@ -70,6 +91,7 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 		}
 		r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+       fmt.Print("ProxyHandler: received POST body: ", string(bodyBytes), "\n")
 
 		var payload txPayload
 		if jsonErr := json.Unmarshal(bodyBytes, &payload); jsonErr == nil && len(payload.Tokens.NFT) > 0 {
@@ -83,12 +105,12 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 				case NFTTypeAgent:
 					h.handleAgentNFT(nftInfo)
 				case NFTTypeIntent:
-					h.handleIntentNFT(nftInfo)
+					h.handleIntentWorkflow(nftInfo)
 				}
 			}
 		}
 	}
-
+	
 	h.proxy.ServeHTTP(w, r)
 }
 
@@ -106,6 +128,7 @@ func (h *Handler) handleUserNFT(nftInfo NFTInfo) error {
 }
 
 func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
+	fmt.Printf("[agentNFT] received nft_id=%s data=%s\n", nftInfo.NFTId, nftInfo.Data)
 	data, err := parseAgentNFT(nftInfo.Data)
 	if err != nil {
 		return err
@@ -126,6 +149,112 @@ func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 	}
 
 	return h.db.StoreNewAgent(nftInfo.NFTId, data.AgentDID, deployer, orgID, data.Policy, agentName)
+}
+
+func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
+	data, err := parseIntentWorkflow(nftInfo.Data)
+	if err != nil {
+		log.Printf("[intentWorkflow] failed to parse nft_id=%s: %v", nftInfo.NFTId, err)
+		return err
+	}
+	if data.Envelope == nil {
+		log.Printf("[intentWorkflow] envelope is nil nft_id=%s", nftInfo.NFTId)
+		return fmt.Errorf("handleIntentWorkflow: envelope is nil")
+	}
+
+	envelopes := walkEnvelopes(data.Envelope)
+	intentID := nftInfo.NFTId
+	interactions := extractInteractionsFromEnvelopes(envelopes)
+
+	log.Printf("[intentWorkflow] parsed ok — envelopes=%d interactions=%d", len(envelopes), len(interactions))
+	for i, ix := range interactions {
+		log.Printf("[intentWorkflow] interaction[%d] from=%s(%s) to=%s(%s) type=%s threat=%v",
+			i, ix.FromName, ix.FromDID, ix.ToName, ix.ToDID, ix.Type, ix.Threat)
+	}
+
+	// ── Resolve org ──────────────────────────────────────────────────────────
+	orgID := ""
+	for _, ix := range interactions {
+		if orgID == "" {
+			orgID, _ = h.db.GetAgentOrgID(ix.FromDID)
+		}
+		if orgID == "" {
+			orgID, _ = h.db.GetAgentOrgID(ix.ToDID)
+		}
+		if orgID != "" {
+			break
+		}
+	}
+	if orgID == "" {
+		orgID = "Test_Org"
+	}
+	log.Printf("[intentWorkflow] orgID=%s intentID=%s", orgID, intentID)
+
+	// ── Initiator is the from-actor of the oldest envelope ───────────────────
+	initiatorDID := ""
+	initiatorName := ""
+	if len(envelopes) > 0 {
+		initiatorDID = envelopes[0].From.ID
+		initiatorName = envelopes[0].From.Name
+	}
+
+	// ── Ensure agents exist ──────────────────────────────────────────────────
+	seen := map[string]bool{}
+	for _, e := range envelopes {
+		for _, actor := range []workflowActor{e.From, e.To} {
+			if actor.Type != "agent" || actor.ID == "" || seen[actor.ID] {
+				continue
+			}
+			seen[actor.ID] = true
+			if err := h.db.StoreNewAgent(uuid.New().String(), actor.ID, initiatorDID, orgID, "", actor.Name); err != nil {
+				log.Printf("[intentWorkflow] StoreNewAgent did=%s name=%s: %v", actor.ID, actor.Name, err)
+			} else {
+				log.Printf("[intentWorkflow] agent saved did=%s name=%s", actor.ID, actor.Name)
+			}
+		}
+	}
+
+	// ── Ensure initiator user exists if human ────────────────────────────────
+	if len(envelopes) > 0 && envelopes[0].From.Type == "human" && initiatorDID != "" {
+		hash, _ := bcrypt.GenerateFromPassword([]byte("test123"), bcrypt.DefaultCost)
+		userNFTID, _ := GetID(initiatorDID)
+		_ = h.db.StoreOrgUser(userNFTID, initiatorDID, orgID, initiatorName, initiatorName, string(hash))
+		log.Printf("[intentWorkflow] user saved did=%s name=%s", initiatorDID, initiatorName)
+	}
+
+	// ── Store interactions ───────────────────────────────────────────────────
+	threatDetected := false
+	interactionIDs := make([]string, 0, len(interactions))
+	for idx, ix := range interactions {
+		iid := fmt.Sprintf("%s-%d", intentID, idx+1)
+		interactionIDs = append(interactionIDs, iid)
+		if ix.Threat {
+			threatDetected = true
+		}
+		if err := h.db.StoreNewInteraction(
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID,
+		); err != nil {
+			return fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
+		}
+		if ix.Type == "tool_call" {
+			_ = h.db.StoreNewTool(ix.ToDID, ix.ToName, orgID)
+		}
+	}
+
+	// ── Store intent ─────────────────────────────────────────────────────────
+	flowType := detectFlowTypeFromExtracts(interactions)
+	chainDepth := len(envelopes)
+	executor := initiatorName
+	if executor == "" {
+		executor = initiatorDID
+	}
+
+	if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, chainDepth, threatDetected, interactionIDs); err != nil {
+		log.Printf("[intentWorkflow] intent save error: %v", err)
+		return err
+	}
+	log.Printf("[intentWorkflow] saved intent_id=%s interactions=%d threat=%v flowType=%s", intentID, len(interactionIDs), threatDetected, flowType)
+	return nil
 }
 
 func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
@@ -377,7 +506,7 @@ func (h *Handler) Login(c *gin.Context) {
 		}
 		tokenStr, err := h.issueToken(JWTClaims{
 			DID: user.DID, Email: user.Email, OrgID: user.OrganizationID,
-			NFTID: user.NFTID, APIKey: user.APIKey, IsAdmin: false,
+			NFTID: user.NFTID, APIKey: user.APIKey,
 		})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate token"})
@@ -411,7 +540,7 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 	tokenStr, err := h.issueToken(JWTClaims{
 		DID: admin.DID, Email: admin.Email, OrgID: admin.OrganizationID,
-		APIKey: admin.APIKey, IsAdmin: true,
+		APIKey: admin.APIKey,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate token"})
@@ -431,7 +560,41 @@ func (h *Handler) Login(c *gin.Context) {
 }
 
 func (h *Handler) Signup(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"message": "not implemented"})
+	var req struct {
+		DID      string `json:"did"`
+		Name     string `json:"name"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		OrgID    string `json:"orgID"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.DID == "" || req.Email == "" || req.Password == "" || req.OrgID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did, email, password and orgID are required"})
+		return
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
+		return
+	}
+
+	nftID, err := GetID(req.DID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate nft id"})
+		return
+	}
+
+	if err := h.db.StoreOrgUser(nftID, req.DID, req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register user: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
+		"did":   req.DID,
+		"name":  req.Name,
+		"email": req.Email,
+		"orgID": req.OrgID,
+	}})
 }
 
 func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
@@ -451,6 +614,7 @@ func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"did": req.DID, "org_id": req.OrgID}})
 }
+
 
 func (h *Handler) CreateUser(c *gin.Context) {
 	fmt.Printf("test create user")
@@ -515,7 +679,7 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 	}
 
 	// Call external agent service to register admin and get DID.
-	did, err := h.callRegisterAdmin(req.Username)
+	did, err := h.callRegisterAdmin(req.Username, req.OrgID, req.Password)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
@@ -539,6 +703,43 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 		"orgID":  req.OrgID,
 		"apiKey": apiKey,
 	}})
+}
+
+func (h *Handler) UserProfile(c *gin.Context) {
+	email := c.GetString(CtxEmail)
+	if email == "" {
+		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
+		return
+	}
+	profile, err := h.db.GetUserProfile(email)
+	if err != nil {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "user not found"})
+		return
+	}
+	c.JSON(http.StatusOK, Response{Status: true, Data: profile})
+}
+
+func (h *Handler) AdminProfile(c *gin.Context) {
+	email := c.GetString(CtxEmail)
+	if email == "" {
+		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
+		return
+	}
+	profile, err := h.db.GetAdminProfile(email)
+	if err != nil {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "admin not found"})
+		return
+	}
+	c.JSON(http.StatusOK, Response{Status: true, Data: profile})
+}
+
+func (h *Handler) GlobalStats(c *gin.Context) {
+	stats, err := h.db.GetGlobalStats()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, Response{Status: true, Data: stats})
 }
 
 func (h *Handler) HomeMetrics(c *gin.Context) {
@@ -1480,11 +1681,10 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 }
 
 // callRegisterAdmin calls the external agent service to register an admin and get their DID.
-func (h *Handler) callRegisterAdmin(username string) (string, error) {
-	fmt.Printf("test111:%s\n", username)
+func (h *Handler) callRegisterAdmin(username, org, password string) (string, error) {
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/register-admin"
 
-	b, _ := json.Marshal(map[string]string{"username": username})
+	b, _ := json.Marshal(map[string]string{"username": username, "org": org, "password": password})
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
 		return "", fmt.Errorf("callRegisterAdmin: http post: %v", err)
@@ -1515,6 +1715,7 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (
 	mw.WriteField("org_id", orgID)
 	mw.WriteField("agent_name", agentName)
 	fw, fwErr := mw.CreateFormFile("policy", "policy.txt")
+	fmt.Printf("TEST--11: creatorDID=%q orgID=%q agentName=%q policy=%q\n", creatorDID, orgID, agentName, policy)
 	if fwErr != nil {
 		return "", fmt.Errorf("callCreateAgent: create form file: %v", fwErr)
 	}
@@ -1908,8 +2109,17 @@ func (h *Handler) AgentsCreationRequestsListUser(c *gin.Context) {
 	enableCors(&w)
 
 	creatorDID := c.GetString(CtxDID)
+	email := c.GetString(CtxEmail)
+	log.Printf("[AgentsCreationRequestsListUser] ctx did=%q email=%q org_id=%q", creatorDID, email, c.GetString(CtxOrgID))
+	if creatorDID == "" && email != "" {
+		if u, err := h.db.GetOrgUserByEmail(email); err == nil && u.DID != "" {
+			creatorDID = u.DID
+			log.Printf("[AgentsCreationRequestsListUser] resolved did=%q from email=%q", creatorDID, email)
+		}
+	}
 	if creatorDID == "" {
-		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
+		log.Printf("[AgentsCreationRequestsListUser] rejecting — could not resolve DID")
+		c.JSON(http.StatusOK, Response{Status: false, Message: "no_did", Data: map[string]string{"email": email}})
 		return
 	}
 
@@ -1999,6 +2209,18 @@ func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
 	if err := h.db.CreateRequest(id, "deploy_agent", policy, creatorDID, agentID, agentName, requestInfo, orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to create request: %v", err)})
 		return
+	}
+
+	// Notify admin.
+	log.Printf("[AgentsCreationRequestsCreate] looking up admin for orgID=%q", orgID)
+	if _, adminEmail, err := h.db.GetAdminEmailByOrgID(orgID); err != nil {
+		log.Printf("[AgentsCreationRequestsCreate] GetAdminEmailByOrgID failed orgID=%q err=%v", orgID, err)
+	} else {
+		log.Printf("[AgentsCreationRequestsCreate] found admin email=%q, sending notification", adminEmail)
+		requesterName, _, _ := h.db.GetOrgUserEmailByDID(creatorDID)
+		log.Printf("[AgentsCreationRequestsCreate] requesterName=%q agentName=%q requestID=%q", requesterName, agentName, id)
+		h.sendMail(email.AgentCreationRequestNew(adminEmail, agentName, requesterName, id))
+		log.Printf("[AgentsCreationRequestsCreate] mail dispatched to admin=%q", adminEmail)
 	}
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"requestID": id}})
@@ -2103,6 +2325,11 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 	if err := h.db.UpdateRequestStatus(req.RequestID, req.Status); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to update status: %v", err)})
 		return
+	}
+
+	// Notify the request creator.
+	if userName, userEmail, err := h.db.GetOrgUserEmailByDID(existing.CreatorDID); err == nil {
+		h.sendMail(email.AgentCreationRequestStatus(userEmail, userName, existing.AgentName, req.Status))
 	}
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"requestID": req.RequestID, "status": req.Status}})
@@ -2276,4 +2503,40 @@ func (h *Handler) AgentAccessRequestSubmit(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"requestID": req.RequestID, "status": req.Status}})
+}
+
+func (h *Handler) RegisterUser(c *gin.Context) {
+	var req struct {
+		Name     string `json:"name"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		OrgID    string `json:"orgID"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || req.Password == "" || req.OrgID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email, password and orgID are required"})
+		return
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
+		return
+	}
+
+	// Generate a unique api_key.
+	apiKey := uuid.New().String()
+
+	if err := h.db.RegisterOrgUser( apiKey, req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register user: %v", err)})
+		return
+	}
+
+	h.sendMail(email.UserRegistration(req.Email, req.Name))
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
+		"api_key": apiKey,
+		"name":    req.Name,
+		"email":   req.Email,
+		"orgID":   req.OrgID,
+	}})
 }

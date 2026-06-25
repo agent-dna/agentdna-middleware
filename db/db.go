@@ -120,6 +120,7 @@ type OrgUserRecord struct {
 	IntentCount     int
 	ThreatCount     int
 	AgentAccessList []string
+	Key             string
 }
 
 type IntentBlockRecord struct {
@@ -168,12 +169,12 @@ func New(dsn string) *DB {
 			total_users     INTEGER DEFAULT 0
 		);
 		CREATE TABLE IF NOT EXISTS new_org_users (
-			did               TEXT PRIMARY KEY,
+			did               TEXT DEFAULT '',
 			organization_id   TEXT,
 			api_key           TEXT,
 			nft_id            TEXT,
 			name              TEXT DEFAULT '',
-			email             TEXT,
+			email             TEXT PRIMARY KEY,
 			password          TEXT,
 			policy            TEXT DEFAULT '',
 			agent_count       INTEGER DEFAULT 0,
@@ -280,7 +281,19 @@ func New(dsn string) *DB {
 
 	// Runtime migrations for existing databases.
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
+	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''`)
+	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
 	conn.Exec(`ALTER TABLE new_org_users ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''`)
+	conn.Exec(`ALTER TABLE new_org_users ADD COLUMN IF NOT EXISTS key TEXT DEFAULT ''`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_org_users_key ON new_org_users (key)`)
+	conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_org_users_api_key ON new_org_users (api_key) WHERE api_key IS NOT NULL AND api_key <> ''`)
+	// Migrate new_org_users primary key from did → email so users can be
+	// created without a DID (DID is populated later via user-did-to-key).
+	conn.Exec(`ALTER TABLE new_org_users ALTER COLUMN did DROP NOT NULL`)
+	conn.Exec(`ALTER TABLE new_org_users ALTER COLUMN did SET DEFAULT ''`)
+	conn.Exec(`ALTER TABLE new_org_users DROP CONSTRAINT IF EXISTS new_org_users_pkey`)
+	conn.Exec(`ALTER TABLE new_org_users ADD COLUMN IF NOT EXISTS email_pk_added BOOLEAN DEFAULT FALSE`)
+	conn.Exec(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE table_name='new_org_users' AND constraint_type='PRIMARY KEY') THEN ALTER TABLE new_org_users ADD PRIMARY KEY (email); END IF; END $$`)
 	// Migrate new_tools primary key from (did, organization_id) → did.
 	conn.Exec(`DELETE FROM new_tools WHERE ctid NOT IN (SELECT MIN(ctid) FROM new_tools GROUP BY did)`)
 	conn.Exec(`ALTER TABLE new_tools DROP CONSTRAINT IF EXISTS new_tools_pkey`)

@@ -7,18 +7,26 @@ import (
 
 func Register(r *gin.Engine, h *handler.Handler) {
 	r.GET("/healthz", h.Healthz)
+	r.POST("/core/v1/register-user", h.CoreRegisterUser)
+	r.POST("/core/v1/register-agent", h.CoreRegisterAgent)
 
 	// Dashboard — public
-	r.POST("/login", h.Login)
-	r.POST("/signup", h.Signup)
-	r.POST("/create-admin", h.CreateAdmin)
-	r.POST("/register-admin", h.RegisterAdminMiddleware)
+	public := r.Group("/dashboard/v1")
+	public.POST("/login", h.Login)
+	public.POST("/register-user", h.RegisterUser)
+	public.POST("/signup", h.Signup)
+	public.POST("/create-admin", h.CreateAdmin)
+	public.POST("/register-admin", h.RegisterAdminMiddleware)
 
 	// CBAC authorization gate — called by the agent runtime / SDK.
-	r.POST("/authorize-action", h.AuthorizeAction)
+	public.POST("/authorize-action", h.AuthorizeAction)
+
+	public.GET("/global-stats", h.GlobalStats)
 
 	// Dashboard — JWT protected
-	dashboard := r.Group("/", h.JWTAuthMiddleware())
+	dashboard := r.Group("/dashboard/v1", h.JWTAuthMiddleware())
+	dashboard.GET("/user-profile", h.UserProfile)
+	dashboard.GET("/admin-profile", h.AdminProfile)
 	dashboard.GET("/home-metrics", h.HomeMetrics)
 	dashboard.GET("/interactions-list", h.InteractionsList)
 	dashboard.GET("/agent-metrics", h.AgentMetrics)
@@ -58,6 +66,6 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/agent-policy", h.GetAgentPolicy)
 	dashboard.GET("/agent-policy-history", h.GetAgentPolicyHistory)
 	dashboard.GET("/agent-policy-update", h.GetAgentPolicyUpdate)
-
-
+	
 }
+
