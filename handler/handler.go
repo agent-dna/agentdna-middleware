@@ -501,11 +501,15 @@ func (h *Handler) Login(c *gin.Context) {
 
 	// Try org user first
 	user, err := h.db.GetOrgUserByEmail(req.Email)
+	log.Printf("[Login] GetOrgUserByEmail email=%q found=%v err=%v", req.Email, err == nil, err)
 	if err == nil {
+		log.Printf("[Login] user did=%q orgID=%q hasPasswordHash=%v", user.DID, user.OrganizationID, user.PasswordHash != "")
 		if user.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+			log.Printf("[Login] password mismatch for user email=%q", req.Email)
 			c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
 			return
 		}
+		log.Printf("[Login] user login success email=%q did=%q", req.Email, user.DID)
 		tokenStr, err := h.issueToken(JWTClaims{
 			DID: user.DID, Email: user.Email, OrgID: user.OrganizationID,
 			NFTID: user.NFTID, APIKey: user.APIKey,
@@ -532,14 +536,18 @@ func (h *Handler) Login(c *gin.Context) {
 
 	// Try admin
 	admin, err := h.db.GetAdminByEmail(req.Email)
+	log.Printf("[Login] GetAdminByEmail email=%q found=%v err=%v", req.Email, err == nil, err)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
 		return
 	}
+	log.Printf("[Login] admin did=%q orgID=%q hasPasswordHash=%v", admin.DID, admin.OrganizationID, admin.PasswordHash != "")
 	if admin.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(admin.PasswordHash), []byte(req.Password)) != nil {
+		log.Printf("[Login] password mismatch for admin email=%q", req.Email)
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
 		return
 	}
+	log.Printf("[Login] admin login success email=%q did=%q", req.Email, admin.DID)
 	tokenStr, err := h.issueToken(JWTClaims{
 		DID: admin.DID, Email: admin.Email, OrgID: admin.OrganizationID,
 		APIKey: admin.APIKey,
