@@ -1735,7 +1735,10 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (
 	mw.Close()
 
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/create-agent"
+	log.Printf("[callCreateAgent] POST %s", endpoint)
+	httpStart := time.Now()
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
+	log.Printf("[callCreateAgent] http post took %s", time.Since(httpStart))
 	if err != nil {
 		return "", fmt.Errorf("callCreateAgent: http post: %v", err)
 	}
@@ -2307,6 +2310,7 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 		return
 	}
 
+	submitStart := time.Now()
 	if req.Status == "approved" {
 		policy := existing.Policy
 		if policy == "" {
@@ -2314,9 +2318,11 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 		}
 		adminDID := c.GetString(CtxDID)
 		log.Printf("[AgentCreationRequestSubmit] calling create-agent requestID=%s agentDID=%s agentName=%s adminDID=%s", req.RequestID, existing.AgentDID, existing.AgentName, adminDID)
+		callStart := time.Now()
 		nftID, err := h.callCreateAgent(existing.AgentName, policy, adminDID, existing.OrgID)
+		log.Printf("[AgentCreationRequestSubmit] create-agent call took %s", time.Since(callStart))
 		if err != nil {
-			log.Printf("[AgentCreationRequestSubmit] create-agent error: %v", err)
+			log.Printf("[AgentCreationRequestSubmit] create-agent error after %s: %v", time.Since(callStart), err)
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 			return
 		}
@@ -2324,12 +2330,13 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 		if nftID == "" {
 			nftID = uuid.New().String()
 		}
+		dbStart := time.Now()
 		if err := h.db.StoreNewAgent(nftID, existing.AgentDID, existing.CreatorDID, existing.OrgID, policy, existing.AgentName); err != nil {
 			log.Printf("[AgentCreationRequestSubmit] StoreNewAgent error: %v", err)
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to store agent: %v", err)})
 			return
 		}
-		log.Printf("[AgentCreationRequestSubmit] agent stored agentDID=%s nftID=%s", existing.AgentDID, nftID)
+		log.Printf("[AgentCreationRequestSubmit] agent stored agentDID=%s nftID=%s (db took %s)", existing.AgentDID, nftID, time.Since(dbStart))
 	}
 
 	if err := h.db.UpdateRequestStatus(req.RequestID, req.Status); err != nil {
@@ -2342,6 +2349,7 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 		h.sendMail(email.AgentCreationRequestStatus(userEmail, userName, existing.AgentName, req.Status))
 	}
 
+	log.Printf("[AgentCreationRequestSubmit] total request took %s requestID=%s status=%s", time.Since(submitStart), req.RequestID, req.Status)
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"requestID": req.RequestID, "status": req.Status}})
 }
 
