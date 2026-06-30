@@ -1735,11 +1735,11 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (
 	mw.Close()
 
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/create-agent"
-	log.Printf("[callCreateAgent] POST %s", endpoint)
+	fmt.Printf("[callCreateAgent] POST %s", endpoint)
 	httpStart := time.Now()
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
-	log.Printf("[callCreateAgent] http post took %s", time.Since(httpStart))
-	log.Printf("Message Body: %s", resp)
+	fmt.Printf("[callCreateAgent] http post took %s", time.Since(httpStart))
+	fmt.Printf("test_0001: %v", resp)
 	if err != nil {
 		return "", fmt.Errorf("callCreateAgent: http post: %v", err)
 	}
