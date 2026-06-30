@@ -1715,7 +1715,7 @@ func (h *Handler) callRegisterAdmin(username, org, password string) (string, err
 
 // callCreateAgent POSTs multipart form-data to CREATE_AGENT_ENDPOINT.
 // The agent DID is known upfront; the API returns the NFT ID for that agent.
-func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (nftID string, err error) {
+func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID string) (nftID string, err error) {
 	if policy == "" {
 		policy = "default policy"
 	}
@@ -1724,6 +1724,7 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (
 	mw.WriteField("creator_did", creatorDID)
 	mw.WriteField("org_id", orgID)
 	mw.WriteField("agent_name", agentName)
+	mw.WriteField("agent_id", agentDID)
 	fw, fwErr := mw.CreateFormFile("policy", "policy.txt")
 	fmt.Printf("TEST--11: creatorDID=%q orgID=%q agentName=%q policy=%q\n", creatorDID, orgID, agentName, policy)
 	if fwErr != nil {
@@ -2318,9 +2319,10 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 			policy = "default policy"
 		}
 		adminDID := c.GetString(CtxDID)
+		agentDID := existing.AgentDID
 		log.Printf("[AgentCreationRequestSubmit] calling create-agent requestID=%s agentDID=%s agentName=%s adminDID=%s", req.RequestID, existing.AgentDID, existing.AgentName, adminDID)
 		callStart := time.Now()
-		nftID, err := h.callCreateAgent(existing.AgentName, policy, adminDID, existing.OrgID)
+		nftID, err := h.callCreateAgent(existing.AgentName, policy, adminDID, existing.OrgID, agentDID)
 		log.Printf("[AgentCreationRequestSubmit] create-agent call took %s", time.Since(callStart))
 		if err != nil {
 			log.Printf("[AgentCreationRequestSubmit] create-agent error after %s: %v", time.Since(callStart), err)

@@ -79,6 +79,7 @@ func (h *Handler) CoreRegisterAgent(c *gin.Context) {
 
 	agentName := c.PostForm("agent_name")
 	agentID := c.PostForm("agent_id")
+
 	if agentName == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agent_name is required"})
 		return
@@ -93,6 +94,7 @@ func (h *Handler) CoreRegisterAgent(c *gin.Context) {
 			policy = string(raw)
 		}
 	}
+	
 
 	requestID := uuid.New().String()
 	if err := h.db.CreateRequest(requestID, "deploy_agent", policy, user.DID, agentID, agentName, "", user.OrgID); err != nil {
