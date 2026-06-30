@@ -165,7 +165,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 	}
 
 	envelopes := walkEnvelopes(data.Envelope)
-	intentID := nftInfo.NFTId
+	intentID := uuid.New().String()
 	interactions := extractInteractionsFromEnvelopes(envelopes)
 
 	log.Printf("[intentWorkflow] parsed ok — envelopes=%d interactions=%d", len(envelopes), len(interactions))
