@@ -1752,14 +1752,15 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 	var result struct {
 		Status  bool   `json:"status"`
 		Message string `json:"message"`
-		NFTID   string `json:"agent_id"`
+		AgentID string `json:"agent_id"`
+		AgentCardID string `json:"agent_card_id"`
 	}
 	json.Unmarshal(rawBody, &result)
 
 	if !result.Status {
 		return "", fmt.Errorf("create agent failed: %s", result.Message)
 	}
-	return result.NFTID, nil
+	return result.AgentCardID, nil
 }
 
 // callUpdateAgent POSTs multipart form-data to UPDATE_AGENT_ENDPOINT.
