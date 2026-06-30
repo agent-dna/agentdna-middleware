@@ -310,7 +310,7 @@ func (d *DB) GetInteractionsByOrg(orgID string, limit, offset int) ([]*Interacti
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
 		FROM new_interactions
 		WHERE organization_id = $1
 		ORDER BY time DESC
@@ -344,7 +344,7 @@ func (d *DB) GetInteractionsByOrgAndIntent(orgID, intentID string, limit, offset
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
 		FROM new_interactions
 		WHERE organization_id = $1 AND intent_id = $2
 		ORDER BY time DESC
@@ -371,7 +371,7 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
 		FROM new_interactions
 		WHERE organization_id = $1 AND threat = 1
 		ORDER BY time DESC
@@ -593,7 +593,7 @@ type AdminProfile struct {
 	CreatedAt      int64  `json:"createdAt"`
 }
 
-func (d *DB) GetAdminProfile(email string) (*AdminProfile, error) {
+func (d *DB) GetAdminProfile(username string) (*AdminProfile, error) {
 	p := &AdminProfile{}
 	var createdAt sql.NullTime
 	err := d.conn.QueryRow(`
@@ -608,8 +608,8 @@ func (d *DB) GetAdminProfile(email string) (*AdminProfile, error) {
 			total_users,
 			created_at
 		FROM new_admins
-		WHERE email = $1`,
-		email,
+		WHERE username = $1`,
+		username,
 	).Scan(&p.Name, &p.Email, &p.OrganizationID, &p.APIKey, &p.AgentCount, &p.IntentCount, &p.ThreatCount, &p.TotalUsers, &createdAt)
 	if err != nil {
 		return nil, err
@@ -830,16 +830,16 @@ func (d *DB) GetAgentNFTID(agentDID string) (string, error) {
 	return nftID.String, err
 }
 
-func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID string) error {
+func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message string) error {
 	threatInt := 0
 	if threat {
 		threatInt = 1
 	}
 	_, err := d.conn.Exec(
 		`INSERT INTO new_interactions
-		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING`,
-		id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction, threatInt, intentID, orgID,
+		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id, message)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT DO NOTHING`,
+		id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction, threatInt, intentID, orgID, message,
 	)
 	return err
 }
@@ -879,7 +879,7 @@ func scanInteractionNewRows(rows *sql.Rows) ([]*InteractionRecord, error) {
 			&r.InteractionID,
 			&r.From, &r.FromName,
 			&r.To, &r.ToName,
-			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time,
+			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
 		); err != nil {
 			return nil, err
 		}
@@ -894,7 +894,7 @@ func (d *DB) GetInteractionsByAgent(agentDID string, limit, offset int) ([]*Inte
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
 		FROM new_interactions
 		WHERE initiator_did = $1
 		ORDER BY time DESC
@@ -1145,7 +1145,7 @@ func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, err
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
 		FROM new_interactions WHERE intent_id = $1 ORDER BY time ASC`,
 		intentID,
 	)
@@ -1243,7 +1243,7 @@ func (d *DB) GetInteractionsByTool(toolDID, orgID string, limit, offset int) ([]
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
 		FROM new_interactions
 		WHERE interacted_to_did = $1 AND organization_id = $2
 		ORDER BY time DESC

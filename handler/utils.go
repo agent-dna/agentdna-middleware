@@ -78,6 +78,7 @@ func extractInteractionsFromEnvelopes(envs []*workflowEnvelope) []interactionExt
 			ToName:   e.To.Name,
 			Type:     deriveWorkflowInteractionType(e, seenAsFrom),
 			Threat:   len(e.Issues) > 0,
+			Message:  e.Payload,
 		})
 		seenAsFrom[e.From.ID] = true
 	}

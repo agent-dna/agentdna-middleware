@@ -78,9 +78,9 @@ func (h *Handler) JWTAuthMiddleware() gin.HandlerFunc {
 			}
 		}
 		// Fallback: check by org_id — if an admin record exists and DID matches, it's admin.
-		if !isAdmin && claims.OrgID != "" {
-			admin, err := h.db.GetAdminByOrgID(claims.OrgID)
-			log.Printf("[JWT:admin-check] GetAdminByOrgID org_id=%q foundDID=%q err=%v", claims.OrgID, func() string {
+		if !isAdmin && h.orgID != "" {
+			admin, err := h.db.GetAdminByOrgID(h.orgID)
+			log.Printf("[JWT:admin-check] GetAdminByOrgID org_id=%q foundDID=%q err=%v", h.orgID, func() string {
 				if admin != nil {
 					return admin.DID
 				}
@@ -90,11 +90,11 @@ func (h *Handler) JWTAuthMiddleware() gin.HandlerFunc {
 				isAdmin = true
 			}
 		}
-		// Auto-register: if JWT is valid, has a DID + org_id, but no admin record
+		// Auto-register: if JWT is valid and has a DID, but no admin record
 		// exists yet for this org, store the admin so subsequent requests work.
-		if !isAdmin && claims.DID != "" && claims.OrgID != "" {
-			if err := h.db.StoreAdmin(claims.DID, claims.OrgID, "", "", ""); err == nil {
-				log.Printf("[JWT:admin-check] auto-registered admin did=%q org_id=%q", claims.DID, claims.OrgID)
+		if !isAdmin && claims.DID != "" && h.orgID != "" {
+			if err := h.db.StoreAdmin(claims.DID, h.orgID, "", "", ""); err == nil {
+				log.Printf("[JWT:admin-check] auto-registered admin did=%q org_id=%q", claims.DID, h.orgID)
 				isAdmin = true
 			} else {
 				log.Printf("[JWT:admin-check] auto-register failed: %v", err)
@@ -102,11 +102,11 @@ func (h *Handler) JWTAuthMiddleware() gin.HandlerFunc {
 		}
 		log.Printf("[JWT:admin-check] result is_admin=%v", isAdmin)
 
-		log.Printf("[JWT] verified ok — sub=%s did=%s org_id=%s is_admin=%v", claims.Subject, claims.DID, claims.OrgID, isAdmin)
+		log.Printf("[JWT] verified ok — sub=%s did=%s org_id=%s is_admin=%v", claims.Subject, claims.DID, h.orgID, isAdmin)
 
 		c.Set(CtxDID, claims.DID)
 		c.Set(CtxEmail, claims.Email)
-		c.Set(CtxOrgID, claims.OrgID)
+		c.Set(CtxOrgID, h.orgID)
 		c.Set(CtxNFTID, claims.NFTID)
 		c.Set(CtxAPIKey, claims.APIKey)
 		c.Set(CtxIsAdmin, isAdmin)

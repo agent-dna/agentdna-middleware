@@ -34,19 +34,21 @@ type Handler struct {
 	proxy               *httputil.ReverseProxy
 	baseURL             *url.URL
 	jwtSecret           string
+	orgID               string
 	adminServiceURL     string
 	createAgentEndpoint string
 	updateAgentEndpoint string
 	mailer              *email.Mailer
 }
 
-func New(database *db.DB, backendURL *url.URL, jwtSecret, adminServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
+func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
 	h := &Handler{
 		db:                  database,
 		proxy:               proxy,
 		baseURL:             backendURL,
 		jwtSecret:           jwtSecret,
+		orgID:               orgID,
 		adminServiceURL:     adminServiceURL,
 		createAgentEndpoint: createAgentEndpoint,
 		updateAgentEndpoint: updateAgentEndpoint,
@@ -78,7 +80,6 @@ func (h *Handler) Healthz(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
-
 func (h *Handler) ProxyHandler(c *gin.Context) {
 	r := c.Request
 	w := c.Writer
@@ -91,10 +92,11 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 		}
 		r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-       fmt.Print("ProxyHandler: received POST body: ", string(bodyBytes), "\n")
+		fmt.Print("ProxyHandler: received POST body: ", string(bodyBytes), "\n")
 
 		var payload txPayload
 		if jsonErr := json.Unmarshal(bodyBytes, &payload); jsonErr == nil && len(payload.Tokens.NFT) > 0 {
+			fmt.Printf("ProxyHandler: TEST_01", payload.Tokens.NFT[0])
 			nftInfo := payload.Tokens.NFT[0]
 			nftType, typeErr := parseNFTType(nftInfo.Data)
 			log.Printf("[NFT] received nft_id=%s type=%s data=%s", nftInfo.NFTId, nftType, nftInfo.Data)
@@ -110,10 +112,9 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 			}
 		}
 	}
-	
+
 	h.proxy.ServeHTTP(w, r)
 }
-
 
 func (h *Handler) handleUserNFT(nftInfo NFTInfo) error {
 	data, err := parseUserNFT(nftInfo.Data)
@@ -163,7 +164,8 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 	}
 
 	envelopes := walkEnvelopes(data.Envelope)
-	intentID := nftInfo.NFTId
+	fmt.Printf("test envelopers: %v\n", envelopes)
+	intentID := uuid.New().String()
 	interactions := extractInteractionsFromEnvelopes(envelopes)
 
 	log.Printf("[intentWorkflow] parsed ok — envelopes=%d interactions=%d", len(envelopes), len(interactions))
@@ -232,7 +234,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 			threatDetected = true
 		}
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message,
 		); err != nil {
 			return fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
 		}
@@ -280,7 +282,6 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 	log.Printf("[intentNFT] extracted blocks=%d interactions=%d", len(blocks), len(interactions))
 	// ── Log extracted content ────────────────────────────────────────────────
 
-
 	for i, ix := range interactions {
 		log.Printf("[intentNFT] interaction[%d] from=%s(%s) to=%s(%s) type=%s threat=%v",
 			i, ix.FromName, ix.FromDID, ix.ToName, ix.ToDID, ix.Type, ix.Threat)
@@ -310,12 +311,11 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 	if len(blocks) > 0 {
 		initiatorDID = blocks[0].Agent
 	}
-    
+
 	log.Printf("[intentNFT] blocks=%d org=%s initiator=%s", len(blocks), orgID, initiatorDID)
 	// ── 4. Ensure agents exist (create with defaults if missing) ─────────────
 	for _, b := range blocks {
 		log.Printf("[intentNFT] block did=%s type=%s name=%s", b.Agent, b.Type, b.Name)
-		
 
 		agentName := b.Name
 		log.Printf("[intentNFT] processing agent did=%s name=%s org=%s", b.Agent, agentName, orgID)
@@ -352,7 +352,7 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 		iid := fmt.Sprintf("%s-%d", intentID, idx+1)
 		interactionIDs = append(interactionIDs, iid)
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message,
 		); err != nil {
 			return fmt.Errorf("handleIntentNFT: StoreNewInteraction: %v", err)
 		}
@@ -496,14 +496,17 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-
 	// Try org user first
 	user, err := h.db.GetOrgUserByEmail(req.Email)
+	log.Printf("[Login] GetOrgUserByEmail email=%q found=%v err=%v", req.Email, err == nil, err)
 	if err == nil {
+		log.Printf("[Login] user did=%q orgID=%q hasPasswordHash=%v", user.DID, user.OrganizationID, user.PasswordHash != "")
 		if user.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+			log.Printf("[Login] password mismatch for user email=%q", req.Email)
 			c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
 			return
 		}
+		log.Printf("[Login] user login success email=%q did=%q", req.Email, user.DID)
 		tokenStr, err := h.issueToken(JWTClaims{
 			DID: user.DID, Email: user.Email, OrgID: user.OrganizationID,
 			NFTID: user.NFTID, APIKey: user.APIKey,
@@ -530,14 +533,18 @@ func (h *Handler) Login(c *gin.Context) {
 
 	// Try admin
 	admin, err := h.db.GetAdminByEmail(req.Email)
+	log.Printf("[Login] GetAdminByEmail email=%q found=%v err=%v", req.Email, err == nil, err)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
 		return
 	}
+	log.Printf("[Login] admin did=%q orgID=%q hasPasswordHash=%v", admin.DID, admin.OrganizationID, admin.PasswordHash != "")
 	if admin.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(admin.PasswordHash), []byte(req.Password)) != nil {
+		log.Printf("[Login] password mismatch for admin email=%q", req.Email)
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
 		return
 	}
+	log.Printf("[Login] admin login success email=%q did=%q", req.Email, admin.DID)
 	tokenStr, err := h.issueToken(JWTClaims{
 		DID: admin.DID, Email: admin.Email, OrgID: admin.OrganizationID,
 		APIKey: admin.APIKey,
@@ -615,7 +622,6 @@ func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"did": req.DID, "org_id": req.OrgID}})
 }
 
-
 func (h *Handler) CreateUser(c *gin.Context) {
 	fmt.Printf("test create user")
 	w := http.ResponseWriter(c.Writer)
@@ -638,7 +644,7 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did, email, password and orgID are required"})
 		return
 	}
-    fmt.Printf("test102: %+v\n", req)
+	fmt.Printf("test102: %+v\n", req)
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
@@ -654,8 +660,7 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to create user: %v", err)})
 		return
 	}
-		println("test104: user stored in DB with DID=", req.DID)
-
+	println("test104: user stored in DB with DID=", req.DID)
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
 		"did":   req.DID,
@@ -849,6 +854,7 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 			"threat":        i.Threat,
 			"intentID":      i.IntentID,
 			"time":          i.Time,
+			"message":       i.Message,
 		})
 	}
 
@@ -907,6 +913,7 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 			"direction":     t.Direction,
 			"intentID":      t.IntentID,
 			"time":          t.Time,
+			"message":       t.Message,
 		})
 	}
 
@@ -1238,6 +1245,7 @@ func (h *Handler) AgentInteractions(c *gin.Context) {
 			"threat":        i.Threat,
 			"intentID":      i.IntentID,
 			"time":          i.Time,
+			"message":       i.Message,
 		})
 	}
 
@@ -1347,15 +1355,15 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 	list := make([]gin.H, 0, len(intents))
 	for _, i := range intents {
 		entry := gin.H{
-			"intentID":          i.IntentID,
-			"initiatorDID":      i.InitiatorDID,
-			"initiatorName":     i.InitiatorName,
-			"startedAt":         i.StartedAt,
-			"status":            i.Status,
-			"threatDetected":    i.ThreatDetected,
-			"flowType":          i.FlowType,
-			"executor":          i.Executor,
-			"chainDepth":        i.ChainDepth,
+			"intentID":           i.IntentID,
+			"initiatorDID":       i.InitiatorDID,
+			"initiatorName":      i.InitiatorName,
+			"startedAt":          i.StartedAt,
+			"status":             i.Status,
+			"threatDetected":     i.ThreatDetected,
+			"flowType":           i.FlowType,
+			"executor":           i.Executor,
+			"chainDepth":         i.ChainDepth,
 			"interactionsCount":  i.InteractionsCount,
 			"agentsCount":        i.AgentsCount,
 			"toolsCount":         i.ToolsCount,
@@ -1444,8 +1452,8 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"intentID":  intentID,
-			"diagram":   root,
+			"intentID": intentID,
+			"diagram":  root,
 		},
 	})
 }
@@ -1531,26 +1539,27 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 			"direction":     i.Direction,
 			"threat":        i.Threat,
 			"time":          i.Time,
+			"message":       i.Message,
 		})
 	}
 
 	data := gin.H{
-		"intentID":          intent.IntentID,
-		"initiatorDID":      intent.InitiatorDID,
-		"initiatorName":     intent.InitiatorName,
-		"startedAt":         intent.StartedAt,
-		"status":            intent.Status,
-		"threatDetected":    intent.ThreatDetected,
-		"flowType":          intent.FlowType,
-		"executor":          intent.Executor,
-		"chainDepth":        intent.ChainDepth,
-		"interactionsCount": intent.InteractionsCount,
-		"agentsCount":       intent.AgentsCount,
-		"toolsCount":        intent.ToolsCount,
+		"intentID":           intent.IntentID,
+		"initiatorDID":       intent.InitiatorDID,
+		"initiatorName":      intent.InitiatorName,
+		"startedAt":          intent.StartedAt,
+		"status":             intent.Status,
+		"threatDetected":     intent.ThreatDetected,
+		"flowType":           intent.FlowType,
+		"executor":           intent.Executor,
+		"chainDepth":         intent.ChainDepth,
+		"interactionsCount":  intent.InteractionsCount,
+		"agentsCount":        intent.AgentsCount,
+		"toolsCount":         intent.ToolsCount,
 		"firstInteractionAt": intent.FirstInteractionAt,
 		"lastInteractionAt":  intent.LastInteractionAt,
 		"runtimeSeconds":     intent.RuntimeSeconds,
-		"interactions":      txns,
+		"interactions":       txns,
 	}
 	if intent.EndedAt != nil {
 		data["endedAt"] = intent.EndedAt
@@ -1659,6 +1668,7 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 			"threat":        i.Threat,
 			"intentID":      i.IntentID,
 			"time":          i.Time,
+			"message":       i.Message,
 		})
 	}
 
@@ -1705,7 +1715,7 @@ func (h *Handler) callRegisterAdmin(username, org, password string) (string, err
 
 // callCreateAgent POSTs multipart form-data to CREATE_AGENT_ENDPOINT.
 // The agent DID is known upfront; the API returns the NFT ID for that agent.
-func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (nftID string, err error) {
+func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID string) (nftID string, err error) {
 	if policy == "" {
 		policy = "default policy"
 	}
@@ -1714,6 +1724,7 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (
 	mw.WriteField("creator_did", creatorDID)
 	mw.WriteField("org_id", orgID)
 	mw.WriteField("agent_name", agentName)
+	mw.WriteField("agent_id", agentDID)
 	fw, fwErr := mw.CreateFormFile("policy", "policy.txt")
 	fmt.Printf("TEST--11: creatorDID=%q orgID=%q agentName=%q policy=%q\n", creatorDID, orgID, agentName, policy)
 	if fwErr != nil {
@@ -1725,7 +1736,13 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (
 	mw.Close()
 
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/create-agent"
+	fmt.Print("test_0002: %v", buf.Bytes())
+	fmt.Print("test_0003: %v", mw.FormDataContentType())
+	
+	httpStart := time.Now()
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
+	fmt.Printf("[callCreateAgent] http post took %s", time.Since(httpStart))
+	fmt.Printf("test_0001: %v", resp)
 	if err != nil {
 		return "", fmt.Errorf("callCreateAgent: http post: %v", err)
 	}
@@ -1733,18 +1750,19 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (
 
 	rawBody, _ := io.ReadAll(resp.Body)
 	log.Printf("[callCreateAgent] response status=%d body=%s", resp.StatusCode, string(rawBody))
-
+   
 	var result struct {
 		Status  bool   `json:"status"`
 		Message string `json:"message"`
-		NFTID   string `json:"agent_id"`
+		AgentID string `json:"agent_id"`
+		AgentCardID string `json:"agent_card_id"`
 	}
 	json.Unmarshal(rawBody, &result)
 
 	if !result.Status {
 		return "", fmt.Errorf("create agent failed: %s", result.Message)
 	}
-	return result.NFTID, nil
+	return result.AgentCardID, nil
 }
 
 // callUpdateAgent POSTs multipart form-data to UPDATE_AGENT_ENDPOINT.
@@ -2297,16 +2315,20 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 		return
 	}
 
+	submitStart := time.Now()
 	if req.Status == "approved" {
 		policy := existing.Policy
 		if policy == "" {
 			policy = "default policy"
 		}
 		adminDID := c.GetString(CtxDID)
+		agentDID := existing.AgentDID
 		log.Printf("[AgentCreationRequestSubmit] calling create-agent requestID=%s agentDID=%s agentName=%s adminDID=%s", req.RequestID, existing.AgentDID, existing.AgentName, adminDID)
-		nftID, err := h.callCreateAgent(existing.AgentName, policy, adminDID, existing.OrgID)
+		callStart := time.Now()
+		nftID, err := h.callCreateAgent(existing.AgentName, policy, adminDID, existing.OrgID, agentDID)
+		log.Printf("[AgentCreationRequestSubmit] create-agent call took %s", time.Since(callStart))
 		if err != nil {
-			log.Printf("[AgentCreationRequestSubmit] create-agent error: %v", err)
+			log.Printf("[AgentCreationRequestSubmit] create-agent error after %s: %v", time.Since(callStart), err)
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 			return
 		}
@@ -2314,12 +2336,13 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 		if nftID == "" {
 			nftID = uuid.New().String()
 		}
+		dbStart := time.Now()
 		if err := h.db.StoreNewAgent(nftID, existing.AgentDID, existing.CreatorDID, existing.OrgID, policy, existing.AgentName); err != nil {
 			log.Printf("[AgentCreationRequestSubmit] StoreNewAgent error: %v", err)
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to store agent: %v", err)})
 			return
 		}
-		log.Printf("[AgentCreationRequestSubmit] agent stored agentDID=%s nftID=%s", existing.AgentDID, nftID)
+		log.Printf("[AgentCreationRequestSubmit] agent stored agentDID=%s nftID=%s (db took %s)", existing.AgentDID, nftID, time.Since(dbStart))
 	}
 
 	if err := h.db.UpdateRequestStatus(req.RequestID, req.Status); err != nil {
@@ -2332,6 +2355,7 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 		h.sendMail(email.AgentCreationRequestStatus(userEmail, userName, existing.AgentName, req.Status))
 	}
 
+	log.Printf("[AgentCreationRequestSubmit] total request took %s requestID=%s status=%s", time.Since(submitStart), req.RequestID, req.Status)
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"requestID": req.RequestID, "status": req.Status}})
 }
 
@@ -2353,7 +2377,6 @@ func (h *Handler) AgentInfoEdit(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
 		return
 	}
-
 
 	// Look up org and NFT ID for the agent to pass to the update endpoint.
 	orgID, _ := h.db.GetAgentOrgID(req.AgentDID)
@@ -2526,7 +2549,7 @@ func (h *Handler) RegisterUser(c *gin.Context) {
 	// Generate a unique api_key.
 	apiKey := uuid.New().String()
 
-	if err := h.db.RegisterOrgUser( apiKey, req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
+	if err := h.db.RegisterOrgUser(apiKey, req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register user: %v", err)})
 		return
 	}

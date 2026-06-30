@@ -172,7 +172,7 @@ func main() {
 				dir = "inbound"
 			}
 			if err := database.StoreNewInteraction(
-				iid, hop[0], hop[1], hop[2], hop[3], hop[4], dir, threat, intentID, orgID,
+				iid, hop[0], hop[1], hop[2], hop[3], hop[4], dir, threat, intentID, orgID, "",
 			); err != nil {
 				log.Printf("StoreNewInteraction intent=%s hop=%d: %v", intentID, j, err)
 			}
