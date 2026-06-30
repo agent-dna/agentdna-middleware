@@ -1739,6 +1739,7 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (
 	httpStart := time.Now()
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
 	log.Printf("[callCreateAgent] http post took %s", time.Since(httpStart))
+	log.Printf("Message Body: %s", resp)
 	if err != nil {
 		return "", fmt.Errorf("callCreateAgent: http post: %v", err)
 	}
@@ -1746,7 +1747,7 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID string) (
 
 	rawBody, _ := io.ReadAll(resp.Body)
 	log.Printf("[callCreateAgent] response status=%d body=%s", resp.StatusCode, string(rawBody))
-
+   
 	var result struct {
 		Status  bool   `json:"status"`
 		Message string `json:"message"`
