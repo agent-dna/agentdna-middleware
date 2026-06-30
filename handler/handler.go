@@ -97,6 +97,7 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 
 		var payload txPayload
 		if jsonErr := json.Unmarshal(bodyBytes, &payload); jsonErr == nil && len(payload.Tokens.NFT) > 0 {
+			fmt.Printf("ProxyHandler: TEST_01", payload.Tokens.NFT[0])
 			nftInfo := payload.Tokens.NFT[0]
 			nftType, typeErr := parseNFTType(nftInfo.Data)
 			log.Printf("[NFT] received nft_id=%s type=%s data=%s", nftInfo.NFTId, nftType, nftInfo.Data)
@@ -165,6 +166,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 	}
 
 	envelopes := walkEnvelopes(data.Envelope)
+	fmt.Printf("test envelopers: %v\n", envelopes)
 	intentID := uuid.New().String()
 	interactions := extractInteractionsFromEnvelopes(envelopes)
 
