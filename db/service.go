@@ -593,7 +593,7 @@ type AdminProfile struct {
 	CreatedAt      int64  `json:"createdAt"`
 }
 
-func (d *DB) GetAdminProfile(email string) (*AdminProfile, error) {
+func (d *DB) GetAdminProfile(username string) (*AdminProfile, error) {
 	p := &AdminProfile{}
 	var createdAt sql.NullTime
 	err := d.conn.QueryRow(`
@@ -608,8 +608,8 @@ func (d *DB) GetAdminProfile(email string) (*AdminProfile, error) {
 			total_users,
 			created_at
 		FROM new_admins
-		WHERE email = $1`,
-		email,
+		WHERE username = $1`,
+		username,
 	).Scan(&p.Name, &p.Email, &p.OrganizationID, &p.APIKey, &p.AgentCount, &p.IntentCount, &p.ThreatCount, &p.TotalUsers, &createdAt)
 	if err != nil {
 		return nil, err
