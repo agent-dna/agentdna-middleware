@@ -353,7 +353,7 @@ func (d *DB) GetUserMetrics(userDID, orgID string) (*OrgMetrics, error) {
 	m := &OrgMetrics{}
 	err := d.conn.QueryRow(userScopeIntentsCTE+`
 		SELECT
-			(SELECT COUNT(*) FROM user_agents),
+			(SELECT COUNT(*) FROM new_agents WHERE deployer_did = $1),
 			(SELECT COUNT(*) FROM user_intents),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents)),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents))
