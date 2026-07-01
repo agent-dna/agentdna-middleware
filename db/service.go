@@ -217,7 +217,7 @@ func (d *DB) CountAgentsByOrg(orgID string) (int, error) {
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM new_agents
 		WHERE organization_id = $1
-			AND did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did IS NOT NULL)`,
+			AND did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did != 'none')`,
 		orgID,
 	).Scan(&total)
 	return total, err
@@ -242,7 +242,7 @@ func (d *DB) GetAgentsByOrg(orgID string, limit, offset int) ([]*AgentDetailReco
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did IS NOT NULL)
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did != 'none')
 		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy
 		ORDER BY a.did
 		LIMIT $2 OFFSET $3`,
@@ -270,7 +270,7 @@ func (d *DB) CountAgentsByUser(userDID, orgID string) (int, error) {
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM new_agents a
 		WHERE a.organization_id = $2
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $2 AND did IS NOT NULL)
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $2 AND did != 'none')
 			AND (
 				(a.deployer_did = $1 AND a.deployer_did != '')
 				OR a.did IN (
@@ -302,7 +302,7 @@ func (d *DB) GetAgentsByUser(userDID, orgID string, limit, offset int) ([]*Agent
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $2
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $2 AND did IS NOT NULL)
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $2 AND did != 'none')
 			AND (
 				(a.deployer_did = $1 AND a.deployer_did != '')
 				OR a.did IN (
@@ -662,7 +662,7 @@ func (d *DB) CountTopThreatAgentsByOrg(orgID string) (int, error) {
 		JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
 			AND i.threat = 1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did IS NOT NULL)`,
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did != 'none')`,
 		orgID,
 	).Scan(&total)
 	return total, err
@@ -679,7 +679,7 @@ func (d *DB) GetTopThreatAgentsByOrg(orgID string, limit, offset int) ([]*AgentV
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did IS NOT NULL)
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did != 'none')
 		GROUP BY a.did, a.nft_id, a.name
 		ORDER BY total_threats DESC
 		LIMIT $2 OFFSET $3`,
@@ -798,7 +798,7 @@ func (d *DB) GetTopAgentsByOrg(orgID string, limit, offset int) ([]*AgentVolumeR
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did IS NOT NULL)
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did != 'none')
 		GROUP BY a.did, a.nft_id, a.name
 		ORDER BY total_interactions DESC
 		LIMIT $2 OFFSET $3`,
@@ -997,13 +997,12 @@ func (d *DB) StoreOrgUser(nftID, did, orgID, name, email, passwordHash string) e
 			}
 		}
 	}
-	var didVal interface{}
-	if did != "" {
-		didVal = did
+	if did == "" {
+		did = "none"
 	}
 	_, err := d.conn.Exec(
 		`INSERT INTO new_org_users (nft_id, did, organization_id, name, email, password) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
-		nftID, didVal, orgID, name, email, passwordHash,
+		nftID, did, orgID, name, email, passwordHash,
 	)
 	return err
 }
