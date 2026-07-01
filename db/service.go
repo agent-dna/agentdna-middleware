@@ -877,7 +877,7 @@ func (d *DB) GetAdminProfile(username string) (*AdminProfile, error) {
 			total_users,
 			created_at
 		FROM new_admins
-		WHERE username = $1`,
+		WHERE did = $1`,
 		username,
 	).Scan(&p.Name, &p.Email, &p.OrganizationID, &p.APIKey, &p.AgentCount, &p.IntentCount, &p.ThreatCount, &p.TotalUsers, &createdAt)
 	if err != nil {

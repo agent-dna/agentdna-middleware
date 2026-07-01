@@ -748,12 +748,12 @@ func (h *Handler) UserProfile(c *gin.Context) {
 }
 
 func (h *Handler) AdminProfile(c *gin.Context) {
-	email := c.GetString(CtxEmail)
-	if email == "" {
+	did := c.GetString(CtxDID)
+	if did == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
 		return
 	}
-	profile, err := h.db.GetAdminProfile(email)
+	profile, err := h.db.GetAdminProfile(did)
 	if err != nil {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "admin not found"})
 		return
@@ -2077,6 +2077,7 @@ func (h *Handler) GetAgentPolicyHistory(c *gin.Context) {
 	}
 
 	nftID, err := h.db.GetAgentNFTID(agentDID)
+	fmt.Printf("GetAgentPolicyHistory: agentDID=%s nftID=%s err=%v\n", agentDID, nftID, err)
 	if err != nil || nftID == "" {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "agent NFT not found"})
 		return
