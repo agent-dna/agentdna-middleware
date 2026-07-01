@@ -1409,7 +1409,7 @@ func (h *Handler) UserIntents(c *gin.Context) {
 
 	userDID := c.GetString(CtxDID)
 	orgID := c.GetString(CtxOrgID)
-	if userDID == "" || orgID == "" {
+	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
 		return
 	}
@@ -1421,13 +1421,13 @@ func (h *Handler) UserIntents(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountUserIntents(userDID, orgID)
+	total, err := h.db.CountIntentsByUser(userDID, orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
 		return
 	}
 
-	intents, err := h.db.GetUserIntents(userDID, orgID, pageSize, offset)
+	intents, err := h.db.GetIntentsByUser(userDID, orgID, pageSize, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch intents: %v", err)})
 		return

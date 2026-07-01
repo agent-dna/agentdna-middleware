@@ -997,9 +997,13 @@ func (d *DB) StoreOrgUser(nftID, did, orgID, name, email, passwordHash string) e
 			}
 		}
 	}
+	var didVal interface{}
+	if did != "" {
+		didVal = did
+	}
 	_, err := d.conn.Exec(
 		`INSERT INTO new_org_users (nft_id, did, organization_id, name, email, password) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
-		nftID, did, orgID, name, email, passwordHash,
+		nftID, didVal, orgID, name, email, passwordHash,
 	)
 	return err
 }
