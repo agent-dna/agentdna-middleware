@@ -270,14 +270,7 @@ func (d *DB) CountAgentsByUser(userDID, orgID string) (int, error) {
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM new_agents a
 		WHERE a.organization_id = $2
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $2 AND did != 'none')
-			AND (
-				(a.deployer_did = $1 AND a.deployer_did != '')
-				OR a.did IN (
-					SELECT json_array_elements_text(COALESCE(u.agent_access_list, '[]')::json)
-					FROM new_org_users u WHERE u.did = $1
-				)
-			)`,
+			AND a.deployer_did = $1`,
 		userDID, orgID,
 	).Scan(&total)
 	return total, err
@@ -302,14 +295,7 @@ func (d *DB) GetAgentsByUser(userDID, orgID string, limit, offset int) ([]*Agent
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $2
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $2 AND did != 'none')
-			AND (
-				(a.deployer_did = $1 AND a.deployer_did != '')
-				OR a.did IN (
-					SELECT json_array_elements_text(COALESCE(u.agent_access_list, '[]')::json)
-					FROM new_org_users u WHERE u.did = $1
-				)
-			)
+			AND a.deployer_did = $1
 		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy
 		ORDER BY a.did
 		LIMIT $3 OFFSET $4`,
@@ -340,7 +326,11 @@ WITH user_agents AS (
     FROM new_agents a
     WHERE a.organization_id = $2
       AND (
-          (a.deployer_did = $1 AND a.deployer_did != '')
+          a.deployer_did = $1
+          OR a.did IN (
+              SELECT agent_did FROM new_requests
+              WHERE creator_did = $1 AND request_type = 'deploy_agent' AND status = 'approved'
+          )
           OR a.did IN (
               SELECT json_array_elements_text(COALESCE(u.agent_access_list,'[]')::json)
               FROM new_org_users u WHERE u.did = $1
