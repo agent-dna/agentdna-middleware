@@ -2,17 +2,20 @@ package handler
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"mime/multipart"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agentdna-ratelimit-auth/db"
@@ -29,6 +32,11 @@ func enableCors(w *http.ResponseWriter) {
 	(*w).Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization")
 }
 
+type otpEntry struct {
+	code      string
+	expiresAt time.Time
+}
+
 type Handler struct {
 	db                  *db.DB
 	proxy               *httputil.ReverseProxy
@@ -39,6 +47,7 @@ type Handler struct {
 	createAgentEndpoint string
 	updateAgentEndpoint string
 	mailer              *email.Mailer
+	otpStore            sync.Map
 }
 
 func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
@@ -59,6 +68,60 @@ func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL
 		log.Printf("[email] mailer disabled: %v", err)
 	}
 	return h
+}
+
+func generateOTP() (string, error) {
+	var otp string
+	for i := 0; i < 6; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(10))
+		if err != nil {
+			return "", err
+		}
+		otp += n.String()
+	}
+	return otp, nil
+}
+
+func (h *Handler) SendOTP(c *gin.Context) {
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email is required"})
+		return
+	}
+
+	code, err := generateOTP()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate OTP"})
+		return
+	}
+
+	h.otpStore.Store(req.Email, otpEntry{
+		code:      code,
+		expiresAt: time.Now().Add(5 * time.Minute),
+	})
+
+	h.sendMail(email.OTPVerification(req.Email, code))
+	log.Printf("[SendOTP] OTP sent to email=%q", req.Email)
+	c.JSON(http.StatusOK, Response{Status: true, Message: "OTP sent to " + req.Email})
+}
+
+func (h *Handler) verifyOTP(emailAddr, code string) bool {
+	val, ok := h.otpStore.Load(emailAddr)
+	if !ok {
+		return false
+	}
+	entry := val.(otpEntry)
+	if time.Now().After(entry.expiresAt) {
+		h.otpStore.Delete(emailAddr)
+		return false
+	}
+	if entry.code != code {
+		return false
+	}
+	h.otpStore.Delete(emailAddr)
+	return true
 }
 
 // sendMail fires an email in a goroutine so it never blocks the request path.
@@ -92,11 +155,9 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 		}
 		r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		fmt.Print("ProxyHandler: received POST body: ", string(bodyBytes), "\n")
 
 		var payload txPayload
 		if jsonErr := json.Unmarshal(bodyBytes, &payload); jsonErr == nil && len(payload.Tokens.NFT) > 0 {
-			fmt.Printf("ProxyHandler: TEST_01", payload.Tokens.NFT[0])
 			nftInfo := payload.Tokens.NFT[0]
 			nftType, typeErr := parseNFTType(nftInfo.Data)
 			log.Printf("[NFT] received nft_id=%s type=%s data=%s", nftInfo.NFTId, nftType, nftInfo.Data)
@@ -116,37 +177,24 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 	h.proxy.ServeHTTP(w, r)
 }
 
-func (h *Handler) handleUserNFT(nftInfo NFTInfo) error {
-	data, err := parseUserNFT(nftInfo.Data)
-	if err != nil {
-		return err
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("test123"), bcrypt.DefaultCost)
-	if err != nil {
-		return fmt.Errorf("handleUserNFT: hash default password: %v", err)
-	}
-	return h.db.StoreOrgUser(nftInfo.NFTId, data.UserDID, data.Metadata.OrgID, data.Metadata.Name, data.Metadata.Email, string(hash))
-}
 
 func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
-	fmt.Printf("[agentNFT] received nft_id=%s data=%s\n", nftInfo.NFTId, nftInfo.Data)
+	log.Printf("[agentNFT] received nft_id=%s", nftInfo.NFTId)
 	data, err := parseAgentNFT(nftInfo.Data)
 	if err != nil {
 		return err
 	}
 	deployer := data.AgentMetadata.Deployer
 	if deployer == "" {
-		deployer = "User_One"
+		return fmt.Errorf("handleAgentNFT: missing deployer in nft_id=%s", nftInfo.NFTId)
 	}
 	orgID := data.AgentMetadata.OrgID
 	if orgID == "" {
-		orgID = "Test_Org"
+		return fmt.Errorf("handleAgentNFT: missing org_id in nft_id=%s", nftInfo.NFTId)
 	}
 	agentName := data.AgentMetadata.AgentName
 	if agentName == "" {
-		const defaultPrefix = "Agent_Finance"
-		count, _ := h.db.CountAgentsWithNamePrefix(defaultPrefix)
-		agentName = fmt.Sprintf("%s_%d", defaultPrefix, count+1)
+		return fmt.Errorf("handleAgentNFT: missing agent_name in nft_id=%s", nftInfo.NFTId)
 	}
 
 	return h.db.StoreNewAgent(nftInfo.NFTId, data.AgentDID, deployer, orgID, data.Policy, agentName)
@@ -164,7 +212,6 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 	}
 
 	envelopes := walkEnvelopes(data.Envelope)
-	fmt.Printf("test envelopers: %v\n", envelopes)
 	intentID := uuid.New().String()
 	interactions := extractInteractionsFromEnvelopes(envelopes)
 
@@ -188,7 +235,8 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 		}
 	}
 	if orgID == "" {
-		orgID = "Test_Org"
+		log.Printf("[intentWorkflow] could not resolve orgID for intent, dropping nft_id=%s", nftInfo.NFTId)
+		return fmt.Errorf("handleIntentWorkflow: could not resolve orgID")
 	}
 	log.Printf("[intentWorkflow] orgID=%s intentID=%s", orgID, intentID)
 
@@ -214,14 +262,6 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 				log.Printf("[intentWorkflow] agent saved did=%s name=%s", actor.ID, actor.Name)
 			}
 		}
-	}
-
-	// ── Ensure initiator user exists if human ────────────────────────────────
-	if len(envelopes) > 0 && envelopes[0].From.Type == "human" && initiatorDID != "" {
-		hash, _ := bcrypt.GenerateFromPassword([]byte("test123"), bcrypt.DefaultCost)
-		userNFTID, _ := GetID(initiatorDID)
-		_ = h.db.StoreOrgUser(userNFTID, initiatorDID, orgID, initiatorName, initiatorName, string(hash))
-		log.Printf("[intentWorkflow] user saved did=%s name=%s", initiatorDID, initiatorName)
 	}
 
 	// ── Store interactions ───────────────────────────────────────────────────
@@ -325,7 +365,8 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 		}
 	}
 	if orgID == "" {
-		orgID = "Test_Org"
+		log.Printf("[intentNFT] could not resolve orgID for intent, dropping nft_id=%s", intentID)
+		return fmt.Errorf("handleIntentNFT: could not resolve orgID")
 	}
 
 	initiatorDID := ""
@@ -334,32 +375,21 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 	}
 
 	log.Printf("[intentNFT] blocks=%d org=%s initiator=%s", len(blocks), orgID, initiatorDID)
-	// ── 4. Ensure agents exist (create with defaults if missing) ─────────────
+	// ── 4. Ensure agents exist ───────────────────────────────────────────────
 	for _, b := range blocks {
-		log.Printf("[intentNFT] block did=%s type=%s name=%s", b.Agent, b.Type, b.Name)
-
 		agentName := b.Name
-		log.Printf("[intentNFT] processing agent did=%s name=%s org=%s", b.Agent, agentName, orgID)
 		if agentName == "" {
-			const defaultPrefix = "Agent_Finance"
-			count, _ := h.db.CountAgentsWithNamePrefix(defaultPrefix)
-			agentName = fmt.Sprintf("%s_%d", defaultPrefix, count+1)
+			log.Printf("[intentNFT] skipping agent with no name did=%s", b.Agent)
+			continue
 		}
-		if err := h.db.StoreNewAgent(uuid.New().String(), b.Agent, "User_One", orgID, "", agentName); err != nil {
-			log.Fatalf("[intentNFT] agent save error did=%s: %v", b.Agent, err)
+		if err := h.db.StoreNewAgent(uuid.New().String(), b.Agent, initiatorDID, orgID, "", agentName); err != nil {
+			log.Printf("[intentNFT] agent save error did=%s: %v", b.Agent, err)
 		} else {
 			log.Printf("[intentNFT] agent saved did=%s name=%s org=%s", b.Agent, agentName, orgID)
 		}
 	}
 
-	// ── 5. Ensure initiator user exists ──────────────────────────────────────
-	if initiatorDID != "" {
-		hash, _ := bcrypt.GenerateFromPassword([]byte("test123"), bcrypt.DefaultCost)
-		userNFTID, _ := GetID(initiatorDID)
-		_ = h.db.StoreOrgUser(userNFTID, initiatorDID, orgID, "", "", string(hash))
-	}
-
-	// ── 6. Store interactions ────────────────────────────────────────────────
+	// ── 5. Store interactions ────────────────────────────────────────────────
 	flowType := detectFlowType(blocks)
 	executor := data.Executor
 	if executor == "" {
@@ -596,9 +626,18 @@ func (h *Handler) Signup(c *gin.Context) {
 		Email    string `json:"email"`
 		Password string `json:"password"`
 		OrgID    string `json:"orgID"`
+		OTP      string `json:"otp"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.DID == "" || req.Email == "" || req.Password == "" || req.OrgID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did, email, password and orgID are required"})
+	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || req.Password == "" || req.OrgID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email, password and orgID are required"})
+		return
+	}
+	if req.OTP == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "otp is required"})
+		return
+	}
+	if !h.verifyOTP(req.Email, req.OTP) {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid or expired OTP"})
 		return
 	}
 
@@ -608,13 +647,9 @@ func (h *Handler) Signup(c *gin.Context) {
 		return
 	}
 
-	nftID, err := GetID(req.DID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate nft id"})
-		return
-	}
 
-	if err := h.db.StoreOrgUser(nftID, req.DID, req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
+
+	if err := h.db.StoreOrgUser( req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register user: %v", err)})
 		return
 	}
@@ -646,7 +681,6 @@ func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
 }
 
 func (h *Handler) CreateUser(c *gin.Context) {
-	fmt.Printf("test create user")
 	w := http.ResponseWriter(c.Writer)
 	enableCors(&w)
 
@@ -667,23 +701,16 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did, email, password and orgID are required"})
 		return
 	}
-	fmt.Printf("test102: %+v\n", req)
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
 		return
 	}
 
-	nftID, err := GetID(req.DID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate user nft id"})
-		return
-	}
-	if err := h.db.StoreOrgUser(nftID, req.DID, req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
+	if err := h.db.StoreOrgUser(req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to create user: %v", err)})
 		return
 	}
-	println("test104: user stored in DB with DID=", req.DID)
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
 		"did":   req.DID,
@@ -700,9 +727,18 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 		Email    string `json:"email"`
 		Password string `json:"password"`
 		OrgID    string `json:"orgID"`
+		OTP      string `json:"otp"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.Username == "" || req.Email == "" || req.Password == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "username, email and password are required"})
+		return
+	}
+	if req.OTP == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "otp is required"})
+		return
+	}
+	if !h.verifyOTP(req.Email, req.OTP) {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid or expired OTP"})
 		return
 	}
 
@@ -1834,7 +1870,6 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 	mw.WriteField("agent_name", agentName)
 	mw.WriteField("agent_id", agentDID)
 	fw, fwErr := mw.CreateFormFile("policy", "policy.txt")
-	fmt.Printf("TEST--11: creatorDID=%q orgID=%q agentName=%q policy=%q\n", creatorDID, orgID, agentName, policy)
 	if fwErr != nil {
 		return "", fmt.Errorf("callCreateAgent: create form file: %v", fwErr)
 	}
@@ -1844,13 +1879,7 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 	mw.Close()
 
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/create-agent"
-	fmt.Print("test_0002: %v", buf.Bytes())
-	fmt.Print("test_0003: %v", mw.FormDataContentType())
-
-	httpStart := time.Now()
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
-	fmt.Printf("[callCreateAgent] http post took %s", time.Since(httpStart))
-	fmt.Printf("test_0001: %v", resp)
 	if err != nil {
 		return "", fmt.Errorf("callCreateAgent: http post: %v", err)
 	}
@@ -2039,7 +2068,6 @@ func (h *Handler) fetchAgentChain(nftID string) ([]struct {
 }, error) {
 	chainURL := fmt.Sprintf("%s://%s/rubix/v1/nfts/%s/chain", h.baseURL.Scheme, h.baseURL.Host, nftID)
 	resp, err := http.Get(chainURL)
-	fmt.Printf("fetchAgentChain: GET %s -> err=%v\n", resp, err)
 	if err != nil {
 		return nil, err
 	}
@@ -2085,7 +2113,6 @@ func (h *Handler) GetAgentPolicyHistory(c *gin.Context) {
 	}
 
 	nftID, err := h.db.GetAgentNFTID(agentDID)
-	fmt.Printf("GetAgentPolicyHistory: agentDID=%s nftID=%s err=%v\n", agentDID, nftID, err)
 	if err != nil || nftID == "" {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "agent NFT not found"})
 		return
@@ -2105,7 +2132,6 @@ func (h *Handler) GetAgentPolicyHistory(c *gin.Context) {
 	for _, e := range entries {
 		history = append(history, historyItem{UpdateID: e.TransactionID, Time: e.Epoch})
 	}
-    fmt.Printf("testpolicy history: %+v\n", history)
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"agentDID": agentDID, "nftID": nftID, "history": history}})
 }
 
