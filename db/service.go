@@ -970,7 +970,7 @@ func (d *DB) GetOrgUserNameByDID(did string) (string, error) {
 	return name, err
 }
 
-func (d *DB) StoreOrgUser(nftID, did, orgID, name, email, passwordHash string) error {
+func (d *DB) StoreOrgUser( orgID, name, email, passwordHash string) error {
 	if name == "" {
 		// Find the next available user_N name.
 		var n int
@@ -985,12 +985,10 @@ func (d *DB) StoreOrgUser(nftID, did, orgID, name, email, passwordHash string) e
 			}
 		}
 	}
-	if did == "" {
-		did = "none"
-	}
+	
 	_, err := d.conn.Exec(
 		`INSERT INTO new_org_users (nft_id, did, organization_id, name, email, password) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
-		nftID, did, orgID, name, email, passwordHash,
+		"default-card-id", "default-id", orgID, name, email, passwordHash,
 	)
 	return err
 }

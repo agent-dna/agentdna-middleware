@@ -661,8 +661,8 @@ func (h *Handler) Signup(c *gin.Context) {
 		OrgID    string `json:"orgID"`
 		OTP      string `json:"otp"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.DID == "" || req.Email == "" || req.Password == "" || req.OrgID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did, email, password and orgID are required"})
+	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || req.Password == "" || req.OrgID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email, password and orgID are required"})
 		return
 	}
 	if req.OTP == "" {
@@ -680,13 +680,9 @@ func (h *Handler) Signup(c *gin.Context) {
 		return
 	}
 
-	nftID, err := GetID(req.DID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate nft id"})
-		return
-	}
 
-	if err := h.db.StoreOrgUser(nftID, req.DID, req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
+
+	if err := h.db.StoreOrgUser( req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register user: %v", err)})
 		return
 	}
