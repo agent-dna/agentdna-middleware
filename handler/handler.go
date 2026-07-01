@@ -786,13 +786,28 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 	}
 	offset := (page - 1) * 5
 
-	metrics, err := h.db.GetOrgMetrics(orgID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
-		return
-	}
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
 
-	agents, err := h.db.GetTopAgentsByOrg(orgID, 5, offset)
+	var metrics *db.OrgMetrics
+	var agents []*db.AgentVolumeRecord
+	var err error
+
+	if isAdmin {
+		metrics, err = h.db.GetOrgMetrics(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
+			return
+		}
+		agents, err = h.db.GetTopAgentsByOrg(orgID, 5, offset)
+	} else {
+		metrics, err = h.db.GetUserMetrics(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
+			return
+		}
+		agents, err = h.db.GetTopAgentsByUser(userDID, orgID, 5, offset)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch agents: %v", err)})
 		return
@@ -831,6 +846,8 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 		return
 	}
 
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
 	intentID := c.Query("intentID")
 
 	const pageSize = 10
@@ -851,13 +868,20 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 			return
 		}
 		interactions, err = h.db.GetInteractionsByOrgAndIntent(orgID, intentID, pageSize, offset)
-	} else {
+	} else if isAdmin {
 		total, err = h.db.CountInteractionsByOrg(orgID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count interactions: %v", err)})
 			return
 		}
 		interactions, err = h.db.GetInteractionsByOrg(orgID, pageSize, offset)
+	} else {
+		total, err = h.db.CountInteractionsByUser(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count interactions: %v", err)})
+			return
+		}
+		interactions, err = h.db.GetInteractionsByUser(userDID, orgID, pageSize, offset)
 	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch interactions: %v", err)})
@@ -912,13 +936,28 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountThreatsByOrg(orgID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count threats: %v", err)})
-		return
-	}
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
 
-	threats, err := h.db.GetThreatsByOrg(orgID, pageSize, offset)
+	var total int
+	var threats []*db.InteractionRecord
+	var err error
+
+	if isAdmin {
+		total, err = h.db.CountThreatsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count threats: %v", err)})
+			return
+		}
+		threats, err = h.db.GetThreatsByOrg(orgID, pageSize, offset)
+	} else {
+		total, err = h.db.CountThreatsByUser(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count threats: %v", err)})
+			return
+		}
+		threats, err = h.db.GetThreatsByUser(userDID, orgID, pageSize, offset)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch threats: %v", err)})
 		return
@@ -1020,13 +1059,28 @@ func (h *Handler) IntentList(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountIntentsByOrg(orgID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
-		return
-	}
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
 
-	intents, err := h.db.GetIntentsByOrg(orgID, pageSize, offset)
+	var total int
+	var intents []*db.IntentRecord
+	var err error
+
+	if isAdmin {
+		total, err = h.db.CountIntentsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
+			return
+		}
+		intents, err = h.db.GetIntentsByOrg(orgID, pageSize, offset)
+	} else {
+		total, err = h.db.CountIntentsByUser(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
+			return
+		}
+		intents, err = h.db.GetIntentsByUser(userDID, orgID, pageSize, offset)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch intents: %v", err)})
 		return
