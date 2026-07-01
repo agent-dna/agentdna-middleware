@@ -92,9 +92,17 @@ func (h *Handler) JWTAuthMiddleware() gin.HandlerFunc {
 		}
 		log.Printf("[JWT:admin-check] result is_admin=%v", isAdmin)
 
-		log.Printf("[JWT] verified ok — sub=%s did=%s org_id=%s is_admin=%v", claims.Subject, claims.DID, h.orgID, isAdmin)
+		resolvedDID := claims.DID
+		if resolvedDID == "" && claims.Email != "" {
+			if u, err := h.db.GetOrgUserByEmail(claims.Email); err == nil && u.DID != "" && u.DID != "none" {
+				resolvedDID = u.DID
+				log.Printf("[JWT] resolved DID from email=%q did=%q", claims.Email, resolvedDID)
+			}
+		}
 
-		c.Set(CtxDID, claims.DID)
+		log.Printf("[JWT] verified ok — sub=%s did=%s org_id=%s is_admin=%v", claims.Subject, resolvedDID, h.orgID, isAdmin)
+
+		c.Set(CtxDID, resolvedDID)
 		c.Set(CtxEmail, claims.Email)
 		c.Set(CtxOrgID, h.orgID)
 		c.Set(CtxNFTID, claims.NFTID)
