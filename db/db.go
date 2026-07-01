@@ -292,7 +292,8 @@ func New(dsn string) *DB {
 	// Migrate new_org_users primary key from did → email so users can be
 	// created without a DID (DID is populated later via user-did-to-key).
 	conn.Exec(`ALTER TABLE new_org_users ALTER COLUMN did DROP NOT NULL`)
-	conn.Exec(`ALTER TABLE new_org_users ALTER COLUMN did SET DEFAULT ''`)
+	conn.Exec(`ALTER TABLE new_org_users ALTER COLUMN did SET DEFAULT 'none'`)
+	conn.Exec(`UPDATE new_org_users SET did = 'none' WHERE did IS NULL OR did = ''`)
 	conn.Exec(`ALTER TABLE new_org_users DROP CONSTRAINT IF EXISTS new_org_users_pkey`)
 	conn.Exec(`ALTER TABLE new_org_users ADD COLUMN IF NOT EXISTS email_pk_added BOOLEAN DEFAULT FALSE`)
 	conn.Exec(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE table_name='new_org_users' AND constraint_type='PRIMARY KEY') THEN ALTER TABLE new_org_users ADD PRIMARY KEY (email); END IF; END $$`)

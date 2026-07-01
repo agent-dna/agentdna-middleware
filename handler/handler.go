@@ -233,13 +233,34 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 		if ix.Threat {
 			threatDetected = true
 		}
+		eventTime := time.Unix(envelopes[idx].Epoch, 0).UTC()
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, eventTime,
 		); err != nil {
 			return fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
 		}
 		if ix.Type == "tool_call" {
 			_ = h.db.StoreNewTool(ix.ToDID, ix.ToName, orgID)
+		}
+
+		issueReasons := make([]string, 0, len(envelopes[idx].Issues))
+		for _, iss := range envelopes[idx].Issues {
+			issueReasons = append(issueReasons, iss.Reason)
+		}
+		blockRec := &db.IntentBlockRecord{
+			ID:             iid,
+			IntentID:       intentID,
+			BlockIndex:     idx,
+			AgentDID:       ix.FromDID,
+			AgentName:      ix.FromName,
+			BlockType:      ix.Type,
+			Message:        ix.Message,
+			ThreatDetected: ix.Threat,
+			TrustIssues:    issueReasons,
+			CreatedAt:      eventTime,
+		}
+		if err := h.db.StoreIntentBlockData(blockRec); err != nil {
+			log.Printf("[intentWorkflow] block data save error idx=%d: %v", idx, err)
 		}
 	}
 
@@ -352,7 +373,7 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 		iid := fmt.Sprintf("%s-%d", intentID, idx+1)
 		interactionIDs = append(interactionIDs, iid)
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message, time.Time{},
 		); err != nil {
 			return fmt.Errorf("handleIntentNFT: StoreNewInteraction: %v", err)
 		}
@@ -448,6 +469,7 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 		CbacDecision   string   `json:"cbac_decision"`
 		ThreatDetected bool     `json:"threat_detected"`
 		TrustIssues    []string `json:"trust_issues"`
+		CreatedAt      string   `json:"created_at"`
 	}
 	out := make([]blockOut, 0, len(blocks))
 	for _, b := range blocks {
@@ -470,6 +492,7 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 			CbacDecision:   b.CbacDecision,
 			ThreatDetected: b.ThreatDetected,
 			TrustIssues:    issues,
+			CreatedAt:      b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	}
 	c.JSON(http.StatusOK, Response{Status: true, Data: out})
@@ -725,12 +748,12 @@ func (h *Handler) UserProfile(c *gin.Context) {
 }
 
 func (h *Handler) AdminProfile(c *gin.Context) {
-	email := c.GetString(CtxEmail)
-	if email == "" {
+	did := c.GetString(CtxDID)
+	if did == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
 		return
 	}
-	profile, err := h.db.GetAdminProfile(email)
+	profile, err := h.db.GetAdminProfile(did)
 	if err != nil {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "admin not found"})
 		return
@@ -763,13 +786,28 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 	}
 	offset := (page - 1) * 5
 
-	metrics, err := h.db.GetOrgMetrics(orgID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
-		return
-	}
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
 
-	agents, err := h.db.GetTopAgentsByOrg(orgID, 5, offset)
+	var metrics *db.OrgMetrics
+	var agents []*db.AgentVolumeRecord
+	var err error
+
+	if isAdmin {
+		metrics, err = h.db.GetOrgMetrics(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
+			return
+		}
+		agents, err = h.db.GetTopAgentsByOrg(orgID, 5, offset)
+	} else {
+		metrics, err = h.db.GetUserMetrics(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
+			return
+		}
+		agents, err = h.db.GetTopAgentsByUser(userDID, orgID, 5, offset)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch agents: %v", err)})
 		return
@@ -808,6 +846,8 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 		return
 	}
 
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
 	intentID := c.Query("intentID")
 
 	const pageSize = 10
@@ -828,13 +868,20 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 			return
 		}
 		interactions, err = h.db.GetInteractionsByOrgAndIntent(orgID, intentID, pageSize, offset)
-	} else {
+	} else if isAdmin {
 		total, err = h.db.CountInteractionsByOrg(orgID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count interactions: %v", err)})
 			return
 		}
 		interactions, err = h.db.GetInteractionsByOrg(orgID, pageSize, offset)
+	} else {
+		total, err = h.db.CountInteractionsByUser(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count interactions: %v", err)})
+			return
+		}
+		interactions, err = h.db.GetInteractionsByUser(userDID, orgID, pageSize, offset)
 	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch interactions: %v", err)})
@@ -889,13 +936,28 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountThreatsByOrg(orgID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count threats: %v", err)})
-		return
-	}
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
 
-	threats, err := h.db.GetThreatsByOrg(orgID, pageSize, offset)
+	var total int
+	var threats []*db.InteractionRecord
+	var err error
+
+	if isAdmin {
+		total, err = h.db.CountThreatsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count threats: %v", err)})
+			return
+		}
+		threats, err = h.db.GetThreatsByOrg(orgID, pageSize, offset)
+	} else {
+		total, err = h.db.CountThreatsByUser(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count threats: %v", err)})
+			return
+		}
+		threats, err = h.db.GetThreatsByUser(userDID, orgID, pageSize, offset)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch threats: %v", err)})
 		return
@@ -997,13 +1059,28 @@ func (h *Handler) IntentList(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountIntentsByOrg(orgID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
-		return
-	}
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
 
-	intents, err := h.db.GetIntentsByOrg(orgID, pageSize, offset)
+	var total int
+	var intents []*db.IntentRecord
+	var err error
+
+	if isAdmin {
+		total, err = h.db.CountIntentsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
+			return
+		}
+		intents, err = h.db.GetIntentsByOrg(orgID, pageSize, offset)
+	} else {
+		total, err = h.db.CountIntentsByUser(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
+			return
+		}
+		intents, err = h.db.GetIntentsByUser(userDID, orgID, pageSize, offset)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch intents: %v", err)})
 		return
@@ -1098,6 +1175,11 @@ func (h *Handler) AgentsList(c *gin.Context) {
 		return
 	}
 
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
+
+	log.Printf("[AgentsList] isAdmin=%v userDID=%q orgID=%q", isAdmin, userDID, orgID)
+
 	const pageSize = 10
 	page := 1
 	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
@@ -1105,16 +1187,35 @@ func (h *Handler) AgentsList(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountAgentsByOrg(orgID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count agents: %v", err)})
-		return
-	}
+	var (
+		total  int
+		agents []*db.AgentDetailRecord
+		err    error
+	)
 
-	agents, err := h.db.GetAgentsByOrg(orgID, pageSize, offset)
+	if isAdmin {
+		total, err = h.db.CountAgentsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count agents: %v", err)})
+			return
+		}
+		agents, err = h.db.GetAgentsByOrg(orgID, pageSize, offset)
+	} else {
+		total, err = h.db.CountAgentsByUser(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count agents: %v", err)})
+			return
+		}
+		agents, err = h.db.GetAgentsByUser(userDID, orgID, pageSize, offset)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch agents: %v", err)})
 		return
+	}
+
+	log.Printf("[AgentsList] total=%d returned=%d", total, len(agents))
+	for _, a := range agents {
+		log.Printf("[AgentsList] agent did=%q name=%q deployer=%q", a.AgentDID, a.AgentName, a.DeployerDID)
 	}
 
 	list := make([]gin.H, 0, len(agents))
@@ -1315,7 +1416,7 @@ func (h *Handler) UserIntents(c *gin.Context) {
 
 	userDID := c.GetString(CtxDID)
 	orgID := c.GetString(CtxOrgID)
-	if userDID == "" || orgID == "" {
+	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
 		return
 	}
@@ -1327,13 +1428,13 @@ func (h *Handler) UserIntents(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountUserIntents(userDID, orgID)
+	total, err := h.db.CountIntentsByUser(userDID, orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
 		return
 	}
 
-	intents, err := h.db.GetUserIntents(userDID, orgID, pageSize, offset)
+	intents, err := h.db.GetIntentsByUser(userDID, orgID, pageSize, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch intents: %v", err)})
 		return
@@ -1414,13 +1515,19 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 		InteractionType string         `json:"interactionType,omitempty"`
 		Direction       string         `json:"direction,omitempty"`
 		Threat          bool           `json:"threat"`
+		CreatedAt       string         `json:"created_at"`
 		Children        []*DiagramNode `json:"children"`
 	}
 
+	formatTime := func(t time.Time) string {
+		return t.UTC().Format("2006-01-02T15:04:05.000Z")
+	}
+
 	root := &DiagramNode{
-		DID:      intent.InitiatorDID,
-		Name:     intent.InitiatorName,
-		Children: []*DiagramNode{},
+		DID:       intent.InitiatorDID,
+		Name:      intent.InitiatorName,
+		CreatedAt: formatTime(intent.StartedAt),
+		Children:  []*DiagramNode{},
 	}
 
 	// Stack tracks the current path from root to the active node.
@@ -1437,6 +1544,7 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 				InteractionType: ix.Type,
 				Direction:       ix.Direction,
 				Threat:          ix.Threat,
+				CreatedAt:       formatTime(ix.Time),
 				Children:        []*DiagramNode{},
 			}
 			current.Children = append(current.Children, child)
@@ -1738,7 +1846,7 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/create-agent"
 	fmt.Print("test_0002: %v", buf.Bytes())
 	fmt.Print("test_0003: %v", mw.FormDataContentType())
-	
+
 	httpStart := time.Now()
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
 	fmt.Printf("[callCreateAgent] http post took %s", time.Since(httpStart))
@@ -1750,11 +1858,11 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 
 	rawBody, _ := io.ReadAll(resp.Body)
 	log.Printf("[callCreateAgent] response status=%d body=%s", resp.StatusCode, string(rawBody))
-   
+
 	var result struct {
-		Status  bool   `json:"status"`
-		Message string `json:"message"`
-		AgentID string `json:"agent_id"`
+		Status      bool   `json:"status"`
+		Message     string `json:"message"`
+		AgentID     string `json:"agent_id"`
 		AgentCardID string `json:"agent_card_id"`
 	}
 	json.Unmarshal(rawBody, &result)
@@ -1766,13 +1874,15 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 }
 
 // callUpdateAgent POSTs multipart form-data to UPDATE_AGENT_ENDPOINT.
-func (h *Handler) callUpdateAgent(agentName, agentID, policy, creatorDID, orgID string) error {
+func (h *Handler) callUpdateAgent(agentName, agentID, policy, adminDID, orgID string) error {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	mw.WriteField("creator_did", creatorDID)
+
+	mw.WriteField("creator_did", adminDID)
 	mw.WriteField("org_id", orgID)
 	mw.WriteField("agent_name", agentName)
 	mw.WriteField("agent_id", agentID)
+	
 	fw, err := mw.CreateFormFile("policy", "policy.txt")
 	if err != nil {
 		return fmt.Errorf("callUpdateAgent: create form file: %v", err)
@@ -1885,7 +1995,7 @@ func (h *Handler) UploadAgentPolicy(c *gin.Context) {
 		return
 	}
 	orgID, _ := h.db.GetAgentOrgID(agentDID)
-	if err := h.callUpdateAgent(agentInfo.AgentName, agentDID, content, agentInfo.DeployerDID, orgID); err != nil {
+	if err := h.callUpdateAgent(agentInfo.AgentName, agentDID, content, c.GetString(CtxDID), orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
 	}
@@ -1929,6 +2039,7 @@ func (h *Handler) fetchAgentChain(nftID string) ([]struct {
 }, error) {
 	chainURL := fmt.Sprintf("%s://%s/rubix/v1/nfts/%s/chain", h.baseURL.Scheme, h.baseURL.Host, nftID)
 	resp, err := http.Get(chainURL)
+	fmt.Printf("fetchAgentChain: GET %s -> err=%v\n", resp, err)
 	if err != nil {
 		return nil, err
 	}
@@ -1945,7 +2056,7 @@ func (h *Handler) fetchAgentChain(nftID string) ([]struct {
 		return nil, err
 	}
 
-	if len(chainResp.Result) <= 1 {
+	if len(chainResp.Result) <= 0 {
 		return nil, nil
 	}
 
@@ -1954,7 +2065,7 @@ func (h *Handler) fetchAgentChain(nftID string) ([]struct {
 		Epoch         int64
 		Data          string
 	}
-	for _, e := range chainResp.Result[1:] {
+	for _, e := range chainResp.Result {
 		out = append(out, struct {
 			TransactionID string
 			Epoch         int64
@@ -1974,6 +2085,7 @@ func (h *Handler) GetAgentPolicyHistory(c *gin.Context) {
 	}
 
 	nftID, err := h.db.GetAgentNFTID(agentDID)
+	fmt.Printf("GetAgentPolicyHistory: agentDID=%s nftID=%s err=%v\n", agentDID, nftID, err)
 	if err != nil || nftID == "" {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "agent NFT not found"})
 		return
@@ -1993,7 +2105,7 @@ func (h *Handler) GetAgentPolicyHistory(c *gin.Context) {
 	for _, e := range entries {
 		history = append(history, historyItem{UpdateID: e.TransactionID, Time: e.Epoch})
 	}
-
+    fmt.Printf("testpolicy history: %+v\n", history)
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"agentDID": agentDID, "nftID": nftID, "history": history}})
 }
 
@@ -2381,7 +2493,7 @@ func (h *Handler) AgentInfoEdit(c *gin.Context) {
 	// Look up org and NFT ID for the agent to pass to the update endpoint.
 	orgID, _ := h.db.GetAgentOrgID(req.AgentDID)
 	nftID, _ := h.db.GetAgentNFTID(req.AgentDID)
-	if err := h.callUpdateAgent(req.AgentName, nftID, req.Policy, req.AgentDID, orgID); err != nil {
+	if err := h.callUpdateAgent(req.AgentName, nftID, req.Policy, c.GetString(CtxDID), orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
 	}

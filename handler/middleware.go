@@ -90,21 +90,19 @@ func (h *Handler) JWTAuthMiddleware() gin.HandlerFunc {
 				isAdmin = true
 			}
 		}
-		// Auto-register: if JWT is valid and has a DID, but no admin record
-		// exists yet for this org, store the admin so subsequent requests work.
-		if !isAdmin && claims.DID != "" && h.orgID != "" {
-			if err := h.db.StoreAdmin(claims.DID, h.orgID, "", "", ""); err == nil {
-				log.Printf("[JWT:admin-check] auto-registered admin did=%q org_id=%q", claims.DID, h.orgID)
-				isAdmin = true
-			} else {
-				log.Printf("[JWT:admin-check] auto-register failed: %v", err)
-			}
-		}
 		log.Printf("[JWT:admin-check] result is_admin=%v", isAdmin)
 
-		log.Printf("[JWT] verified ok — sub=%s did=%s org_id=%s is_admin=%v", claims.Subject, claims.DID, h.orgID, isAdmin)
+		resolvedDID := claims.DID
+		if resolvedDID == "" && claims.Email != "" {
+			if u, err := h.db.GetOrgUserByEmail(claims.Email); err == nil && u.DID != "" && u.DID != "none" {
+				resolvedDID = u.DID
+				log.Printf("[JWT] resolved DID from email=%q did=%q", claims.Email, resolvedDID)
+			}
+		}
 
-		c.Set(CtxDID, claims.DID)
+		log.Printf("[JWT] verified ok — sub=%s did=%s org_id=%s is_admin=%v", claims.Subject, resolvedDID, h.orgID, isAdmin)
+
+		c.Set(CtxDID, resolvedDID)
 		c.Set(CtxEmail, claims.Email)
 		c.Set(CtxOrgID, h.orgID)
 		c.Set(CtxNFTID, claims.NFTID)
