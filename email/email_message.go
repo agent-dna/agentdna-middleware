@@ -631,3 +631,72 @@ var apiKeyDeliveryTmpl = template.Must(template.New("apikey").Parse(`
 </body>
 </html>
 `))
+
+// OTPVerification sends a 6-digit OTP code to the given email for registration verification.
+func OTPVerification(toEmail, code string) (Message, error) {
+	data := struct {
+		Email string
+		Code  string
+		Year  int
+	}{
+		Email: toEmail,
+		Code:  code,
+		Year:  time.Now().Year(),
+	}
+	html, err := render(otpVerificationTmpl, data)
+	if err != nil {
+		return Message{}, err
+	}
+	return Message{
+		To:      toEmail,
+		Subject: "Your AgentDNA verification code",
+		HTML:    html,
+	}, nil
+}
+
+var otpVerificationTmpl = template.Must(template.New("otp-verification").Parse(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Verify your email · AgentDNA</title>
+  <style>body{margin:0;padding:0;background:#F0F4F9;font-family:'Inter',-apple-system,sans-serif;}</style>
+</head>
+<body>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#F0F4F9;padding:40px 16px;">
+    <tr><td align="center" valign="top">
+      <table role="presentation" width="580" cellpadding="0" cellspacing="0" border="0"
+             style="max-width:580px;width:100%;background:#fff;border-radius:16px;border:1px solid #DCE6F4;box-shadow:0 4px 24px -8px rgba(10,34,64,.10);">
+        <tr><td style="background:linear-gradient(90deg,#2D7DFF 0%,#6BA8FF 100%);height:3px;border-radius:16px 16px 0 0;font-size:0;line-height:0;">&nbsp;</td></tr>
+        <tr><td style="padding:32px 40px 0;">
+          <a href="https://agentdna.io" style="display:inline-block;text-decoration:none;">
+            <img src="https://agentdna.io/assets/wb-BuhqEaFf.png" alt="AgentDNA" height="36" style="height:36px;width:auto;display:block;"/>
+          </a>
+        </td></tr>
+        <tr><td style="padding:32px 40px 40px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:20px;">
+            <tr><td style="background:#EAF2FF;border-radius:999px;padding:5px 12px;">
+              <p style="margin:0;font-size:11px;font-weight:600;color:#1D5FD9;text-transform:uppercase;letter-spacing:.14em;line-height:1;">&#9679;&ensp;Email Verification</p>
+            </td></tr>
+          </table>
+          <h1 style="margin:0 0 10px;font-size:28px;font-weight:800;color:#0A2240;">Verify your email address</h1>
+          <p style="margin:0 0 24px;font-size:15.5px;color:#0E1A2B;line-height:1.7;">
+            Use the code below to complete your registration. It expires in <strong>5 minutes</strong>.
+          </p>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
+            <tr><td align="center" style="background:#F6F9FE;border:1.5px solid #DCE6F4;border-radius:12px;padding:28px 20px;">
+              <p style="margin:0;font-size:42px;font-weight:800;letter-spacing:12px;color:#0A2240;font-family:'Courier New',monospace;">{{.Code}}</p>
+            </td></tr>
+          </table>
+          <p style="margin:0;font-size:13px;color:#94A3B8;">If you did not request this, you can safely ignore this email.</p>
+        </td></tr>
+        <tr><td style="background:#F6F9FE;border-top:1px solid #EDF3FB;padding:20px 40px;border-radius:0 0 16px 16px;">
+          <p style="margin:0;font-size:11.5px;color:#94A3B8;text-align:center;">&copy; {{.Year}} AgentDNA, Inc.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
+`))

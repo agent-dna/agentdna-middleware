@@ -2,17 +2,20 @@ package handler
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"mime/multipart"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agentdna-ratelimit-auth/db"
@@ -29,6 +32,11 @@ func enableCors(w *http.ResponseWriter) {
 	(*w).Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization")
 }
 
+type otpEntry struct {
+	code      string
+	expiresAt time.Time
+}
+
 type Handler struct {
 	db                  *db.DB
 	proxy               *httputil.ReverseProxy
@@ -39,6 +47,7 @@ type Handler struct {
 	createAgentEndpoint string
 	updateAgentEndpoint string
 	mailer              *email.Mailer
+	otpStore            sync.Map
 }
 
 func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
@@ -59,6 +68,60 @@ func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL
 		log.Printf("[email] mailer disabled: %v", err)
 	}
 	return h
+}
+
+func generateOTP() (string, error) {
+	var otp string
+	for i := 0; i < 6; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(10))
+		if err != nil {
+			return "", err
+		}
+		otp += n.String()
+	}
+	return otp, nil
+}
+
+func (h *Handler) SendOTP(c *gin.Context) {
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email is required"})
+		return
+	}
+
+	code, err := generateOTP()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate OTP"})
+		return
+	}
+
+	h.otpStore.Store(req.Email, otpEntry{
+		code:      code,
+		expiresAt: time.Now().Add(5 * time.Minute),
+	})
+
+	h.sendMail(email.OTPVerification(req.Email, code))
+	log.Printf("[SendOTP] OTP sent to email=%q", req.Email)
+	c.JSON(http.StatusOK, Response{Status: true, Message: "OTP sent to " + req.Email})
+}
+
+func (h *Handler) verifyOTP(emailAddr, code string) bool {
+	val, ok := h.otpStore.Load(emailAddr)
+	if !ok {
+		return false
+	}
+	entry := val.(otpEntry)
+	if time.Now().After(entry.expiresAt) {
+		h.otpStore.Delete(emailAddr)
+		return false
+	}
+	if entry.code != code {
+		return false
+	}
+	h.otpStore.Delete(emailAddr)
+	return true
 }
 
 // sendMail fires an email in a goroutine so it never blocks the request path.
@@ -596,9 +659,18 @@ func (h *Handler) Signup(c *gin.Context) {
 		Email    string `json:"email"`
 		Password string `json:"password"`
 		OrgID    string `json:"orgID"`
+		OTP      string `json:"otp"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.DID == "" || req.Email == "" || req.Password == "" || req.OrgID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did, email, password and orgID are required"})
+		return
+	}
+	if req.OTP == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "otp is required"})
+		return
+	}
+	if !h.verifyOTP(req.Email, req.OTP) {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid or expired OTP"})
 		return
 	}
 
@@ -700,9 +772,18 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 		Email    string `json:"email"`
 		Password string `json:"password"`
 		OrgID    string `json:"orgID"`
+		OTP      string `json:"otp"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.Username == "" || req.Email == "" || req.Password == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "username, email and password are required"})
+		return
+	}
+	if req.OTP == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "otp is required"})
+		return
+	}
+	if !h.verifyOTP(req.Email, req.OTP) {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid or expired OTP"})
 		return
 	}
 

@@ -13,6 +13,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	// Dashboard — public
 	public := r.Group("/dashboard/v1")
 	public.POST("/login", h.Login)
+	public.POST("/send-otp", h.SendOTP)
 	public.POST("/register-user", h.RegisterUser)
 	public.POST("/signup", h.Signup)
 	public.POST("/create-admin", h.CreateAdmin)
