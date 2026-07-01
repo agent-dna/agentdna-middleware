@@ -2048,7 +2048,7 @@ func (h *Handler) fetchAgentChain(nftID string) ([]struct {
 		return nil, err
 	}
 
-	if len(chainResp.Result) <= 1 {
+	if len(chainResp.Result) <= 0 {
 		return nil, nil
 	}
 
