@@ -1178,6 +1178,8 @@ func (h *Handler) AgentsList(c *gin.Context) {
 	isAdmin := c.GetBool(CtxIsAdmin)
 	userDID := c.GetString(CtxDID)
 
+	log.Printf("[AgentsList] isAdmin=%v userDID=%q orgID=%q", isAdmin, userDID, orgID)
+
 	const pageSize = 10
 	page := 1
 	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
@@ -1209,6 +1211,11 @@ func (h *Handler) AgentsList(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch agents: %v", err)})
 		return
+	}
+
+	log.Printf("[AgentsList] total=%d returned=%d", total, len(agents))
+	for _, a := range agents {
+		log.Printf("[AgentsList] agent did=%q name=%q deployer=%q", a.AgentDID, a.AgentName, a.DeployerDID)
 	}
 
 	list := make([]gin.H, 0, len(agents))
