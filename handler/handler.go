@@ -2097,7 +2097,7 @@ func (h *Handler) GetAgentPolicyHistory(c *gin.Context) {
 	for _, e := range entries {
 		history = append(history, historyItem{UpdateID: e.TransactionID, Time: e.Epoch})
 	}
-
+    fmt.Printf("testpolicy history: %+v\n", history)
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"agentDID": agentDID, "nftID": nftID, "history": history}})
 }
 
