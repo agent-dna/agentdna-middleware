@@ -2032,6 +2032,7 @@ func (h *Handler) fetchAgentChain(nftID string) ([]struct {
 }, error) {
 	chainURL := fmt.Sprintf("%s://%s/rubix/v1/nfts/%s/chain", h.baseURL.Scheme, h.baseURL.Host, nftID)
 	resp, err := http.Get(chainURL)
+	fmt.Printf("fetchAgentChain: GET %s -> err=%v\n", resp, err)
 	if err != nil {
 		return nil, err
 	}
