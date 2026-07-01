@@ -269,9 +269,8 @@ func (d *DB) CountAgentsByUser(userDID, orgID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM new_agents a
-		WHERE a.organization_id = $2
-			AND a.deployer_did = $1`,
-		userDID, orgID,
+		WHERE a.deployer_did = $1`,
+		userDID,
 	).Scan(&total)
 	return total, err
 }
@@ -294,12 +293,11 @@ func (d *DB) GetAgentsByUser(userDID, orgID string, limit, offset int) ([]*Agent
 			END                                                                  AS score
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
-		WHERE a.organization_id = $2
-			AND a.deployer_did = $1
+		WHERE a.deployer_did = $1
 		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy
 		ORDER BY a.did
-		LIMIT $3 OFFSET $4`,
-		userDID, orgID, limit, offset,
+		LIMIT $2 OFFSET $3`,
+		userDID, limit, offset,
 	)
 	if err != nil {
 		return nil, err
