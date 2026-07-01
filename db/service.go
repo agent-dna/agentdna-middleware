@@ -217,7 +217,7 @@ func (d *DB) CountAgentsByOrg(orgID string) (int, error) {
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM new_agents
 		WHERE organization_id = $1
-			AND did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1)`,
+			AND did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did IS NOT NULL)`,
 		orgID,
 	).Scan(&total)
 	return total, err
@@ -242,7 +242,7 @@ func (d *DB) GetAgentsByOrg(orgID string, limit, offset int) ([]*AgentDetailReco
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1)
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did IS NOT NULL)
 		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy
 		ORDER BY a.did
 		LIMIT $2 OFFSET $3`,
@@ -270,7 +270,7 @@ func (d *DB) CountAgentsByUser(userDID, orgID string) (int, error) {
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM new_agents a
 		WHERE a.organization_id = $2
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $2)
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $2 AND did IS NOT NULL)
 			AND (
 				(a.deployer_did = $1 AND a.deployer_did != '')
 				OR a.did IN (
@@ -302,7 +302,7 @@ func (d *DB) GetAgentsByUser(userDID, orgID string, limit, offset int) ([]*Agent
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $2
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $2)
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $2 AND did IS NOT NULL)
 			AND (
 				(a.deployer_did = $1 AND a.deployer_did != '')
 				OR a.did IN (
@@ -542,7 +542,7 @@ func (d *DB) CountUsersByOrg(orgID string) (int, error) {
 func (d *DB) GetUsersByOrg(orgID string, limit, offset int) ([]*UserDetailRecord, error) {
 	rows, err := d.conn.Query(`
 		SELECT
-			u.did,
+			COALESCE(u.did, ''),
 			COALESCE(u.name, ''),
 			COALESCE(u.created_at, NOW()),
 			COUNT(DISTINCT ni.intent_id)                                                AS total_intents,
@@ -662,7 +662,7 @@ func (d *DB) CountTopThreatAgentsByOrg(orgID string) (int, error) {
 		JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
 			AND i.threat = 1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1)`,
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did IS NOT NULL)`,
 		orgID,
 	).Scan(&total)
 	return total, err
@@ -679,7 +679,7 @@ func (d *DB) GetTopThreatAgentsByOrg(orgID string, limit, offset int) ([]*AgentV
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1)
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did IS NOT NULL)
 		GROUP BY a.did, a.nft_id, a.name
 		ORDER BY total_threats DESC
 		LIMIT $2 OFFSET $3`,
@@ -798,7 +798,7 @@ func (d *DB) GetTopAgentsByOrg(orgID string, limit, offset int) ([]*AgentVolumeR
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1)
+			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did IS NOT NULL)
 		GROUP BY a.did, a.nft_id, a.name
 		ORDER BY total_interactions DESC
 		LIMIT $2 OFFSET $3`,
