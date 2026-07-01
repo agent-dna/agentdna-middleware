@@ -1867,13 +1867,15 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 }
 
 // callUpdateAgent POSTs multipart form-data to UPDATE_AGENT_ENDPOINT.
-func (h *Handler) callUpdateAgent(agentName, agentID, policy, creatorDID, orgID string) error {
+func (h *Handler) callUpdateAgent(agentName, agentID, policy, adminDID, orgID string) error {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	mw.WriteField("creator_did", creatorDID)
+
+	mw.WriteField("creator_did", adminDID)
 	mw.WriteField("org_id", orgID)
 	mw.WriteField("agent_name", agentName)
 	mw.WriteField("agent_id", agentID)
+	
 	fw, err := mw.CreateFormFile("policy", "policy.txt")
 	if err != nil {
 		return fmt.Errorf("callUpdateAgent: create form file: %v", err)
@@ -1986,7 +1988,7 @@ func (h *Handler) UploadAgentPolicy(c *gin.Context) {
 		return
 	}
 	orgID, _ := h.db.GetAgentOrgID(agentDID)
-	if err := h.callUpdateAgent(agentInfo.AgentName, agentDID, content, agentInfo.DeployerDID, orgID); err != nil {
+	if err := h.callUpdateAgent(agentInfo.AgentName, agentDID, content, c.GetString(CtxDID), orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
 	}
@@ -2482,7 +2484,7 @@ func (h *Handler) AgentInfoEdit(c *gin.Context) {
 	// Look up org and NFT ID for the agent to pass to the update endpoint.
 	orgID, _ := h.db.GetAgentOrgID(req.AgentDID)
 	nftID, _ := h.db.GetAgentNFTID(req.AgentDID)
-	if err := h.callUpdateAgent(req.AgentName, nftID, req.Policy, req.AgentDID, orgID); err != nil {
+	if err := h.callUpdateAgent(req.AgentName, nftID, req.Policy, c.GetString(CtxDID), orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
 	}
