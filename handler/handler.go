@@ -2058,7 +2058,7 @@ func (h *Handler) fetchAgentChain(nftID string) ([]struct {
 		Epoch         int64
 		Data          string
 	}
-	for _, e := range chainResp.Result[1:] {
+	for _, e := range chainResp.Result {
 		out = append(out, struct {
 			TransactionID string
 			Epoch         int64
