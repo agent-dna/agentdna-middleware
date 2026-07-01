@@ -10,10 +10,10 @@ import (
 
 	"agentdna-ratelimit-auth/db"
 
-	cid "github.com/ipfs/go-cid"
-	mh "github.com/multiformats/go-multihash"
 	"github.com/google/uuid"
+	cid "github.com/ipfs/go-cid"
 	_ "github.com/lib/pq"
+	mh "github.com/multiformats/go-multihash"
 )
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -172,7 +172,7 @@ func main() {
 				dir = "inbound"
 			}
 			if err := database.StoreNewInteraction(
-				iid, hop[0], hop[1], hop[2], hop[3], hop[4], dir, threat, intentID, orgID, "",
+				iid, hop[0], hop[1], hop[2], hop[3], hop[4], dir, threat, intentID, orgID, "", time.Time{},
 			); err != nil {
 				log.Printf("StoreNewInteraction intent=%s hop=%d: %v", intentID, j, err)
 			}

@@ -233,13 +233,34 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 		if ix.Threat {
 			threatDetected = true
 		}
+		eventTime := time.Unix(envelopes[idx].Epoch, 0).UTC()
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, eventTime,
 		); err != nil {
 			return fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
 		}
 		if ix.Type == "tool_call" {
 			_ = h.db.StoreNewTool(ix.ToDID, ix.ToName, orgID)
+		}
+
+		issueReasons := make([]string, 0, len(envelopes[idx].Issues))
+		for _, iss := range envelopes[idx].Issues {
+			issueReasons = append(issueReasons, iss.Reason)
+		}
+		blockRec := &db.IntentBlockRecord{
+			ID:             iid,
+			IntentID:       intentID,
+			BlockIndex:     idx,
+			AgentDID:       ix.FromDID,
+			AgentName:      ix.FromName,
+			BlockType:      ix.Type,
+			Message:        ix.Message,
+			ThreatDetected: ix.Threat,
+			TrustIssues:    issueReasons,
+			CreatedAt:      eventTime,
+		}
+		if err := h.db.StoreIntentBlockData(blockRec); err != nil {
+			log.Printf("[intentWorkflow] block data save error idx=%d: %v", idx, err)
 		}
 	}
 
@@ -352,7 +373,7 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 		iid := fmt.Sprintf("%s-%d", intentID, idx+1)
 		interactionIDs = append(interactionIDs, iid)
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message, time.Time{},
 		); err != nil {
 			return fmt.Errorf("handleIntentNFT: StoreNewInteraction: %v", err)
 		}
@@ -448,6 +469,7 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 		CbacDecision   string   `json:"cbac_decision"`
 		ThreatDetected bool     `json:"threat_detected"`
 		TrustIssues    []string `json:"trust_issues"`
+		CreatedAt      string   `json:"created_at"`
 	}
 	out := make([]blockOut, 0, len(blocks))
 	for _, b := range blocks {
@@ -470,6 +492,7 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 			CbacDecision:   b.CbacDecision,
 			ThreatDetected: b.ThreatDetected,
 			TrustIssues:    issues,
+			CreatedAt:      b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	}
 	c.JSON(http.StatusOK, Response{Status: true, Data: out})
@@ -1098,6 +1121,9 @@ func (h *Handler) AgentsList(c *gin.Context) {
 		return
 	}
 
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
+
 	const pageSize = 10
 	page := 1
 	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
@@ -1105,13 +1131,27 @@ func (h *Handler) AgentsList(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountAgentsByOrg(orgID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count agents: %v", err)})
-		return
-	}
+	var (
+		total  int
+		agents []*db.AgentDetailRecord
+		err    error
+	)
 
-	agents, err := h.db.GetAgentsByOrg(orgID, pageSize, offset)
+	if isAdmin {
+		total, err = h.db.CountAgentsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count agents: %v", err)})
+			return
+		}
+		agents, err = h.db.GetAgentsByOrg(orgID, pageSize, offset)
+	} else {
+		total, err = h.db.CountAgentsByUser(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count agents: %v", err)})
+			return
+		}
+		agents, err = h.db.GetAgentsByUser(userDID, orgID, pageSize, offset)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch agents: %v", err)})
 		return
@@ -1414,13 +1454,19 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 		InteractionType string         `json:"interactionType,omitempty"`
 		Direction       string         `json:"direction,omitempty"`
 		Threat          bool           `json:"threat"`
+		CreatedAt       string         `json:"created_at"`
 		Children        []*DiagramNode `json:"children"`
 	}
 
+	formatTime := func(t time.Time) string {
+		return t.UTC().Format("2006-01-02T15:04:05.000Z")
+	}
+
 	root := &DiagramNode{
-		DID:      intent.InitiatorDID,
-		Name:     intent.InitiatorName,
-		Children: []*DiagramNode{},
+		DID:       intent.InitiatorDID,
+		Name:      intent.InitiatorName,
+		CreatedAt: formatTime(intent.StartedAt),
+		Children:  []*DiagramNode{},
 	}
 
 	// Stack tracks the current path from root to the active node.
@@ -1437,6 +1483,7 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 				InteractionType: ix.Type,
 				Direction:       ix.Direction,
 				Threat:          ix.Threat,
+				CreatedAt:       formatTime(ix.Time),
 				Children:        []*DiagramNode{},
 			}
 			current.Children = append(current.Children, child)
@@ -1738,7 +1785,7 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/create-agent"
 	fmt.Print("test_0002: %v", buf.Bytes())
 	fmt.Print("test_0003: %v", mw.FormDataContentType())
-	
+
 	httpStart := time.Now()
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
 	fmt.Printf("[callCreateAgent] http post took %s", time.Since(httpStart))
@@ -1750,11 +1797,11 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 
 	rawBody, _ := io.ReadAll(resp.Body)
 	log.Printf("[callCreateAgent] response status=%d body=%s", resp.StatusCode, string(rawBody))
-   
+
 	var result struct {
-		Status  bool   `json:"status"`
-		Message string `json:"message"`
-		AgentID string `json:"agent_id"`
+		Status      bool   `json:"status"`
+		Message     string `json:"message"`
+		AgentID     string `json:"agent_id"`
 		AgentCardID string `json:"agent_card_id"`
 	}
 	json.Unmarshal(rawBody, &result)
