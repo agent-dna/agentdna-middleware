@@ -98,6 +98,16 @@ func (h *Handler) CoreRegisterAgent(c *gin.Context) {
 	}
 	
 
+	if agentID != "" {
+		if exists, err := h.db.ActiveRequestExistsForAgent(agentID); err != nil {
+			log.Printf("[CoreRegisterAgent] ActiveRequestExistsForAgent check failed agentID=%q err=%v", agentID, err)
+		} else if exists {
+			log.Printf("[CoreRegisterAgent] duplicate request blocked agentID=%q", agentID)
+			c.JSON(http.StatusConflict, Response{Status: false, Message: "an active request for this agent is already pending or approved"})
+			return
+		}
+	}
+
 	requestID := uuid.New().String()
 	if err := h.db.CreateRequest(requestID, "deploy_agent", policy, user.DID, agentID, agentName, "", user.OrgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to create request: %v", err)})

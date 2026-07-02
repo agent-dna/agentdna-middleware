@@ -102,6 +102,21 @@ func (d *DB) CreateRequest(id, requestType, policy, creatorDID, agentDID, agentN
 	return err
 }
 
+// ActiveRequestExistsForAgent returns true if a pending or approved deploy_agent
+// request already exists for the given agent_did, meaning a new one should not be created.
+func (d *DB) ActiveRequestExistsForAgent(agentDID string) (bool, error) {
+	var exists bool
+	err := d.conn.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM new_requests
+			WHERE agent_did = $1
+			  AND request_type = 'deploy_agent'
+			  AND status IN ('pending', 'approved')
+		)`, agentDID,
+	).Scan(&exists)
+	return exists, err
+}
+
 func (d *DB) GetRequestByID(id string) (*RequestRecord, error) {
 	r := &RequestRecord{}
 	var agentDID, agentName, requestInfo, orgID sql.NullString

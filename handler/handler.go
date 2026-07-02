@@ -2484,6 +2484,16 @@ func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
 		return
 	}
 
+	if agentID != "" {
+		if exists, err := h.db.ActiveRequestExistsForAgent(agentID); err != nil {
+			log.Printf("[AgentsCreationRequestsCreate] ActiveRequestExistsForAgent check failed agentID=%q err=%v", agentID, err)
+		} else if exists {
+			log.Printf("[AgentsCreationRequestsCreate] duplicate request blocked agentID=%q", agentID)
+			c.JSON(http.StatusConflict, Response{Status: false, Message: "an active request for this agent is already pending or approved"})
+			return
+		}
+	}
+
 	id := uuid.New().String()
 	if err := h.db.CreateRequest(id, "deploy_agent", policy, creatorDID, agentID, agentName, requestInfo, orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to create request: %v", err)})
