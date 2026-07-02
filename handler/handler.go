@@ -801,6 +801,10 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "username, email and password are required"})
 		return
 	}
+	if req.OrgID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "orgID is required"})
+		return
+	}
 	if req.OTP == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "otp is required"})
 		return
@@ -812,7 +816,7 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 
 	// Call external agent service to register admin and get DID.
 	log.Printf("[CreateAdmin] calling agent service username=%q orgID=%q email=%q", req.Username, req.OrgID, req.Email)
-	did, err := h.callRegisterAdmin(req.Username, req.OrgID, req.Password)
+	did, err := h.callRegisterAdmin(req.Username, req.OrgID, req.Email, req.Password)
 	if err != nil {
 		log.Printf("[CreateAdmin] agent service error: %v", err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
@@ -1906,11 +1910,11 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 }
 
 // callRegisterAdmin calls the external agent service to register an admin and get their DID.
-func (h *Handler) callRegisterAdmin(username, org, password string) (string, error) {
+func (h *Handler) callRegisterAdmin(username, org, email, password string) (string, error) {
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/register-admin"
-	log.Printf("[callRegisterAdmin] POST %s username=%q org=%q", endpoint, username, org)
+	log.Printf("[callRegisterAdmin] POST %s username=%q org=%q email=%q", endpoint, username, org, email)
 
-	b, _ := json.Marshal(map[string]string{"username": username, "org": org, "password": password})
+	b, _ := json.Marshal(map[string]string{"username": username, "org": org, "email": email, "password": password})
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
 		log.Printf("[callRegisterAdmin] http error: %v", err)
