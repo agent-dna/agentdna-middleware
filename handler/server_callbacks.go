@@ -3,7 +3,9 @@ package handler
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"strings"
 
 	"agentdna-ratelimit-auth/email"
 	"github.com/gin-gonic/gin"
@@ -102,9 +104,20 @@ func (h *Handler) CoreRegisterAgent(c *gin.Context) {
 		return
 	}
 
-	// Notify admin.
-	if _, adminEmail, err := h.db.GetAdminEmailByOrgID(user.OrgID); err == nil {
-		h.sendMail(email.AgentCreationRequestNew(adminEmail, agentName, user.Name, requestID))
+	// Notify all admins in the org.
+	adminEmails, err := h.db.GetAllAdminEmailsByOrgID(user.OrgID)
+	if err != nil {
+		log.Printf("[CoreRegisterAgent] GetAllAdminEmailsByOrgID failed orgID=%q err=%v", user.OrgID, err)
+	} else if len(adminEmails) == 0 {
+		log.Printf("[CoreRegisterAgent] no admin emails found for orgID=%q", user.OrgID)
+	} else {
+		log.Printf("[CoreRegisterAgent] notifying %d admin(s)=%v agentName=%q requestID=%q", len(adminEmails), adminEmails, agentName, requestID)
+		for _, adminEmail := range adminEmails {
+			if strings.TrimSpace(adminEmail) == "" {
+				continue
+			}
+			h.sendMail(email.AgentCreationRequestNew(adminEmail, agentName, user.Name, requestID))
+		}
 	}
 
 	c.JSON(http.StatusOK, Response{Status: true, Message: ""})
