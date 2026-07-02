@@ -103,7 +103,7 @@ func (h *Handler) CoreRegisterAgent(c *gin.Context) {
 			log.Printf("[CoreRegisterAgent] ActiveRequestExistsForAgent check failed agentID=%q err=%v", agentID, err)
 		} else if exists {
 			log.Printf("[CoreRegisterAgent] duplicate request blocked agentID=%q", agentID)
-			c.JSON(http.StatusConflict, Response{Status: false, Message: "an active request for this agent is already pending or approved"})
+			c.JSON(http.StatusConflict, Response{Status: true, Message: "duplicate id"})
 			return
 		}
 	}
