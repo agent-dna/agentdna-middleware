@@ -193,14 +193,21 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 }
 
 // sendMail fires an email in a goroutine so it never blocks the request path.
-// It is a no-op when no mailer is configured.
 func (h *Handler) sendMail(msg email.Message, err error) {
-	if err != nil || h.mailer == nil {
+	if err != nil {
+		log.Printf("[email] template render failed: %v", err)
 		return
 	}
+	if h.mailer == nil {
+		log.Printf("[email] mailer not configured — skipping email to=%q subject=%q", msg.To, msg.Subject)
+		return
+	}
+	log.Printf("[email] dispatching to=%q subject=%q", msg.To, msg.Subject)
 	go func() {
 		if sendErr := h.mailer.Send(msg); sendErr != nil {
-			log.Printf("[email] send to %s failed: %v", msg.To, sendErr)
+			log.Printf("[email] send failed to=%q subject=%q err=%v", msg.To, msg.Subject, sendErr)
+		} else {
+			log.Printf("[email] sent ok to=%q subject=%q", msg.To, msg.Subject)
 		}
 	}()
 }
@@ -2454,17 +2461,17 @@ func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
 
 	// Notify all admins in the org.
 	log.Printf("[AgentsCreationRequestsCreate] looking up all admins for orgID=%q", orgID)
-	adminEmails, err := h.db.GetAllAdminEmailsByOrgID(orgID)
-	if err != nil {
-		log.Printf("[AgentsCreationRequestsCreate] GetAllAdminEmailsByOrgID failed orgID=%q err=%v", orgID, err)
+	adminEmails, adminErr := h.db.GetAllAdminEmailsByOrgID(orgID)
+	if adminErr != nil {
+		log.Printf("[AgentsCreationRequestsCreate] GetAllAdminEmailsByOrgID failed orgID=%q err=%v", orgID, adminErr)
 	} else if len(adminEmails) == 0 {
-		log.Printf("[AgentsCreationRequestsCreate] no admin emails found for orgID=%q", orgID)
+		log.Printf("[AgentsCreationRequestsCreate] no admin emails found for orgID=%q — check new_admins table has email column populated", orgID)
 	} else {
 		requesterName, _, _ := h.db.GetOrgUserEmailByDID(creatorDID)
-		log.Printf("[AgentsCreationRequestsCreate] notifying %d admin(s) requester=%q agentName=%q requestID=%q", len(adminEmails), requesterName, agentName, id)
+		log.Printf("[AgentsCreationRequestsCreate] found %d admin email(s)=%v requester=%q agentName=%q requestID=%q", len(adminEmails), adminEmails, requesterName, agentName, id)
 		for _, adminEmail := range adminEmails {
+			log.Printf("[AgentsCreationRequestsCreate] sending email to admin=%q", adminEmail)
 			h.sendMail(email.AgentCreationRequestNew(adminEmail, agentName, requesterName, id))
-			log.Printf("[AgentsCreationRequestsCreate] mail dispatched to admin=%q", adminEmail)
 		}
 	}
 
