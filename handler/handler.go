@@ -37,6 +37,9 @@ type otpEntry struct {
 	expiresAt time.Time
 }
 
+const emailWorkers = 5
+const emailQueueSize = 100
+
 type Handler struct {
 	db                  *db.DB
 	proxy               *httputil.ReverseProxy
@@ -48,6 +51,7 @@ type Handler struct {
 	updateAgentEndpoint string
 	mailer              *email.Mailer
 	otpStore            sync.Map
+	emailQueue          chan email.Message
 }
 
 func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
@@ -61,13 +65,32 @@ func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL
 		adminServiceURL:     adminServiceURL,
 		createAgentEndpoint: createAgentEndpoint,
 		updateAgentEndpoint: updateAgentEndpoint,
+		emailQueue:          make(chan email.Message, emailQueueSize),
 	}
 	if cfg, err := email.LoadConfigFromEnv(); err == nil {
 		h.mailer = email.New(cfg)
 	} else {
 		log.Printf("[email] mailer disabled: %v", err)
 	}
+	h.startEmailWorkers()
 	return h
+}
+
+// startEmailWorkers spawns a fixed pool of goroutines that process the email queue.
+// Workers run for the lifetime of the server — no unbounded goroutine spawning per request.
+func (h *Handler) startEmailWorkers() {
+	for i := range emailWorkers {
+		go func(workerID int) {
+			for msg := range h.emailQueue {
+				if err := h.mailer.Send(msg); err != nil {
+					log.Printf("[email] worker=%d send failed to=%q subject=%q err=%v", workerID, msg.To, msg.Subject, err)
+				} else {
+					log.Printf("[email] worker=%d sent ok to=%q subject=%q", workerID, msg.To, msg.Subject)
+				}
+			}
+		}(i)
+	}
+	log.Printf("[email] started %d email workers (queue capacity=%d)", emailWorkers, emailQueueSize)
 }
 
 func generateOTP() (string, error) {
@@ -124,17 +147,94 @@ func (h *Handler) verifyOTP(emailAddr, code string) bool {
 	return true
 }
 
-// sendMail fires an email in a goroutine so it never blocks the request path.
-// It is a no-op when no mailer is configured.
-func (h *Handler) sendMail(msg email.Message, err error) {
-	if err != nil || h.mailer == nil {
+func (h *Handler) ForgotPassword(c *gin.Context) {
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email is required"})
 		return
 	}
-	go func() {
-		if sendErr := h.mailer.Send(msg); sendErr != nil {
-			log.Printf("[email] send to %s failed: %v", msg.To, sendErr)
+
+	// Confirm the email belongs to a known user or admin before sending OTP.
+	isUser := true
+	if _, err := h.db.GetOrgUserByEmail(req.Email); err != nil {
+		if _, err := h.db.GetAdminByEmail(req.Email); err != nil {
+			c.JSON(http.StatusNotFound, Response{Status: false, Message: "no account found with that email"})
+			return
 		}
-	}()
+		isUser = false
+	}
+	_ = isUser
+
+	code, err := generateOTP()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate OTP"})
+		return
+	}
+	h.otpStore.Store(req.Email, otpEntry{code: code, expiresAt: time.Now().Add(5 * time.Minute)})
+	h.sendMail(email.OTPVerification(req.Email, code))
+	log.Printf("[ForgotPassword] OTP sent to email=%q", req.Email)
+	c.JSON(http.StatusOK, Response{Status: true, Message: "OTP sent to " + req.Email})
+}
+
+func (h *Handler) ResetPassword(c *gin.Context) {
+	var req struct {
+		Email       string `json:"email"`
+		OTP         string `json:"otp"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || req.OTP == "" || req.NewPassword == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email, otp and new_password are required"})
+		return
+	}
+	if len(req.NewPassword) < 8 {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "password must be at least 8 characters"})
+		return
+	}
+	if !h.verifyOTP(req.Email, req.OTP) {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid or expired OTP"})
+		return
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
+		return
+	}
+
+	// Try user first, then admin.
+	if err := h.db.UpdateUserPassword(req.Email, string(hash)); err != nil {
+		if err := h.db.UpdateAdminPassword(req.Email, string(hash)); err != nil {
+			c.JSON(http.StatusNotFound, Response{Status: false, Message: "no account found with that email"})
+			return
+		}
+	}
+
+	log.Printf("[ResetPassword] password updated for email=%q", req.Email)
+	c.JSON(http.StatusOK, Response{Status: true, Message: "password updated successfully"})
+}
+
+// sendMail enqueues an email for the worker pool. Never blocks the request path.
+func (h *Handler) sendMail(msg email.Message, err error) {
+	if err != nil {
+		log.Printf("[email] template render failed: %v", err)
+		return
+	}
+	if strings.TrimSpace(msg.To) == "" {
+		log.Printf("[email] skipping — empty To address subject=%q", msg.Subject)
+		return
+	}
+	if h.mailer == nil {
+		log.Printf("[email] mailer not configured — skipping email to=%q subject=%q", msg.To, msg.Subject)
+		return
+	}
+	select {
+	case h.emailQueue <- msg:
+		log.Printf("[email] queued to=%q subject=%q (queue len=%d)", msg.To, msg.Subject, len(h.emailQueue))
+	default:
+		log.Printf("[email] queue full — dropping email to=%q subject=%q", msg.To, msg.Subject)
+	}
 }
 
 func (h *Handler) Healthz(c *gin.Context) {
@@ -733,6 +833,10 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "username, email and password are required"})
 		return
 	}
+	if req.OrgID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "orgID is required"})
+		return
+	}
 	if req.OTP == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "otp is required"})
 		return
@@ -743,11 +847,14 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 	}
 
 	// Call external agent service to register admin and get DID.
-	did, err := h.callRegisterAdmin(req.Username, req.OrgID, req.Password)
+	log.Printf("[CreateAdmin] calling agent service username=%q orgID=%q email=%q", req.Username, req.OrgID, req.Email)
+	did, err := h.callRegisterAdmin(req.Username, req.OrgID, req.Email, req.Password)
 	if err != nil {
+		log.Printf("[CreateAdmin] agent service error: %v", err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
 	}
+	log.Printf("[CreateAdmin] agent service returned did=%q", did)
 
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
@@ -1098,6 +1205,8 @@ func (h *Handler) IntentList(c *gin.Context) {
 	isAdmin := c.GetBool(CtxIsAdmin)
 	userDID := c.GetString(CtxDID)
 
+	log.Printf("[IntentList] isAdmin=%v userDID=%q orgID=%q page=%d", isAdmin, userDID, orgID, page)
+
 	var total int
 	var intents []*db.IntentRecord
 	var err error
@@ -1110,11 +1219,15 @@ func (h *Handler) IntentList(c *gin.Context) {
 		}
 		intents, err = h.db.GetIntentsByOrg(orgID, pageSize, offset)
 	} else {
+		if userDID == "" {
+			log.Printf("[IntentList] userDID is empty — user will see 0 intents")
+		}
 		total, err = h.db.CountIntentsByUser(userDID, orgID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
 			return
 		}
+		log.Printf("[IntentList] user query returned total=%d for userDID=%q orgID=%q", total, userDID, orgID)
 		intents, err = h.db.GetIntentsByUser(userDID, orgID, pageSize, offset)
 	}
 	if err != nil {
@@ -1835,25 +1948,35 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 }
 
 // callRegisterAdmin calls the external agent service to register an admin and get their DID.
-func (h *Handler) callRegisterAdmin(username, org, password string) (string, error) {
+func (h *Handler) callRegisterAdmin(username, org, email, password string) (string, error) {
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/register-admin"
+	log.Printf("[callRegisterAdmin] POST %s username=%q org=%q email=%q", endpoint, username, org, email)
 
-	b, _ := json.Marshal(map[string]string{"username": username, "org": org, "password": password})
+	b, _ := json.Marshal(map[string]string{"username": username, "org": org, "email": email, "password": password})
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
+		log.Printf("[callRegisterAdmin] http error: %v", err)
 		return "", fmt.Errorf("callRegisterAdmin: http post: %v", err)
 	}
 	defer resp.Body.Close()
+
+	rawBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[callRegisterAdmin] status=%d body=%s", resp.StatusCode, string(rawBody))
 
 	var result struct {
 		Status  bool   `json:"status"`
 		Message string `json:"message"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.Unmarshal(rawBody, &result); err != nil {
+		log.Printf("[callRegisterAdmin] failed to parse response: %v", err)
+		return "", fmt.Errorf("callRegisterAdmin: parse response: %v", err)
+	}
 
 	if !result.Status {
+		log.Printf("[callRegisterAdmin] agent service returned failure: %s", result.Message)
 		return "", fmt.Errorf("register admin failed: %s", result.Message)
 	}
+	log.Printf("[callRegisterAdmin] success did=%s", result.Message)
 	return result.Message, nil // message = admin DID on success
 }
 
@@ -2361,22 +2484,43 @@ func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
 		return
 	}
 
+	if agentID != "" {
+		if exists, err := h.db.ActiveRequestExistsForAgent(agentID); err != nil {
+			log.Printf("[AgentsCreationRequestsCreate] ActiveRequestExistsForAgent check failed agentID=%q err=%v", agentID, err)
+		} else if exists {
+			log.Printf("[AgentsCreationRequestsCreate] duplicate request blocked agentID=%q", agentID)
+
+			// c.JSON(http.StatusConflict, Response{Status: false, Message: "an active request for this agent is already pending or approved"})
+			c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"requestID": "duplicate"}})
+
+			return
+		}
+	}
+
 	id := uuid.New().String()
 	if err := h.db.CreateRequest(id, "deploy_agent", policy, creatorDID, agentID, agentName, requestInfo, orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to create request: %v", err)})
 		return
 	}
 
-	// Notify admin.
-	log.Printf("[AgentsCreationRequestsCreate] looking up admin for orgID=%q", orgID)
-	if _, adminEmail, err := h.db.GetAdminEmailByOrgID(orgID); err != nil {
-		log.Printf("[AgentsCreationRequestsCreate] GetAdminEmailByOrgID failed orgID=%q err=%v", orgID, err)
+	// Notify all admins in the org.
+	log.Printf("[AgentsCreationRequestsCreate] looking up all admins for orgID=%q", orgID)
+	adminEmails, adminErr := h.db.GetAllAdminEmailsByOrgID(orgID)
+	if adminErr != nil {
+		log.Printf("[AgentsCreationRequestsCreate] GetAllAdminEmailsByOrgID failed orgID=%q err=%v", orgID, adminErr)
+	} else if len(adminEmails) == 0 {
+		log.Printf("[AgentsCreationRequestsCreate] no admin emails found for orgID=%q — check new_admins table has email column populated", orgID)
 	} else {
-		log.Printf("[AgentsCreationRequestsCreate] found admin email=%q, sending notification", adminEmail)
 		requesterName, _, _ := h.db.GetOrgUserEmailByDID(creatorDID)
-		log.Printf("[AgentsCreationRequestsCreate] requesterName=%q agentName=%q requestID=%q", requesterName, agentName, id)
-		h.sendMail(email.AgentCreationRequestNew(adminEmail, agentName, requesterName, id))
-		log.Printf("[AgentsCreationRequestsCreate] mail dispatched to admin=%q", adminEmail)
+		log.Printf("[AgentsCreationRequestsCreate] found %d admin email(s)=%v requester=%q agentName=%q requestID=%q", len(adminEmails), adminEmails, requesterName, agentName, id)
+		for _, adminEmail := range adminEmails {
+			if strings.TrimSpace(adminEmail) == "" {
+				log.Printf("[AgentsCreationRequestsCreate] skipping admin with empty email")
+				continue
+			}
+			log.Printf("[AgentsCreationRequestsCreate] sending email to admin=%q", adminEmail)
+			h.sendMail(email.AgentCreationRequestNew(adminEmail, agentName, requesterName, id))
+		}
 	}
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"requestID": id}})

@@ -93,7 +93,7 @@ func (h *Handler) JWTAuthMiddleware() gin.HandlerFunc {
 		log.Printf("[JWT:admin-check] result is_admin=%v", isAdmin)
 
 		resolvedDID := claims.DID
-		if resolvedDID == "" && claims.Email != "" {
+		if (resolvedDID == "" || resolvedDID == "none") && claims.Email != "" {
 			if u, err := h.db.GetOrgUserByEmail(claims.Email); err == nil && u.DID != "" && u.DID != "none" {
 				resolvedDID = u.DID
 				log.Printf("[JWT] resolved DID from email=%q did=%q", claims.Email, resolvedDID)

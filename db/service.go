@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -36,6 +37,25 @@ func (d *DB) GetAdminEmailByOrgID(orgID string) (name, email string, err error) 
 		orgID,
 	).Scan(&name, &email)
 	return
+}
+
+func (d *DB) GetAllAdminEmailsByOrgID(orgID string) ([]string, error) {
+	rows, err := d.conn.Query(
+		`SELECT TRIM(email) FROM new_admins WHERE organization_id = $1 AND email IS NOT NULL AND TRIM(email) <> ''`,
+		orgID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var emails []string
+	for rows.Next() {
+		var e string
+		if err := rows.Scan(&e); err == nil && strings.TrimSpace(e) != "" {
+			emails = append(emails, strings.TrimSpace(e))
+		}
+	}
+	return emails, nil
 }
 
 func (d *DB) GetOrgUserEmailByDID(did string) (name, email string, err error) {
@@ -80,6 +100,21 @@ func (d *DB) CreateRequest(id, requestType, policy, creatorDID, agentDID, agentN
 		id, requestType, policy, creatorDID, agentDID, agentName, requestInfo, orgID,
 	)
 	return err
+}
+
+// ActiveRequestExistsForAgent returns true if a pending or approved deploy_agent
+// request already exists for the given agent_did, meaning a new one should not be created.
+func (d *DB) ActiveRequestExistsForAgent(agentDID string) (bool, error) {
+	var exists bool
+	err := d.conn.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM new_requests
+			WHERE agent_did = $1
+			  AND request_type = 'deploy_agent'
+			  AND status IN ('pending', 'approved')
+		)`, agentDID,
+	).Scan(&exists)
+	return exists, err
 }
 
 func (d *DB) GetRequestByID(id string) (*RequestRecord, error) {
@@ -1587,4 +1622,32 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 		result = append(result, r)
 	}
 	return result, nil
+}
+
+func (d *DB) UpdateUserPassword(email, passwordHash string) error {
+	res, err := d.conn.Exec(
+		`UPDATE new_org_users SET password = $1 WHERE email = $2`, passwordHash, email,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no user found with email %s", email)
+	}
+	return nil
+}
+
+func (d *DB) UpdateAdminPassword(email, passwordHash string) error {
+	res, err := d.conn.Exec(
+		`UPDATE new_admins SET password = $1 WHERE email = $2`, passwordHash, email,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no admin found with email %s", email)
+	}
+	return nil
 }

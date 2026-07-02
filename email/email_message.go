@@ -21,7 +21,7 @@ func UserRegistration(toEmail, name string) (Message, error) {
 	}{
 		Name:         name,
 		Email:        toEmail,
-		DashboardURL: envOr("APP_DASHBOARD_URL", "#"),
+		DashboardURL: envOr("APP_DASHBOARD_URL", "https://dashboard.agentdna.io/"),
 		Year:         time.Now().Year(),
 	}
 	html, err := render(userRegistrationTmpl, data)
@@ -197,7 +197,7 @@ func AgentCreationRequestNew(toEmail, agentName, requesterName, requestID string
 		AgentName:     agentName,
 		RequesterName: requesterName,
 		RequestID:     requestID,
-		DashboardURL:  envOr("APP_DASHBOARD_URL", "#"),
+		DashboardURL:  envOr("APP_DASHBOARD_URL", "https://dashboard.agentdna.io/") + "requests",
 		Year:          time.Now().Year(),
 	}
 	html, err := render(agentRequestNewTmpl, data)
@@ -226,7 +226,7 @@ func AgentCreationRequestStatus(toEmail, userName, agentName, status string) (Me
 		AgentName:    agentName,
 		Status:       status,
 		Approved:     status == "approved",
-		DashboardURL: envOr("APP_DASHBOARD_URL", "#"),
+		DashboardURL: envOr("APP_DASHBOARD_URL", "https://dashboard.agentdna.io/"),
 		Year:         time.Now().Year(),
 	}
 	html, err := render(agentRequestStatusTmpl, data)
