@@ -37,6 +37,9 @@ type otpEntry struct {
 	expiresAt time.Time
 }
 
+const emailWorkers = 5
+const emailQueueSize = 100
+
 type Handler struct {
 	db                  *db.DB
 	proxy               *httputil.ReverseProxy
@@ -48,6 +51,7 @@ type Handler struct {
 	updateAgentEndpoint string
 	mailer              *email.Mailer
 	otpStore            sync.Map
+	emailQueue          chan email.Message
 }
 
 func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
@@ -61,13 +65,32 @@ func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL
 		adminServiceURL:     adminServiceURL,
 		createAgentEndpoint: createAgentEndpoint,
 		updateAgentEndpoint: updateAgentEndpoint,
+		emailQueue:          make(chan email.Message, emailQueueSize),
 	}
 	if cfg, err := email.LoadConfigFromEnv(); err == nil {
 		h.mailer = email.New(cfg)
 	} else {
 		log.Printf("[email] mailer disabled: %v", err)
 	}
+	h.startEmailWorkers()
 	return h
+}
+
+// startEmailWorkers spawns a fixed pool of goroutines that process the email queue.
+// Workers run for the lifetime of the server — no unbounded goroutine spawning per request.
+func (h *Handler) startEmailWorkers() {
+	for i := range emailWorkers {
+		go func(workerID int) {
+			for msg := range h.emailQueue {
+				if err := h.mailer.Send(msg); err != nil {
+					log.Printf("[email] worker=%d send failed to=%q subject=%q err=%v", workerID, msg.To, msg.Subject, err)
+				} else {
+					log.Printf("[email] worker=%d sent ok to=%q subject=%q", workerID, msg.To, msg.Subject)
+				}
+			}
+		}(i)
+	}
+	log.Printf("[email] started %d email workers (queue capacity=%d)", emailWorkers, emailQueueSize)
 }
 
 func generateOTP() (string, error) {
@@ -192,24 +215,26 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{Status: true, Message: "password updated successfully"})
 }
 
-// sendMail fires an email in a goroutine so it never blocks the request path.
+// sendMail enqueues an email for the worker pool. Never blocks the request path.
 func (h *Handler) sendMail(msg email.Message, err error) {
 	if err != nil {
 		log.Printf("[email] template render failed: %v", err)
+		return
+	}
+	if strings.TrimSpace(msg.To) == "" {
+		log.Printf("[email] skipping — empty To address subject=%q", msg.Subject)
 		return
 	}
 	if h.mailer == nil {
 		log.Printf("[email] mailer not configured — skipping email to=%q subject=%q", msg.To, msg.Subject)
 		return
 	}
-	log.Printf("[email] dispatching to=%q subject=%q", msg.To, msg.Subject)
-	go func() {
-		if sendErr := h.mailer.Send(msg); sendErr != nil {
-			log.Printf("[email] send failed to=%q subject=%q err=%v", msg.To, msg.Subject, sendErr)
-		} else {
-			log.Printf("[email] sent ok to=%q subject=%q", msg.To, msg.Subject)
-		}
-	}()
+	select {
+	case h.emailQueue <- msg:
+		log.Printf("[email] queued to=%q subject=%q (queue len=%d)", msg.To, msg.Subject, len(h.emailQueue))
+	default:
+		log.Printf("[email] queue full — dropping email to=%q subject=%q", msg.To, msg.Subject)
+	}
 }
 
 func (h *Handler) Healthz(c *gin.Context) {
@@ -2470,6 +2495,10 @@ func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
 		requesterName, _, _ := h.db.GetOrgUserEmailByDID(creatorDID)
 		log.Printf("[AgentsCreationRequestsCreate] found %d admin email(s)=%v requester=%q agentName=%q requestID=%q", len(adminEmails), adminEmails, requesterName, agentName, id)
 		for _, adminEmail := range adminEmails {
+			if strings.TrimSpace(adminEmail) == "" {
+				log.Printf("[AgentsCreationRequestsCreate] skipping admin with empty email")
+				continue
+			}
 			log.Printf("[AgentsCreationRequestsCreate] sending email to admin=%q", adminEmail)
 			h.sendMail(email.AgentCreationRequestNew(adminEmail, agentName, requesterName, id))
 		}
