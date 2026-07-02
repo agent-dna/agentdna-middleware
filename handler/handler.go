@@ -2452,16 +2452,20 @@ func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
 		return
 	}
 
-	// Notify admin.
-	log.Printf("[AgentsCreationRequestsCreate] looking up admin for orgID=%q", orgID)
-	if _, adminEmail, err := h.db.GetAdminEmailByOrgID(orgID); err != nil {
-		log.Printf("[AgentsCreationRequestsCreate] GetAdminEmailByOrgID failed orgID=%q err=%v", orgID, err)
+	// Notify all admins in the org.
+	log.Printf("[AgentsCreationRequestsCreate] looking up all admins for orgID=%q", orgID)
+	adminEmails, err := h.db.GetAllAdminEmailsByOrgID(orgID)
+	if err != nil {
+		log.Printf("[AgentsCreationRequestsCreate] GetAllAdminEmailsByOrgID failed orgID=%q err=%v", orgID, err)
+	} else if len(adminEmails) == 0 {
+		log.Printf("[AgentsCreationRequestsCreate] no admin emails found for orgID=%q", orgID)
 	} else {
-		log.Printf("[AgentsCreationRequestsCreate] found admin email=%q, sending notification", adminEmail)
 		requesterName, _, _ := h.db.GetOrgUserEmailByDID(creatorDID)
-		log.Printf("[AgentsCreationRequestsCreate] requesterName=%q agentName=%q requestID=%q", requesterName, agentName, id)
-		h.sendMail(email.AgentCreationRequestNew(adminEmail, agentName, requesterName, id))
-		log.Printf("[AgentsCreationRequestsCreate] mail dispatched to admin=%q", adminEmail)
+		log.Printf("[AgentsCreationRequestsCreate] notifying %d admin(s) requester=%q agentName=%q requestID=%q", len(adminEmails), requesterName, agentName, id)
+		for _, adminEmail := range adminEmails {
+			h.sendMail(email.AgentCreationRequestNew(adminEmail, agentName, requesterName, id))
+			log.Printf("[AgentsCreationRequestsCreate] mail dispatched to admin=%q", adminEmail)
+		}
 	}
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"requestID": id}})

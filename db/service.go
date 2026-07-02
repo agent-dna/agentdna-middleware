@@ -38,6 +38,25 @@ func (d *DB) GetAdminEmailByOrgID(orgID string) (name, email string, err error) 
 	return
 }
 
+func (d *DB) GetAllAdminEmailsByOrgID(orgID string) ([]string, error) {
+	rows, err := d.conn.Query(
+		`SELECT email FROM new_admins WHERE organization_id = $1 AND email IS NOT NULL AND email <> ''`,
+		orgID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var emails []string
+	for rows.Next() {
+		var e string
+		if err := rows.Scan(&e); err == nil {
+			emails = append(emails, e)
+		}
+	}
+	return emails, nil
+}
+
 func (d *DB) GetOrgUserEmailByDID(did string) (name, email string, err error) {
 	err = d.conn.QueryRow(
 		`SELECT COALESCE(name,''), COALESCE(email,'') FROM new_org_users WHERE did = $1`,
