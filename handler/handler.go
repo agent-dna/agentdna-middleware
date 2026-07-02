@@ -1205,6 +1205,8 @@ func (h *Handler) IntentList(c *gin.Context) {
 	isAdmin := c.GetBool(CtxIsAdmin)
 	userDID := c.GetString(CtxDID)
 
+	log.Printf("[IntentList] isAdmin=%v userDID=%q orgID=%q page=%d", isAdmin, userDID, orgID, page)
+
 	var total int
 	var intents []*db.IntentRecord
 	var err error
@@ -1217,11 +1219,15 @@ func (h *Handler) IntentList(c *gin.Context) {
 		}
 		intents, err = h.db.GetIntentsByOrg(orgID, pageSize, offset)
 	} else {
+		if userDID == "" {
+			log.Printf("[IntentList] userDID is empty — user will see 0 intents")
+		}
 		total, err = h.db.CountIntentsByUser(userDID, orgID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
 			return
 		}
+		log.Printf("[IntentList] user query returned total=%d for userDID=%q orgID=%q", total, userDID, orgID)
 		intents, err = h.db.GetIntentsByUser(userDID, orgID, pageSize, offset)
 	}
 	if err != nil {
