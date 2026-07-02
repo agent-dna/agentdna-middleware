@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -40,7 +41,7 @@ func (d *DB) GetAdminEmailByOrgID(orgID string) (name, email string, err error) 
 
 func (d *DB) GetAllAdminEmailsByOrgID(orgID string) ([]string, error) {
 	rows, err := d.conn.Query(
-		`SELECT email FROM new_admins WHERE organization_id = $1 AND email IS NOT NULL AND email <> ''`,
+		`SELECT TRIM(email) FROM new_admins WHERE organization_id = $1 AND email IS NOT NULL AND TRIM(email) <> ''`,
 		orgID,
 	)
 	if err != nil {
@@ -50,8 +51,8 @@ func (d *DB) GetAllAdminEmailsByOrgID(orgID string) ([]string, error) {
 	var emails []string
 	for rows.Next() {
 		var e string
-		if err := rows.Scan(&e); err == nil {
-			emails = append(emails, e)
+		if err := rows.Scan(&e); err == nil && strings.TrimSpace(e) != "" {
+			emails = append(emails, strings.TrimSpace(e))
 		}
 	}
 	return emails, nil
