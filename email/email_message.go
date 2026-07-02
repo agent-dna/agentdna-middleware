@@ -197,7 +197,7 @@ func AgentCreationRequestNew(toEmail, agentName, requesterName, requestID string
 		AgentName:     agentName,
 		RequesterName: requesterName,
 		RequestID:     requestID,
-		DashboardURL:  envOr("APP_DASHBOARD_URL", "#"),
+		DashboardURL:  envOr("APP_DASHBOARD_URL", "https://dashboard.agentdna.io/") + "requests",
 		Year:          time.Now().Year(),
 	}
 	html, err := render(agentRequestNewTmpl, data)
