@@ -1588,3 +1588,31 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 	}
 	return result, nil
 }
+
+func (d *DB) UpdateUserPassword(email, passwordHash string) error {
+	res, err := d.conn.Exec(
+		`UPDATE new_org_users SET password = $1 WHERE email = $2`, passwordHash, email,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no user found with email %s", email)
+	}
+	return nil
+}
+
+func (d *DB) UpdateAdminPassword(email, passwordHash string) error {
+	res, err := d.conn.Exec(
+		`UPDATE new_admins SET password = $1 WHERE email = $2`, passwordHash, email,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no admin found with email %s", email)
+	}
+	return nil
+}

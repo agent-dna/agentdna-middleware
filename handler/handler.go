@@ -124,6 +124,74 @@ func (h *Handler) verifyOTP(emailAddr, code string) bool {
 	return true
 }
 
+func (h *Handler) ForgotPassword(c *gin.Context) {
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email is required"})
+		return
+	}
+
+	// Confirm the email belongs to a known user or admin before sending OTP.
+	isUser := true
+	if _, err := h.db.GetOrgUserByEmail(req.Email); err != nil {
+		if _, err := h.db.GetAdminByEmail(req.Email); err != nil {
+			c.JSON(http.StatusNotFound, Response{Status: false, Message: "no account found with that email"})
+			return
+		}
+		isUser = false
+	}
+	_ = isUser
+
+	code, err := generateOTP()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate OTP"})
+		return
+	}
+	h.otpStore.Store(req.Email, otpEntry{code: code, expiresAt: time.Now().Add(5 * time.Minute)})
+	h.sendMail(email.OTPVerification(req.Email, code))
+	log.Printf("[ForgotPassword] OTP sent to email=%q", req.Email)
+	c.JSON(http.StatusOK, Response{Status: true, Message: "OTP sent to " + req.Email})
+}
+
+func (h *Handler) ResetPassword(c *gin.Context) {
+	var req struct {
+		Email       string `json:"email"`
+		OTP         string `json:"otp"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || req.OTP == "" || req.NewPassword == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email, otp and new_password are required"})
+		return
+	}
+	if len(req.NewPassword) < 8 {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "password must be at least 8 characters"})
+		return
+	}
+	if !h.verifyOTP(req.Email, req.OTP) {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid or expired OTP"})
+		return
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
+		return
+	}
+
+	// Try user first, then admin.
+	if err := h.db.UpdateUserPassword(req.Email, string(hash)); err != nil {
+		if err := h.db.UpdateAdminPassword(req.Email, string(hash)); err != nil {
+			c.JSON(http.StatusNotFound, Response{Status: false, Message: "no account found with that email"})
+			return
+		}
+	}
+
+	log.Printf("[ResetPassword] password updated for email=%q", req.Email)
+	c.JSON(http.StatusOK, Response{Status: true, Message: "password updated successfully"})
+}
+
 // sendMail fires an email in a goroutine so it never blocks the request path.
 // It is a no-op when no mailer is configured.
 func (h *Handler) sendMail(msg email.Message, err error) {
@@ -743,11 +811,14 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 	}
 
 	// Call external agent service to register admin and get DID.
+	log.Printf("[CreateAdmin] calling agent service username=%q orgID=%q email=%q", req.Username, req.OrgID, req.Email)
 	did, err := h.callRegisterAdmin(req.Username, req.OrgID, req.Password)
 	if err != nil {
+		log.Printf("[CreateAdmin] agent service error: %v", err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
 	}
+	log.Printf("[CreateAdmin] agent service returned did=%q", did)
 
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
@@ -1837,23 +1908,33 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 // callRegisterAdmin calls the external agent service to register an admin and get their DID.
 func (h *Handler) callRegisterAdmin(username, org, password string) (string, error) {
 	endpoint := h.createAgentEndpoint + "agent-admin/v1/register-admin"
+	log.Printf("[callRegisterAdmin] POST %s username=%q org=%q", endpoint, username, org)
 
 	b, _ := json.Marshal(map[string]string{"username": username, "org": org, "password": password})
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
+		log.Printf("[callRegisterAdmin] http error: %v", err)
 		return "", fmt.Errorf("callRegisterAdmin: http post: %v", err)
 	}
 	defer resp.Body.Close()
+
+	rawBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[callRegisterAdmin] status=%d body=%s", resp.StatusCode, string(rawBody))
 
 	var result struct {
 		Status  bool   `json:"status"`
 		Message string `json:"message"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.Unmarshal(rawBody, &result); err != nil {
+		log.Printf("[callRegisterAdmin] failed to parse response: %v", err)
+		return "", fmt.Errorf("callRegisterAdmin: parse response: %v", err)
+	}
 
 	if !result.Status {
+		log.Printf("[callRegisterAdmin] agent service returned failure: %s", result.Message)
 		return "", fmt.Errorf("register admin failed: %s", result.Message)
 	}
+	log.Printf("[callRegisterAdmin] success did=%s", result.Message)
 	return result.Message, nil // message = admin DID on success
 }
 
