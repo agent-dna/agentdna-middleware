@@ -41,6 +41,36 @@ type SmartContractInfo struct {
 	Data            string  `json:"data"`
 }
 
+// ── Blockchain transaction provenance (POST /rubix/v1/tx, /rubix/v1/signature) ──
+
+// txResponse is the response body of POST /rubix/v1/tx. We extract result.id and
+// store it as provenance_req_id; status=false means the tx failed to initiate.
+type txResponse struct {
+	Status  bool   `json:"status"`
+	Message string `json:"message"`
+	Result  struct {
+		ID string `json:"id"`
+	} `json:"result"`
+}
+
+// signatureRequest is the request body of POST /rubix/v1/signature. Its id is the
+// value returned by the earlier /tx call and links back to the provenance rows.
+type signatureRequest struct {
+	ID string `json:"id"`
+}
+
+// signatureResponse is the response body of POST /rubix/v1/signature. We extract the
+// transactionID and the first mintedNFTChildren[].childNFTId.
+type signatureResponse struct {
+	Status bool   `json:"status"`
+	Result struct {
+		MintedNFTChildren []struct {
+			ChildNFTId string `json:"childNFTId"`
+		} `json:"mintedNFTChildren"`
+		TransactionID string `json:"transactionID"`
+	} `json:"result"`
+}
+
 type JWTClaims struct {
 	DID    string `json:"did"`
 	Email  string `json:"email"`
