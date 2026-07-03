@@ -1657,60 +1657,54 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 		return
 	}
 
-	type DiagramNode struct {
-		DID             string         `json:"did"`
-		Name            string         `json:"name"`
-		InteractionID   string         `json:"interactionID,omitempty"`
-		InteractionType string         `json:"interactionType,omitempty"`
-		Direction       string         `json:"direction,omitempty"`
-		Threat          bool           `json:"threat"`
-		CreatedAt       string         `json:"created_at"`
-		Children        []*DiagramNode `json:"children"`
+	type interactionOut struct {
+		InteractionID string `json:"interactionID"`
+		Initiator     string `json:"initiator"`
+		InitiatorName string `json:"initiatorName"`
+		To            string `json:"to"`
+		ToName        string `json:"toName"`
+		Type          string `json:"type"`
+		Message       string `json:"message"`
+		IntentID      string `json:"intentID"`
+		Threat        bool   `json:"threat"`
+		Epoch         int64  `json:"epoch"`
 	}
 
-	formatTime := func(t time.Time) string {
-		return t.UTC().Format("2006-01-02T15:04:05.000Z")
-	}
-
-	root := &DiagramNode{
-		DID:       intent.InitiatorDID,
-		Name:      intent.InitiatorName,
-		CreatedAt: formatTime(intent.StartedAt),
-		Children:  []*DiagramNode{},
-	}
-
-	// Stack tracks the current path from root to the active node.
-	stack := []*DiagramNode{root}
-
+	list := make([]interactionOut, 0, len(interactions))
 	for _, ix := range interactions {
-		current := stack[len(stack)-1]
+		list = append(list, interactionOut{
+			InteractionID: ix.InteractionID,
+			Initiator:     ix.From,
+			InitiatorName: ix.FromName,
+			To:            ix.To,
+			ToName:        ix.ToName,
+			Type:          ix.Type,
+			Message:       ix.Message,
+			IntentID:      ix.IntentID,
+			Threat:        ix.Threat,
+			Epoch:         ix.Time.Unix(),
+		})
+	}
 
-		if ix.Direction == "outbound" {
-			child := &DiagramNode{
-				DID:             ix.To,
-				Name:            ix.ToName,
-				InteractionID:   ix.InteractionID,
-				InteractionType: ix.Type,
-				Direction:       ix.Direction,
-				Threat:          ix.Threat,
-				CreatedAt:       formatTime(ix.Time),
-				Children:        []*DiagramNode{},
-			}
-			current.Children = append(current.Children, child)
-			stack = append(stack, child)
-		} else {
-			// inbound — pop back up, but keep at least root on the stack
-			if len(stack) > 1 {
-				stack = stack[:len(stack)-1]
-			}
-		}
+	basicInfo := gin.H{
+		"intentID":          intent.IntentID,
+		"initiatorDID":      intent.InitiatorDID,
+		"initiatorName":     intent.InitiatorName,
+		"flowType":          intent.FlowType,
+		"status":            intent.Status,
+		"threatDetected":    intent.ThreatDetected,
+		"chainDepth":        intent.ChainDepth,
+		"interactionsCount": intent.InteractionsCount,
+		"agentsCount":       intent.AgentsCount,
+		"toolsCount":        intent.ToolsCount,
+		"startedAt":         intent.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"intentID": intentID,
-			"diagram":  root,
+			"basicInfo":    basicInfo,
+			"interactions": list,
 		},
 	})
 }
