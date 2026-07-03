@@ -1158,6 +1158,79 @@ func (d *DB) StoreIntent(intentID, initiatorDID, orgID, flowType, executor strin
 	return err
 }
 
+// SetProvenanceReqID attaches the /rubix/v1/tx response id to every interaction row
+// of the given intent (provenance_req_id). Called from the proxy response hook.
+func (d *DB) SetProvenanceReqID(intentID, reqID string) error {
+	_, err := d.conn.Exec(
+		`UPDATE new_interactions SET provenance_req_id = $1 WHERE intent_id = $2`,
+		reqID, intentID,
+	)
+	return err
+}
+
+// DeleteInteractionsByIntent removes the interaction rows for an intent — used when
+// the /rubix/v1/tx transaction fails to initiate (response status=false).
+func (d *DB) DeleteInteractionsByIntent(intentID string) error {
+	_, err := d.conn.Exec(`DELETE FROM new_interactions WHERE intent_id = $1`, intentID)
+	return err
+}
+
+// SetProvenanceRecord attaches the /rubix/v1/signature response data to the rows
+// matched by the /tx provenance id and returns the number of interaction rows updated
+// (0 means the /tx write has not landed yet, so the caller skips).
+//
+// intent_id is overwritten with childNFTId in BOTH new_intents and new_interactions
+// per product requirement, so the two tables stay joined. Done in one transaction:
+// we look up the current intent_id (the UUID) from the tagged interaction rows before
+// rewriting it.
+func (d *DB) SetProvenanceRecord(reqID, transactionID, childNFTId string) (int64, error) {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+
+	// Find the current intent_id (UUID) tagged with this provenance id.
+	var oldIntentID string
+	err = tx.QueryRow(
+		`SELECT intent_id FROM new_interactions WHERE provenance_req_id = $1 LIMIT 1`,
+		reqID,
+	).Scan(&oldIntentID)
+	if err == sql.ErrNoRows {
+		return 0, nil // /tx write not landed yet — caller skips
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	// Repoint the intent row to childNFTId (PK update; interaction_ids reference the
+	// unchanged interaction_id PKs, so they stay valid).
+	if _, err := tx.Exec(
+		`UPDATE new_intents SET intent_id = $1 WHERE intent_id = $2`,
+		childNFTId, oldIntentID,
+	); err != nil {
+		return 0, err
+	}
+
+	res, err := tx.Exec(
+		`UPDATE new_interactions
+		 SET provenance_record_id = $1, intent_id = $2
+		 WHERE provenance_req_id = $3`,
+		transactionID, childNFTId, reqID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return rows, nil
+}
+
 func (d *DB) CountInteractionsByAgent(agentDID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(
