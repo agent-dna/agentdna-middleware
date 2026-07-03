@@ -1651,3 +1651,70 @@ func (d *DB) UpdateAdminPassword(email, passwordHash string) error {
 	}
 	return nil
 }
+
+// InteractionSeriesBucket holds safe and threat counts for one time bucket.
+type InteractionSeriesBucket struct {
+	Safe    int
+	Threats int
+}
+
+// GetInteractionSeries returns bucketed interaction counts for an org.
+// For range "24h": 24 hourly buckets, index 0 = 23 hours ago, index 23 = current hour.
+// For range "7d":  7 daily buckets,  index 0 = 6 days ago,    index 6 = today.
+func (d *DB) GetInteractionSeries(orgID, rangeParam string) ([]InteractionSeriesBucket, error) {
+	now := time.Now().UTC()
+
+	var buckets []InteractionSeriesBucket
+	var query string
+	var args []any
+
+	if rangeParam == "7d" {
+		buckets = make([]InteractionSeriesBucket, 7)
+		// bucket index = days ago from today (0 = oldest = 6 days ago, 6 = today)
+		query = `
+			SELECT
+				CAST(FLOOR(EXTRACT(EPOCH FROM ($1::timestamptz - time)) / 86400) AS INT) AS bucket,
+				SUM(CASE WHEN threat = 0 THEN 1 ELSE 0 END),
+				SUM(CASE WHEN threat = 1 THEN 1 ELSE 0 END)
+			FROM new_interactions
+			WHERE organization_id = $2
+			  AND time >= $1::timestamptz - INTERVAL '7 days'
+			  AND time <  $1::timestamptz + INTERVAL '1 day'
+			GROUP BY bucket`
+		args = []any{now, orgID}
+	} else {
+		// default: 24h
+		buckets = make([]InteractionSeriesBucket, 24)
+		query = `
+			SELECT
+				CAST(FLOOR(EXTRACT(EPOCH FROM ($1::timestamptz - time)) / 3600) AS INT) AS bucket,
+				SUM(CASE WHEN threat = 0 THEN 1 ELSE 0 END),
+				SUM(CASE WHEN threat = 1 THEN 1 ELSE 0 END)
+			FROM new_interactions
+			WHERE organization_id = $2
+			  AND time >= $1::timestamptz - INTERVAL '24 hours'
+			GROUP BY bucket`
+		args = []any{now, orgID}
+	}
+
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	size := len(buckets)
+	for rows.Next() {
+		var daysOrHoursAgo, safe, threats int
+		if err := rows.Scan(&daysOrHoursAgo, &safe, &threats); err != nil {
+			continue
+		}
+		// daysOrHoursAgo=0 means current bucket → last index; invert to get ascending order
+		idx := size - 1 - daysOrHoursAgo
+		if idx >= 0 && idx < size {
+			buckets[idx].Safe = safe
+			buckets[idx].Threats = threats
+		}
+	}
+	return buckets, rows.Err()
+}

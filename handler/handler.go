@@ -1140,6 +1140,36 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 	})
 }
 
+func (h *Handler) InteractionSeries(c *gin.Context) {
+	orgID := c.GetString(CtxOrgID)
+	rangeParam := c.DefaultQuery("range", "24h")
+	if rangeParam != "24h" && rangeParam != "7d" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "range must be 24h or 7d"})
+		return
+	}
+
+	buckets, err := h.db.GetInteractionSeries(orgID, rangeParam)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to fetch series"})
+		return
+	}
+
+	safe := make([]int, len(buckets))
+	threats := make([]int, len(buckets))
+	for i, b := range buckets {
+		safe[i] = b.Safe
+		threats[i] = b.Threats
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Status: true,
+		Data: gin.H{
+			"safe":    safe,
+			"threats": threats,
+		},
+	})
+}
+
 func (h *Handler) TopThreatAgents(c *gin.Context) {
 	w := http.ResponseWriter(c.Writer)
 	enableCors(&w)
