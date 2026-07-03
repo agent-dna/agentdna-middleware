@@ -284,3 +284,19 @@ func extractInteractions(blocks []*chainBlock) []interactionExtract {
 
 	return result
 }
+
+// resolveActorName looks up a display name for the given DID from the agents
+// table first, then the users table. Falls back to the envelope-provided name
+// if neither has a record or the DID is empty.
+func (h *Handler) resolveActorName(did, fallback string) string {
+	if did == "" || did == "none" {
+		return fallback
+	}
+	if agent, err := h.db.GetAgentInfo(did); err == nil && agent.AgentName != "" {
+		return agent.AgentName
+	}
+	if name, err := h.db.GetOrgUserNameByDID(did); err == nil && name != "" {
+		return name
+	}
+	return fallback
+}
