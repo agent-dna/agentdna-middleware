@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -40,6 +41,25 @@ type otpEntry struct {
 const emailWorkers = 5
 const emailQueueSize = 100
 
+// Rubix blockchain transaction endpoints whose responses we capture for provenance.
+const (
+	rubixTxPath        = "/rubix/v1/tx"
+	rubixSignaturePath = "/rubix/v1/signature"
+)
+
+// provenanceCtxKey is a private request-context key type used to carry a value from
+// the request handler (ProxyHandler) to the response hook (captureRubixResponse).
+type provenanceCtxKey string
+
+const (
+	// ctxIntentIDKey carries the intentID generated while handling a /tx intent
+	// workflow so the /tx response hook can attach provenance_req_id to those rows.
+	ctxIntentIDKey provenanceCtxKey = "provenance_intent_id"
+	// ctxSignatureIDKey carries the id from a /signature request body so the
+	// /signature response hook knows which provenance rows to update.
+	ctxSignatureIDKey provenanceCtxKey = "provenance_signature_id"
+)
+
 type Handler struct {
 	db                  *db.DB
 	proxy               *httputil.ReverseProxy
@@ -67,6 +87,8 @@ func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL
 		updateAgentEndpoint: updateAgentEndpoint,
 		emailQueue:          make(chan email.Message, emailQueueSize),
 	}
+	// Capture blockchain transaction provenance from the upstream responses.
+	proxy.ModifyResponse = h.captureRubixResponse
 	if cfg, err := email.LoadConfigFromEnv(); err == nil {
 		h.mailer = email.New(cfg)
 	} else {
@@ -268,13 +290,141 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 				case NFTTypeAgent:
 					h.handleAgentNFT(nftInfo)
 				case NFTTypeIntent:
-					h.handleIntentWorkflow(nftInfo)
+					// Stash the generated intentID so the /tx response hook can attach
+					// provenance_req_id to the interaction rows we just inserted. Harmless
+					// on non-/tx paths — only captureTxResponse (path-gated) reads it.
+					if intentID, wfErr := h.handleIntentWorkflow(nftInfo); wfErr == nil && intentID != "" {
+						r = r.WithContext(context.WithValue(r.Context(), ctxIntentIDKey, intentID))
+					}
 				}
+			}
+		}
+
+		// /rubix/v1/signature carries the /tx provenance id in its request body; stash
+		// it so the response hook knows which provenance rows to update.
+		if r.URL.Path == rubixSignaturePath {
+			var sigReq signatureRequest
+			if jsonErr := json.Unmarshal(bodyBytes, &sigReq); jsonErr == nil && sigReq.ID != "" {
+				r = r.WithContext(context.WithValue(r.Context(), ctxSignatureIDKey, sigReq.ID))
 			}
 		}
 	}
 
 	h.proxy.ServeHTTP(w, r)
+}
+
+// captureRubixResponse is the proxy ModifyResponse hook. It extracts blockchain
+// transaction provenance from the /tx and /signature responses. It must never return
+// an error: a capture failure is logged and the response passes through untouched.
+func (h *Handler) captureRubixResponse(resp *http.Response) error {
+	switch resp.Request.URL.Path {
+	case rubixTxPath:
+		h.captureTxResponse(resp)
+	case rubixSignaturePath:
+		h.captureSignatureResponse(resp)
+	}
+	return nil
+}
+
+// readAndRestoreBody fully reads resp.Body (so we can parse it) and puts an equivalent
+// reader back so the client still receives the untouched response.
+func readAndRestoreBody(resp *http.Response) ([]byte, error) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	return body, nil
+}
+
+// captureTxResponse handles POST /rubix/v1/tx: it stores result.id as provenance_req_id
+// on the intent's interaction rows, or deletes those rows if the tx failed to initiate.
+func (h *Handler) captureTxResponse(resp *http.Response) {
+	intentID, _ := resp.Request.Context().Value(ctxIntentIDKey).(string)
+	if intentID == "" {
+		return // not an intent-workflow tx we're tracking
+	}
+
+	body, err := readAndRestoreBody(resp)
+	if err != nil {
+		log.Printf("[provenance] tx: read body failed intent_id=%s: %v", intentID, err)
+		return
+	}
+
+	var txResp txResponse
+	if err := json.Unmarshal(body, &txResp); err != nil {
+		log.Printf("[provenance] tx: parse failed intent_id=%s: %v", intentID, err)
+		return
+	}
+
+	// status=false → the transaction failed to initiate; remove the rows we inserted
+	// during request handling. (The new_intents row is left as-is by design.)
+	if !txResp.Status {
+		if err := h.db.DeleteInteractionsByIntent(intentID); err != nil {
+			log.Printf("[provenance] tx: delete failed intent_id=%s: %v", intentID, err)
+		} else {
+			log.Printf("[provenance] tx: status=false, removed interaction rows intent_id=%s", intentID)
+		}
+		return
+	}
+
+	if txResp.Result.ID == "" {
+		log.Printf("[provenance] tx: empty result.id intent_id=%s", intentID)
+		return
+	}
+	if err := h.db.SetProvenanceReqID(intentID, txResp.Result.ID); err != nil {
+		log.Printf("[provenance] tx: set provenance_req_id failed intent_id=%s id=%s: %v", intentID, txResp.Result.ID, err)
+		return
+	}
+	log.Printf("[provenance] tx: intent_id=%s provenance_req_id=%s", intentID, txResp.Result.ID)
+}
+
+// captureSignatureResponse handles POST /rubix/v1/signature: it writes transactionID
+// and the first childNFTId onto the rows previously tagged with provenance_req_id.
+func (h *Handler) captureSignatureResponse(resp *http.Response) {
+	reqID, _ := resp.Request.Context().Value(ctxSignatureIDKey).(string)
+	if reqID == "" {
+		return
+	}
+
+	body, err := readAndRestoreBody(resp)
+	if err != nil {
+		log.Printf("[provenance] signature: read body failed id=%s: %v", reqID, err)
+		return
+	}
+
+	var sigResp signatureResponse
+	if err := json.Unmarshal(body, &sigResp); err != nil {
+		log.Printf("[provenance] signature: parse failed id=%s: %v", reqID, err)
+		return
+	}
+	if !sigResp.Status {
+		log.Printf("[provenance] signature: status=false id=%s, skipping", reqID)
+		return
+	}
+	if len(sigResp.Result.MintedNFTChildren) == 0 {
+		log.Printf("[provenance] signature: no mintedNFTChildren id=%s", reqID)
+		return
+	}
+
+	childNFTId := sigResp.Result.MintedNFTChildren[0].ChildNFTId
+	transactionID := sigResp.Result.TransactionID
+
+	rows, err := h.db.SetProvenanceRecord(reqID, transactionID, childNFTId)
+	if err != nil {
+		log.Printf("[provenance] signature: update failed id=%s: %v", reqID, err)
+		return
+	}
+	if rows == 0 {
+		// No matching row — the /tx write likely has not landed yet (or failed). Skip.
+		log.Printf("[provenance] signature: no rows matched provenance_req_id=%s (tx write pending?)", reqID)
+		return
+	}
+	log.Printf("[provenance] signature: updated rows=%d provenance_req_id=%s transactionID=%s childNFTId=%s",
+		rows, reqID, transactionID, childNFTId)
 }
 
 
@@ -300,15 +450,17 @@ func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 	return h.db.StoreNewAgent(nftInfo.NFTId, data.AgentDID, deployer, orgID, data.Policy, agentName)
 }
 
-func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
+// handleIntentWorkflow stores the intent-workflow interactions and returns the
+// generated intentID so the caller can correlate the /tx response for provenance.
+func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	data, err := parseIntentWorkflow(nftInfo.Data)
 	if err != nil {
 		log.Printf("[intentWorkflow] failed to parse nft_id=%s: %v", nftInfo.NFTId, err)
-		return err
+		return "", err
 	}
 	if data.Envelope == nil {
 		log.Printf("[intentWorkflow] envelope is nil nft_id=%s", nftInfo.NFTId)
-		return fmt.Errorf("handleIntentWorkflow: envelope is nil")
+		return "", fmt.Errorf("handleIntentWorkflow: envelope is nil")
 	}
 
 	envelopes := walkEnvelopes(data.Envelope)
@@ -342,7 +494,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 	}
 	if orgID == "" {
 		log.Printf("[intentWorkflow] could not resolve orgID for intent, dropping nft_id=%s", nftInfo.NFTId)
-		return fmt.Errorf("handleIntentWorkflow: could not resolve orgID")
+		return "", fmt.Errorf("handleIntentWorkflow: could not resolve orgID")
 	}
 	log.Printf("[intentWorkflow] orgID=%s intentID=%s", orgID, intentID)
 
@@ -383,7 +535,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 		if err := h.db.StoreNewInteraction(
 			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, eventTime,
 		); err != nil {
-			return fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
+			return "", fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
 		}
 		if ix.Type == "tool_call" {
 			_ = h.db.StoreNewTool(ix.ToDID, ix.ToName, orgID)
@@ -420,10 +572,10 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 
 	if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, chainDepth, threatDetected, interactionIDs); err != nil {
 		log.Printf("[intentWorkflow] intent save error: %v", err)
-		return err
+		return "", err
 	}
 	log.Printf("[intentWorkflow] saved intent_id=%s interactions=%d threat=%v flowType=%s", intentID, len(interactionIDs), threatDetected, flowType)
-	return nil
+	return intentID, nil
 }
 
 func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
