@@ -748,30 +748,33 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 		return
 	}
 	type blockOut struct {
-		ID             string   `json:"id"`
-		BlockIndex     int      `json:"block_index"`
-		AgentDID       string   `json:"agent_did"`
-		AgentName      string   `json:"agent_name"`
-		Direction      string   `json:"direction"`
-		BlockType      string   `json:"block_type"`
-		Message        string   `json:"message"`
-		Response       string   `json:"response"`
-		DelegateTo     string   `json:"delegate_to"`
-		ReceivedFrom   string   `json:"received_from"`
-		CbacApp        string   `json:"cbac_app"`
-		CbacDecision   string   `json:"cbac_decision"`
-		ThreatDetected bool     `json:"threat_detected"`
-		TrustIssues    []string `json:"trust_issues"`
-		Signature      string   `json:"signature"`
-		CreatedAt      string   `json:"created_at"`
+		ID             string     `json:"id"`
+		BlockIndex     int        `json:"block_index"`
+		AgentDID       string     `json:"agent_did"`
+		AgentName      string     `json:"agent_name"`
+		Direction      string     `json:"direction"`
+		BlockType      string     `json:"block_type"`
+		Message        string     `json:"message"`
+		Response       string     `json:"response"`
+		DelegateTo     string     `json:"delegate_to"`
+		ReceivedFrom   string     `json:"received_from"`
+		CbacApp        string     `json:"cbac_app"`
+		CbacDecision   string     `json:"cbac_decision"`
+		ThreatDetected bool       `json:"threat_detected"`
+		TrustIssues    []string   `json:"trust_issues"`
+		Signature      string     `json:"signature"`
+		CreatedAt      string     `json:"created_at"`
+		ParentBlock    *blockOut  `json:"parent_block"`
 	}
-	out := make([]blockOut, 0, len(blocks))
+	// Build nested structure: blocks[0] is innermost (no parent), each successive
+	// block wraps the previous as parent_block, outermost (latest) is the root.
+	var root *blockOut
 	for _, b := range blocks {
 		issues := b.TrustIssues
 		if issues == nil {
 			issues = []string{}
 		}
-		out = append(out, blockOut{
+		node := &blockOut{
 			ID:             b.ID,
 			BlockIndex:     b.BlockIndex,
 			AgentDID:       b.AgentDID,
@@ -788,9 +791,11 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 			TrustIssues:    issues,
 			Signature:      b.Signature,
 			CreatedAt:      b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-		})
+			ParentBlock:    root,
+		}
+		root = node
 	}
-	c.JSON(http.StatusOK, Response{Status: true, Data: out})
+	c.JSON(http.StatusOK, Response{Status: true, Data: root})
 }
 
 func (h *Handler) issueToken(claims JWTClaims) (string, error) {
