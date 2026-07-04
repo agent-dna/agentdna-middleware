@@ -227,6 +227,7 @@ func New(dsn string) *DB {
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS type TEXT DEFAULT '';
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS direction TEXT DEFAULT '';
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS provenance_req_id TEXT;
+		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT '';
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS provenance_record_id TEXT;
 		DO $$
 		BEGIN
