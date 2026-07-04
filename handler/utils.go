@@ -72,13 +72,14 @@ func extractInteractionsFromEnvelopes(envs []*workflowEnvelope) []interactionExt
 	var result []interactionExtract
 	for _, e := range envs {
 		result = append(result, interactionExtract{
-			FromDID:  e.From.ID,
-			FromName: e.From.Name,
-			ToDID:    e.To.ID,
-			ToName:   e.To.Name,
-			Type:     deriveWorkflowInteractionType(e, seenAsFrom),
-			Threat:   len(e.Issues) > 0,
-			Message:  e.Payload,
+			FromDID:   e.From.ID,
+			FromName:  e.From.Name,
+			ToDID:     e.To.ID,
+			ToName:    e.To.Name,
+			Type:      deriveWorkflowInteractionType(e, seenAsFrom),
+			Threat:    len(e.Issues) > 0,
+			Message:   e.Payload,
+			Signature: e.Signature,
 		})
 		seenAsFrom[e.From.ID] = true
 	}

@@ -1123,7 +1123,7 @@ func (d *DB) GetAgentNFTID(agentDID string) (string, error) {
 	return nftID.String, err
 }
 
-func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message string, eventTime time.Time) error {
+func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message, signature string, eventTime time.Time) error {
 	threatInt := 0
 	if threat {
 		threatInt = 1
@@ -1133,9 +1133,9 @@ func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDI
 	}
 	_, err := d.conn.Exec(
 		`INSERT INTO new_interactions
-		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id, message, time)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT DO NOTHING`,
-		id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction, threatInt, intentID, orgID, message, eventTime,
+		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id, message, signature, time)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT DO NOTHING`,
+		id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction, threatInt, intentID, orgID, message, signature, eventTime,
 	)
 	return err
 }
@@ -1249,6 +1249,7 @@ func scanInteractionNewRows(rows *sql.Rows) ([]*InteractionRecord, error) {
 			&r.From, &r.FromName,
 			&r.To, &r.ToName,
 			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
+			&r.Signature, &r.ProvenanceReqID, &r.ProvenanceRecordID,
 		); err != nil {
 			return nil, err
 		}
@@ -1514,7 +1515,8 @@ func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, err
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
 		FROM new_interactions WHERE intent_id = $1 ORDER BY time ASC`,
 		intentID,
 	)

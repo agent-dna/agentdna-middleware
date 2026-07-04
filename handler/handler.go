@@ -533,7 +533,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		}
 		eventTime := time.Unix(envelopes[idx].Epoch, 0).UTC()
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, eventTime,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, eventTime,
 		); err != nil {
 			return "", fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
 		}
@@ -661,7 +661,7 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 		iid := fmt.Sprintf("%s-%d", intentID, idx+1)
 		interactionIDs = append(interactionIDs, iid)
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message, time.Time{},
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message, ix.Signature, time.Time{},
 		); err != nil {
 			return fmt.Errorf("handleIntentNFT: StoreNewInteraction: %v", err)
 		}
@@ -1846,31 +1846,37 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 	}
 
 	type interactionOut struct {
-		InteractionID string `json:"interactionID"`
-		Initiator     string `json:"initiator"`
-		InitiatorName string `json:"initiatorName"`
-		To            string `json:"to"`
-		ToName        string `json:"toName"`
-		Type          string `json:"type"`
-		Message       string `json:"message"`
-		IntentID      string `json:"intentID"`
-		Threat        bool   `json:"threat"`
-		Epoch         int64  `json:"epoch"`
+		InteractionID      string `json:"interactionID"`
+		Initiator          string `json:"initiator"`
+		InitiatorName      string `json:"initiatorName"`
+		To                 string `json:"to"`
+		ToName             string `json:"toName"`
+		Type               string `json:"type"`
+		Message            string `json:"message"`
+		IntentID           string `json:"intentID"`
+		Threat             bool   `json:"threat"`
+		Epoch              int64  `json:"epoch"`
+		Signature          string `json:"signature"`
+		ProvenanceReqID    string `json:"provenanceReqID"`
+		ProvenanceRecordID string `json:"provenanceRecordID"`
 	}
 
 	list := make([]interactionOut, 0, len(interactions))
 	for _, ix := range interactions {
 		list = append(list, interactionOut{
-			InteractionID: ix.InteractionID,
-			Initiator:     ix.From,
-			InitiatorName: ix.FromName,
-			To:            ix.To,
-			ToName:        ix.ToName,
-			Type:          ix.Type,
-			Message:       ix.Message,
-			IntentID:      ix.IntentID,
-			Threat:        ix.Threat,
-			Epoch:         ix.Time.Unix(),
+			InteractionID:      ix.InteractionID,
+			Initiator:          ix.From,
+			InitiatorName:      ix.FromName,
+			To:                 ix.To,
+			ToName:             ix.ToName,
+			Type:               ix.Type,
+			Message:            ix.Message,
+			IntentID:           ix.IntentID,
+			Threat:             ix.Threat,
+			Epoch:              ix.Time.Unix(),
+			Signature:          ix.Signature,
+			ProvenanceReqID:    ix.ProvenanceReqID,
+			ProvenanceRecordID: ix.ProvenanceRecordID,
 		})
 	}
 
@@ -1966,19 +1972,26 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		return
 	}
 
+	provenanceRecordID := ""
 	txns := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
+		if provenanceRecordID == "" && i.ProvenanceRecordID != "" {
+			provenanceRecordID = i.ProvenanceRecordID
+		}
 		txns = append(txns, gin.H{
-			"interactionID": i.InteractionID,
-			"from":          i.From,
-			"fromName":      i.FromName,
-			"to":            i.To,
-			"toName":        i.ToName,
-			"type":          i.Type,
-			"direction":     i.Direction,
-			"threat":        i.Threat,
-			"time":          i.Time,
-			"message":       i.Message,
+			"interactionID":      i.InteractionID,
+			"from":               i.From,
+			"fromName":           i.FromName,
+			"to":                 i.To,
+			"toName":             i.ToName,
+			"type":               i.Type,
+			"direction":          i.Direction,
+			"threat":             i.Threat,
+			"time":               i.Time,
+			"message":            i.Message,
+			"signature":          i.Signature,
+			"provenanceReqID":    i.ProvenanceReqID,
+			"provenanceRecordID": i.ProvenanceRecordID,
 		})
 	}
 
@@ -1998,6 +2011,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"firstInteractionAt": intent.FirstInteractionAt,
 		"lastInteractionAt":  intent.LastInteractionAt,
 		"runtimeSeconds":     intent.RuntimeSeconds,
+		"provenanceRecordID": provenanceRecordID,
 		"interactions":       txns,
 	}
 	if intent.EndedAt != nil {

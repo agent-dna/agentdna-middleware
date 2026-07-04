@@ -190,4 +190,5 @@ type interactionExtract struct {
 	Direction string
 	Threat    bool
 	Message   string
+	Signature string
 }

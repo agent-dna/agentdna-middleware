@@ -57,17 +57,20 @@ type UserDetailRecord struct {
 }
 
 type InteractionRecord struct {
-	InteractionID string
-	From          string
-	FromName      string
-	To            string
-	ToName        string
-	Type          string
-	Direction     string
-	Threat        bool
-	IntentID      string
-	Message       string
-	Time          time.Time
+	InteractionID       string
+	From                string
+	FromName            string
+	To                  string
+	ToName              string
+	Type                string
+	Direction           string
+	Threat              bool
+	IntentID            string
+	Message             string
+	Signature           string
+	ProvenanceReqID     string
+	ProvenanceRecordID  string
+	Time                time.Time
 }
 
 type IntentRecord struct {
