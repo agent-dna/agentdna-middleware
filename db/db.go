@@ -248,6 +248,8 @@ func New(dsn string) *DB {
 			executor         TEXT DEFAULT 'user',
 			chain_depth      INTEGER DEFAULT 0
 		);
+		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS provenance_req_id TEXT;
+		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS provenance_record_id TEXT;
 		CREATE TABLE IF NOT EXISTS new_tools (
 			did             TEXT PRIMARY KEY,
 			name            TEXT,
