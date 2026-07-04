@@ -472,7 +472,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	intentID := uuid.New().String()
 	interactions := extractInteractionsFromEnvelopes(envelopes)
 
-	// Resolve display names from DB; fall back to envelope name if not found.
+	// Resolve display ames from DB; fall back to envelope name if not found.
 	for i, ix := range interactions {
 		interactions[i].FromName = h.resolveActorName(ix.FromDID, ix.FromName)
 		interactions[i].ToName = h.resolveActorName(ix.ToDID, ix.ToName)

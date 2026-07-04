@@ -1213,21 +1213,43 @@ func (d *DB) SetProvenanceRecord(reqID, transactionID, childNFTId string) (int64
 		return 0, err
 	}
 
-	// Repoint the intent row to childNFTId (PK update; interaction_ids reference the
-	// unchanged interaction_id PKs, so they stay valid).
+	// Repoint intent row and rewrite interaction_ids JSON (uuid-N → childNFTId-N).
 	if _, err := tx.Exec(
-		`UPDATE new_intents SET intent_id = $1, provenance_record_id = $2 WHERE intent_id = $3`,
+		`UPDATE new_intents
+		 SET intent_id           = $1,
+		     provenance_record_id = $2,
+		     interaction_ids      = REPLACE(interaction_ids, $3, $1)
+		 WHERE intent_id = $3`,
 		childNFTId, transactionID, oldIntentID,
 	); err != nil {
 		return 0, err
 	}
 
+	// Update interaction rows: rewrite the PK (uuid-N → childNFTId-N) and set provenance fields.
+	// SUBSTRING position is 1-based: skip past "<uuid>-" to get the numeric suffix.
+	suffixStart := len(oldIntentID) + 2
 	res, err := tx.Exec(
 		`UPDATE new_interactions
-		 SET provenance_record_id = $1, intent_id = $2
+		 SET interaction_id       = $1 || '-' || SUBSTRING(interaction_id FROM $4),
+		     provenance_record_id = $2,
+		     intent_id            = $1
 		 WHERE provenance_req_id = $3`,
-		transactionID, childNFTId, reqID,
+		childNFTId, transactionID, reqID, suffixStart,
 	)
+	if err != nil {
+		return 0, err
+	}
+
+	// Mirror the rename in intent_block_data (id: uuid-block-N → childNFTId-block-N).
+	if _, err := tx.Exec(
+		`UPDATE intent_block_data
+		 SET id        = $1 || '-' || SUBSTRING(id FROM $3),
+		     intent_id = $1
+		 WHERE intent_id = $2`,
+		childNFTId, oldIntentID, suffixStart,
+	); err != nil {
+		return 0, err
+	}
 	if err != nil {
 		return 0, err
 	}
