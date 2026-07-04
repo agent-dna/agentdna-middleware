@@ -513,7 +513,8 @@ func (d *DB) GetInteractionsByUser(userDID, orgID string, limit, offset int) ([]
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
 		FROM new_interactions
 		WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents)
 		ORDER BY time DESC
@@ -542,7 +543,8 @@ func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
 		FROM new_interactions
 		WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents)
 		ORDER BY time DESC
@@ -602,7 +604,8 @@ func (d *DB) GetInteractionsByOrg(orgID string, limit, offset int) ([]*Interacti
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
 		FROM new_interactions
 		WHERE organization_id = $1
 		ORDER BY time DESC
@@ -636,7 +639,8 @@ func (d *DB) GetInteractionsByOrgAndIntent(orgID, intentID string, limit, offset
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
 		FROM new_interactions
 		WHERE organization_id = $1 AND intent_id = $2
 		ORDER BY time DESC
@@ -663,7 +667,8 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
 		FROM new_interactions
 		WHERE organization_id = $1 AND threat = 1
 		ORDER BY time DESC
@@ -1269,7 +1274,8 @@ func (d *DB) GetInteractionsByAgent(agentDID string, limit, offset int) ([]*Inte
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
 		FROM new_interactions
 		WHERE initiator_did = $1
 		ORDER BY time DESC
@@ -1521,6 +1527,7 @@ func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, err
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''),
 		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
 		FROM new_interactions WHERE intent_id = $1 ORDER BY time ASC`,
 		intentID,
@@ -1619,7 +1626,8 @@ func (d *DB) GetInteractionsByTool(toolDID, orgID string, limit, offset int) ([]
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, '')
+		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
 		FROM new_interactions
 		WHERE interacted_to_did = $1 AND organization_id = $2
 		ORDER BY time DESC
