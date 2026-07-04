@@ -410,6 +410,11 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 		return
 	}
 
+	if len(sigResp.Result.MintedNFTChildren) == 0 {
+		log.Printf("[provenance] signature: no mintedNFTChildren id=%s", reqID)
+		return
+	}
+
 	childNFTId := sigResp.Result.MintedNFTChildren[0].ChildNFTId
 	transactionID := sigResp.Result.TransactionID
 

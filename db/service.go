@@ -1165,6 +1165,11 @@ func (d *DB) SetProvenanceReqID(intentID, reqID string) error {
 		`UPDATE new_interactions SET provenance_req_id = $1 WHERE intent_id = $2`,
 		reqID, intentID,
 	)
+
+	_, err = d.conn.Exec(
+		`UPDATE new_intents SET provenance_req_id = $1 WHERE intent_id = $2`,
+		reqID, intentID,
+	)
 	return err
 }
 
@@ -1206,8 +1211,8 @@ func (d *DB) SetProvenanceRecord(reqID, transactionID, childNFTId string) (int64
 	// Repoint the intent row to childNFTId (PK update; interaction_ids reference the
 	// unchanged interaction_id PKs, so they stay valid).
 	if _, err := tx.Exec(
-		`UPDATE new_intents SET intent_id = $1 WHERE intent_id = $2`,
-		childNFTId, oldIntentID,
+		`UPDATE new_intents SET intent_id = $1, provenance_record_id = $2 WHERE intent_id = $3`,
+		childNFTId, transactionID, oldIntentID,
 	); err != nil {
 		return 0, err
 	}
