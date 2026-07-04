@@ -762,6 +762,7 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 		CbacDecision   string   `json:"cbac_decision"`
 		ThreatDetected bool     `json:"threat_detected"`
 		TrustIssues    []string `json:"trust_issues"`
+		Signature      string   `json:"signature"`
 		CreatedAt      string   `json:"created_at"`
 	}
 	out := make([]blockOut, 0, len(blocks))
@@ -785,6 +786,7 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 			CbacDecision:   b.CbacDecision,
 			ThreatDetected: b.ThreatDetected,
 			TrustIssues:    issues,
+			Signature:      b.Signature,
 			CreatedAt:      b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	}

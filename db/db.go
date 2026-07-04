@@ -128,22 +128,23 @@ type OrgUserRecord struct {
 }
 
 type IntentBlockRecord struct {
-	ID            string
-	IntentID      string
-	BlockIndex    int
-	AgentDID      string
-	AgentName     string
-	Direction     string
-	BlockType     string
-	Message       string
-	Response      string
-	DelegateTo    string
-	ReceivedFrom  string
-	CbacApp       string
-	CbacDecision  string
+	ID             string
+	IntentID       string
+	BlockIndex     int
+	AgentDID       string
+	AgentName      string
+	Direction      string
+	BlockType      string
+	Message        string
+	Response       string
+	DelegateTo     string
+	ReceivedFrom   string
+	CbacApp        string
+	CbacDecision   string
 	ThreatDetected bool
-	TrustIssues   []string
-	CreatedAt     time.Time
+	TrustIssues    []string
+	Signature      string
+	CreatedAt      time.Time
 }
 
 type DB struct {

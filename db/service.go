@@ -1700,12 +1700,16 @@ func (d *DB) StoreIntentBlockData(r *IntentBlockRecord) error {
 
 func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT id, intent_id, block_index, agent_did, agent_name, direction, block_type,
-		       message, response, delegate_to, received_from, cbac_app, cbac_decision,
-		       threat_detected, trust_issues, created_at
-		FROM intent_block_data
-		WHERE intent_id = $1
-		ORDER BY block_index ASC`,
+		SELECT b.id, b.intent_id, b.block_index, b.agent_did, b.agent_name, b.direction, b.block_type,
+		       b.message, b.response, b.delegate_to, b.received_from, b.cbac_app, b.cbac_decision,
+		       b.threat_detected, b.trust_issues, b.created_at,
+		       COALESCE(i.signature, '')
+		FROM intent_block_data b
+		LEFT JOIN new_interactions i
+		       ON i.intent_id   = b.intent_id
+		      AND i.interaction_id = b.intent_id || '-' || (b.block_index + 1)::text
+		WHERE b.intent_id = $1
+		ORDER BY b.block_index ASC`,
 		intentID,
 	)
 	if err != nil {
@@ -1722,7 +1726,7 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 			&r.ID, &r.IntentID, &r.BlockIndex, &r.AgentDID, &r.AgentName,
 			&r.Direction, &r.BlockType, &r.Message, &r.Response,
 			&r.DelegateTo, &r.ReceivedFrom, &r.CbacApp, &r.CbacDecision,
-			&threatInt, &trustJSON, &r.CreatedAt,
+			&threatInt, &trustJSON, &r.CreatedAt, &r.Signature,
 		); err != nil {
 			return nil, err
 		}
