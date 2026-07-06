@@ -145,6 +145,12 @@ type IntentBlockRecord struct {
 	TrustIssues    []string
 	Signature      string
 	CreatedAt      time.Time
+	FromDID        string
+	FromName       string
+	FromType       string
+	ToDID          string
+	ToName         string
+	ToType         string
 }
 
 type DB struct {
@@ -290,6 +296,12 @@ func New(dsn string) *DB {
 	}
 
 	// Runtime migrations for existing databases.
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS from_did  TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS from_name TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS from_type TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_did    TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_name   TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_type   TEXT NOT NULL DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS message TEXT DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''`)

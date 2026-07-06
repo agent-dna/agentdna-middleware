@@ -562,6 +562,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		for _, iss := range envelopes[idx].Issues {
 			issueReasons = append(issueReasons, iss.Reason)
 		}
+		env := envelopes[idx]
 		blockRec := &db.IntentBlockRecord{
 			ID:             iid,
 			IntentID:       intentID,
@@ -573,6 +574,12 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 			ThreatDetected: ix.Threat,
 			TrustIssues:    issueReasons,
 			CreatedAt:      eventTime,
+			FromDID:        actorDID(env.From),
+			FromName:       env.From.Name,
+			FromType:       env.From.Type,
+			ToDID:          actorDID(env.To),
+			ToName:         env.To.Name,
+			ToType:         env.To.Type,
 		}
 		if err := h.db.StoreIntentBlockData(blockRec); err != nil {
 			log.Printf("[intentWorkflow] block data save error idx=%d: %v", idx, err)
@@ -759,22 +766,21 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
 		return
 	}
+	type blockActor struct {
+		DID  string `json:"did"`
+		Name string `json:"name"`
+		Type string `json:"type"`
+	}
 	type blockOut struct {
 		ID             string     `json:"id"`
 		BlockIndex     int        `json:"block_index"`
-		AgentDID       string     `json:"agent_did"`
-		AgentName      string     `json:"agent_name"`
-		Direction      string     `json:"direction"`
 		BlockType      string     `json:"block_type"`
+		From           blockActor `json:"from"`
+		To             blockActor `json:"to"`
 		Message        string     `json:"message"`
-		Response       string     `json:"response"`
-		DelegateTo     string     `json:"delegate_to"`
-		ReceivedFrom   string     `json:"received_from"`
-		CbacApp        string     `json:"cbac_app"`
-		CbacDecision   string     `json:"cbac_decision"`
+		Signature      string     `json:"signature"`
 		ThreatDetected bool       `json:"threat_detected"`
 		TrustIssues    []string   `json:"trust_issues"`
-		Signature      string     `json:"signature"`
 		CreatedAt      string     `json:"created_at"`
 		ParentBlock    *blockOut  `json:"parent_block"`
 	}
@@ -787,21 +793,23 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 			issues = []string{}
 		}
 		node := &blockOut{
-			ID:             b.ID,
-			BlockIndex:     b.BlockIndex,
-			AgentDID:       b.AgentDID,
-			AgentName:      b.AgentName,
-			Direction:      b.Direction,
-			BlockType:      b.BlockType,
+			ID:         b.ID,
+			BlockIndex: b.BlockIndex,
+			BlockType:  b.BlockType,
+			From: blockActor{
+				DID:  b.FromDID,
+				Name: b.FromName,
+				Type: b.FromType,
+			},
+			To: blockActor{
+				DID:  b.ToDID,
+				Name: b.ToName,
+				Type: b.ToType,
+			},
 			Message:        b.Message,
-			Response:       b.Response,
-			DelegateTo:     b.DelegateTo,
-			ReceivedFrom:   b.ReceivedFrom,
-			CbacApp:        b.CbacApp,
-			CbacDecision:   b.CbacDecision,
+			Signature:      b.Signature,
 			ThreatDetected: b.ThreatDetected,
 			TrustIssues:    issues,
-			Signature:      b.Signature,
 			CreatedAt:      b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 			ParentBlock:    root,
 		}

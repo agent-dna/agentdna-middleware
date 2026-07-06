@@ -1688,12 +1688,14 @@ func (d *DB) StoreIntentBlockData(r *IntentBlockRecord) error {
 		INSERT INTO intent_block_data
 		  (id, intent_id, block_index, agent_did, agent_name, direction, block_type,
 		   message, response, delegate_to, received_from, cbac_app, cbac_decision,
-		   threat_detected, trust_issues, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+		   threat_detected, trust_issues, created_at,
+		   from_did, from_name, from_type, to_did, to_name, to_type)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 		ON CONFLICT (id) DO NOTHING`,
 		r.ID, r.IntentID, r.BlockIndex, r.AgentDID, r.AgentName, r.Direction, r.BlockType,
 		r.Message, r.Response, r.DelegateTo, r.ReceivedFrom, r.CbacApp, r.CbacDecision,
 		threatInt, string(trustJSON), createdAt,
+		r.FromDID, r.FromName, r.FromType, r.ToDID, r.ToName, r.ToType,
 	)
 	return err
 }
@@ -1703,10 +1705,12 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 		SELECT b.id, b.intent_id, b.block_index, b.agent_did, b.agent_name, b.direction, b.block_type,
 		       b.message, b.response, b.delegate_to, b.received_from, b.cbac_app, b.cbac_decision,
 		       b.threat_detected, b.trust_issues, b.created_at,
-		       COALESCE(i.signature, '')
+		       COALESCE(i.signature, ''),
+		       COALESCE(b.from_did, ''), COALESCE(b.from_name, ''), COALESCE(b.from_type, ''),
+		       COALESCE(b.to_did, ''),   COALESCE(b.to_name, ''),   COALESCE(b.to_type, '')
 		FROM intent_block_data b
 		LEFT JOIN new_interactions i
-		       ON i.intent_id   = b.intent_id
+		       ON i.intent_id      = b.intent_id
 		      AND i.interaction_id = b.intent_id || '-' || (b.block_index + 1)::text
 		WHERE b.intent_id = $1
 		ORDER BY b.block_index ASC`,
@@ -1727,6 +1731,8 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 			&r.Direction, &r.BlockType, &r.Message, &r.Response,
 			&r.DelegateTo, &r.ReceivedFrom, &r.CbacApp, &r.CbacDecision,
 			&threatInt, &trustJSON, &r.CreatedAt, &r.Signature,
+			&r.FromDID, &r.FromName, &r.FromType,
+			&r.ToDID, &r.ToName, &r.ToType,
 		); err != nil {
 			return nil, err
 		}
