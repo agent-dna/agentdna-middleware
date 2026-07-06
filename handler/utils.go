@@ -65,23 +65,33 @@ func walkEnvelopes(root *workflowEnvelope) []*workflowEnvelope {
 	return envs
 }
 
+// actorDID returns the actor's DID, falling back to the actor's name when the DID is absent.
+func actorDID(a workflowActor) string {
+	if a.ID != "" {
+		return a.ID
+	}
+	return a.Name
+}
+
 // extractInteractionsFromEnvelopes maps each envelope directly to one interaction hop.
 // Type is derived from actor types and position in chain (no direction field needed).
 func extractInteractionsFromEnvelopes(envs []*workflowEnvelope) []interactionExtract {
 	seenAsFrom := map[string]bool{}
 	var result []interactionExtract
 	for _, e := range envs {
+		fromDID := actorDID(e.From)
+		toDID := actorDID(e.To)
 		result = append(result, interactionExtract{
-			FromDID:   e.From.ID,
+			FromDID:   fromDID,
 			FromName:  e.From.Name,
-			ToDID:     e.To.ID,
+			ToDID:     toDID,
 			ToName:    e.To.Name,
 			Type:      deriveWorkflowInteractionType(e, seenAsFrom),
 			Threat:    len(e.Issues) > 0,
 			Message:   e.Payload,
 			Signature: e.Signature,
 		})
-		seenAsFrom[e.From.ID] = true
+		seenAsFrom[fromDID] = true
 	}
 	return result
 }
@@ -93,11 +103,16 @@ func deriveWorkflowInteractionType(e *workflowEnvelope, seenAsFrom map[string]bo
 	if e.To.Type == "app" {
 		return "tool_call"
 	}
-	if e.From.ID == e.To.ID {
+	if e.From.Type == "app" {
+		return "tool_response"
+	}
+	fromDID := actorDID(e.From)
+	toDID := actorDID(e.To)
+	if fromDID == toDID {
 		return "tool_response"
 	}
 	// agent→agent: if the destination was already a sender earlier, we're going back up
-	if seenAsFrom[e.To.ID] {
+	if seenAsFrom[toDID] {
 		return "response"
 	}
 	return "delegate"
