@@ -305,6 +305,7 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 		if r.URL.Path == rubixSignaturePath {
 			var sigReq signatureRequest
 			if jsonErr := json.Unmarshal(bodyBytes, &sigReq); jsonErr == nil && sigReq.ID != "" {
+				fmt.Printf("test-0102 sigReq.ID=%s\n", sigReq.ID)
 				r = r.WithContext(context.WithValue(r.Context(), ctxSignatureIDKey, sigReq.ID))
 			}
 		}
@@ -389,6 +390,7 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 	if reqID == "" {
 		return
 	}
+	log.Printf("test-0101 reqID=%s", reqID)
 
 	body, err := readAndRestoreBody(resp)
 	if err != nil {
@@ -418,11 +420,14 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 	childNFTId := sigResp.Result.MintedNFTChildren[0].ChildNFTId
 	transactionID := sigResp.Result.TransactionID
 
+	log.Printf("test-0101 childNFTId=%s transactionID=%s", childNFTId, transactionID)
+
 	rows, err := h.db.SetProvenanceRecord(reqID, transactionID, childNFTId)
 	if err != nil {
 		log.Printf("[provenance] signature: update failed id=%s: %v", reqID, err)
 		return
 	}
+
 	if rows == 0 {
 		// No matching row — the /tx write likely has not landed yet (or failed). Skip.
 		log.Printf("[provenance] signature: no rows matched provenance_req_id=%s (tx write pending?)", reqID)
