@@ -420,7 +420,14 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 	childNFTId := sigResp.Result.MintedNFTChildren[0].ChildNFTId
 	transactionID := sigResp.Result.TransactionID
 
-	log.Printf("test-0101 childNFTId=%s transactionID=%s", childNFTId, transactionID)
+	if childNFTId == "" {
+		log.Printf("[provenance] signature: empty childNFTId id=%s, skipping", reqID)
+		return
+	}
+	if transactionID == "" {
+		log.Printf("[provenance] signature: empty transactionID id=%s, skipping", reqID)
+		return
+	}
 
 	rows, err := h.db.SetProvenanceRecord(reqID, transactionID, childNFTId)
 	if err != nil {

@@ -1230,7 +1230,7 @@ func (d *DB) SetProvenanceRecord(reqID, transactionID, childNFTId string) (int64
 	suffixStart := len(oldIntentID) + 2
 	res, err := tx.Exec(
 		`UPDATE new_interactions
-		 SET interaction_id       = $1 || '-' || SUBSTRING(interaction_id FROM $4),
+		 SET interaction_id       = $1 || '-' || SUBSTR(interaction_id, $4),
 		     provenance_record_id = $2,
 		     intent_id            = $1
 		 WHERE provenance_req_id = $3`,
@@ -1243,7 +1243,7 @@ func (d *DB) SetProvenanceRecord(reqID, transactionID, childNFTId string) (int64
 	// Mirror the rename in intent_block_data (id: uuid-block-N → childNFTId-block-N).
 	if _, err := tx.Exec(
 		`UPDATE intent_block_data
-		 SET id        = $1 || '-' || SUBSTRING(id FROM $3),
+		 SET id        = $1 || '-' || SUBSTR(id, $3),
 		     intent_id = $1
 		 WHERE intent_id = $2`,
 		childNFTId, oldIntentID, suffixStart,
