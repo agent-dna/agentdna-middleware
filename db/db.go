@@ -57,17 +57,20 @@ type UserDetailRecord struct {
 }
 
 type InteractionRecord struct {
-	InteractionID string
-	From          string
-	FromName      string
-	To            string
-	ToName        string
-	Type          string
-	Direction     string
-	Threat        bool
-	IntentID      string
-	Message       string
-	Time          time.Time
+	InteractionID       string
+	From                string
+	FromName            string
+	To                  string
+	ToName              string
+	Type                string
+	Direction           string
+	Threat              bool
+	IntentID            string
+	Message             string
+	Signature           string
+	ProvenanceReqID     string
+	ProvenanceRecordID  string
+	Time                time.Time
 }
 
 type IntentRecord struct {
@@ -125,22 +128,29 @@ type OrgUserRecord struct {
 }
 
 type IntentBlockRecord struct {
-	ID            string
-	IntentID      string
-	BlockIndex    int
-	AgentDID      string
-	AgentName     string
-	Direction     string
-	BlockType     string
-	Message       string
-	Response      string
-	DelegateTo    string
-	ReceivedFrom  string
-	CbacApp       string
-	CbacDecision  string
+	ID             string
+	IntentID       string
+	BlockIndex     int
+	AgentDID       string
+	AgentName      string
+	Direction      string
+	BlockType      string
+	Message        string
+	Response       string
+	DelegateTo     string
+	ReceivedFrom   string
+	CbacApp        string
+	CbacDecision   string
 	ThreatDetected bool
-	TrustIssues   []string
-	CreatedAt     time.Time
+	TrustIssues    []string
+	Signature      string
+	CreatedAt      time.Time
+	FromDID        string
+	FromName       string
+	FromType       string
+	ToDID          string
+	ToName         string
+	ToType         string
 }
 
 type DB struct {
@@ -223,6 +233,9 @@ func New(dsn string) *DB {
 		);
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS type TEXT DEFAULT '';
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS direction TEXT DEFAULT '';
+		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS provenance_req_id TEXT;
+		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT '';
+		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS provenance_record_id TEXT;
 		DO $$
 		BEGIN
 			IF EXISTS (
@@ -246,6 +259,8 @@ func New(dsn string) *DB {
 			executor         TEXT DEFAULT 'user',
 			chain_depth      INTEGER DEFAULT 0
 		);
+		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS provenance_req_id TEXT;
+		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS provenance_record_id TEXT;
 		CREATE TABLE IF NOT EXISTS new_tools (
 			did             TEXT PRIMARY KEY,
 			name            TEXT,
@@ -281,6 +296,12 @@ func New(dsn string) *DB {
 	}
 
 	// Runtime migrations for existing databases.
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS from_did  TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS from_name TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS from_type TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_did    TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_name   TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_type   TEXT NOT NULL DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS message TEXT DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''`)

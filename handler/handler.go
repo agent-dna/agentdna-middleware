@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -40,6 +41,25 @@ type otpEntry struct {
 const emailWorkers = 5
 const emailQueueSize = 100
 
+// Rubix blockchain transaction endpoints whose responses we capture for provenance.
+const (
+	rubixTxPath        = "/rubix/v1/tx"
+	rubixSignaturePath = "/rubix/v1/signature"
+)
+
+// provenanceCtxKey is a private request-context key type used to carry a value from
+// the request handler (ProxyHandler) to the response hook (captureRubixResponse).
+type provenanceCtxKey string
+
+const (
+	// ctxIntentIDKey carries the intentID generated while handling a /tx intent
+	// workflow so the /tx response hook can attach provenance_req_id to those rows.
+	ctxIntentIDKey provenanceCtxKey = "provenance_intent_id"
+	// ctxSignatureIDKey carries the id from a /signature request body so the
+	// /signature response hook knows which provenance rows to update.
+	ctxSignatureIDKey provenanceCtxKey = "provenance_signature_id"
+)
+
 type Handler struct {
 	db                  *db.DB
 	proxy               *httputil.ReverseProxy
@@ -67,6 +87,8 @@ func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL
 		updateAgentEndpoint: updateAgentEndpoint,
 		emailQueue:          make(chan email.Message, emailQueueSize),
 	}
+	// Capture blockchain transaction provenance from the upstream responses.
+	proxy.ModifyResponse = h.captureRubixResponse
 	if cfg, err := email.LoadConfigFromEnv(); err == nil {
 		h.mailer = email.New(cfg)
 	} else {
@@ -268,13 +290,158 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 				case NFTTypeAgent:
 					h.handleAgentNFT(nftInfo)
 				case NFTTypeIntent:
-					h.handleIntentWorkflow(nftInfo)
+					// Stash the generated intentID so the /tx response hook can attach
+					// provenance_req_id to the interaction rows we just inserted. Harmless
+					// on non-/tx paths — only captureTxResponse (path-gated) reads it.
+					if intentID, wfErr := h.handleIntentWorkflow(nftInfo); wfErr == nil && intentID != "" {
+						r = r.WithContext(context.WithValue(r.Context(), ctxIntentIDKey, intentID))
+					}
 				}
+			}
+		}
+
+		// /rubix/v1/signature carries the /tx provenance id in its request body; stash
+		// it so the response hook knows which provenance rows to update.
+		if r.URL.Path == rubixSignaturePath {
+			var sigReq signatureRequest
+			if jsonErr := json.Unmarshal(bodyBytes, &sigReq); jsonErr == nil && sigReq.ID != "" {
+				fmt.Printf("test-0102 sigReq.ID=%s\n", sigReq.ID)
+				r = r.WithContext(context.WithValue(r.Context(), ctxSignatureIDKey, sigReq.ID))
 			}
 		}
 	}
 
 	h.proxy.ServeHTTP(w, r)
+}
+
+// captureRubixResponse is the proxy ModifyResponse hook. It extracts blockchain
+// transaction provenance from the /tx and /signature responses. It must never return
+// an error: a capture failure is logged and the response passes through untouched.
+func (h *Handler) captureRubixResponse(resp *http.Response) error {
+	switch resp.Request.URL.Path {
+	case rubixTxPath:
+		h.captureTxResponse(resp)
+	case rubixSignaturePath:
+		h.captureSignatureResponse(resp)
+	}
+	return nil
+}
+
+// readAndRestoreBody fully reads resp.Body (so we can parse it) and puts an equivalent
+// reader back so the client still receives the untouched response.
+func readAndRestoreBody(resp *http.Response) ([]byte, error) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	return body, nil
+}
+
+// captureTxResponse handles POST /rubix/v1/tx: it stores result.id as provenance_req_id
+// on the intent's interaction rows, or deletes those rows if the tx failed to initiate.
+func (h *Handler) captureTxResponse(resp *http.Response) {
+	intentID, _ := resp.Request.Context().Value(ctxIntentIDKey).(string)
+	if intentID == "" {
+		return // not an intent-workflow tx we're tracking
+	}
+
+	body, err := readAndRestoreBody(resp)
+	if err != nil {
+		log.Printf("[provenance] tx: read body failed intent_id=%s: %v", intentID, err)
+		return
+	}
+
+	var txResp txResponse
+	if err := json.Unmarshal(body, &txResp); err != nil {
+		log.Printf("[provenance] tx: parse failed intent_id=%s: %v", intentID, err)
+		return
+	}
+
+	// status=false → the transaction failed to initiate; remove the rows we inserted
+	// during request handling. (The new_intents row is left as-is by design.)
+	if !txResp.Status {
+		if err := h.db.DeleteInteractionsByIntent(intentID); err != nil {
+			log.Printf("[provenance] tx: delete failed intent_id=%s: %v", intentID, err)
+		} else {
+			log.Printf("[provenance] tx: status=false, removed interaction rows intent_id=%s", intentID)
+		}
+		return
+	}
+
+	if txResp.Result.ID == "" {
+		log.Printf("[provenance] tx: empty result.id intent_id=%s", intentID)
+		return
+	}
+	if err := h.db.SetProvenanceReqID(intentID, txResp.Result.ID); err != nil {
+		log.Printf("[provenance] tx: set provenance_req_id failed intent_id=%s id=%s: %v", intentID, txResp.Result.ID, err)
+		return
+	}
+	log.Printf("[provenance] tx: intent_id=%s provenance_req_id=%s", intentID, txResp.Result.ID)
+}
+
+// captureSignatureResponse handles POST /rubix/v1/signature: it writes transactionID
+// and the first childNFTId onto the rows previously tagged with provenance_req_id.
+func (h *Handler) captureSignatureResponse(resp *http.Response) {
+	reqID, _ := resp.Request.Context().Value(ctxSignatureIDKey).(string)
+	if reqID == "" {
+		return
+	}
+	log.Printf("test-0101 reqID=%s", reqID)
+
+	body, err := readAndRestoreBody(resp)
+	if err != nil {
+		log.Printf("[provenance] signature: read body failed id=%s: %v", reqID, err)
+		return
+	}
+
+	var sigResp signatureResponse
+	if err := json.Unmarshal(body, &sigResp); err != nil {
+		log.Printf("[provenance] signature: parse failed id=%s: %v", reqID, err)
+		return
+	}
+	if !sigResp.Status {
+		log.Printf("[provenance] signature: status=false id=%s, skipping", reqID)
+		return
+	}
+	if len(sigResp.Result.MintedNFTChildren) == 0 {
+		log.Printf("[provenance] signature: no mintedNFTChildren id=%s", reqID)
+		return
+	}
+
+	if len(sigResp.Result.MintedNFTChildren) == 0 {
+		log.Printf("[provenance] signature: no mintedNFTChildren id=%s", reqID)
+		return
+	}
+
+	childNFTId := sigResp.Result.MintedNFTChildren[0].ChildNFTId
+	transactionID := sigResp.Result.TransactionID
+
+	if childNFTId == "" {
+		log.Printf("[provenance] signature: empty childNFTId id=%s, skipping", reqID)
+		return
+	}
+	if transactionID == "" {
+		log.Printf("[provenance] signature: empty transactionID id=%s, skipping", reqID)
+		return
+	}
+
+	rows, err := h.db.SetProvenanceRecord(reqID, transactionID, childNFTId)
+	if err != nil {
+		log.Printf("[provenance] signature: update failed id=%s: %v", reqID, err)
+		return
+	}
+
+	if rows == 0 {
+		// No matching row — the /tx write likely has not landed yet (or failed). Skip.
+		log.Printf("[provenance] signature: no rows matched provenance_req_id=%s (tx write pending?)", reqID)
+		return
+	}
+	log.Printf("[provenance] signature: updated rows=%d provenance_req_id=%s transactionID=%s childNFTId=%s",
+		rows, reqID, transactionID, childNFTId)
 }
 
 
@@ -300,20 +467,28 @@ func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 	return h.db.StoreNewAgent(nftInfo.NFTId, data.AgentDID, deployer, orgID, data.Policy, agentName)
 }
 
-func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
+// handleIntentWorkflow stores the intent-workflow interactions and returns the
+// generated intentID so the caller can correlate the /tx response for provenance.
+func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	data, err := parseIntentWorkflow(nftInfo.Data)
 	if err != nil {
 		log.Printf("[intentWorkflow] failed to parse nft_id=%s: %v", nftInfo.NFTId, err)
-		return err
+		return "", err
 	}
 	if data.Envelope == nil {
 		log.Printf("[intentWorkflow] envelope is nil nft_id=%s", nftInfo.NFTId)
-		return fmt.Errorf("handleIntentWorkflow: envelope is nil")
+		return "", fmt.Errorf("handleIntentWorkflow: envelope is nil")
 	}
 
 	envelopes := walkEnvelopes(data.Envelope)
 	intentID := uuid.New().String()
 	interactions := extractInteractionsFromEnvelopes(envelopes)
+
+	// Resolve display ames from DB; fall back to envelope name if not found.
+	for i, ix := range interactions {
+		interactions[i].FromName = h.resolveActorName(ix.FromDID, ix.FromName)
+		interactions[i].ToName = h.resolveActorName(ix.ToDID, ix.ToName)
+	}
 
 	log.Printf("[intentWorkflow] parsed ok — envelopes=%d interactions=%d", len(envelopes), len(interactions))
 	for i, ix := range interactions {
@@ -336,7 +511,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 	}
 	if orgID == "" {
 		log.Printf("[intentWorkflow] could not resolve orgID for intent, dropping nft_id=%s", nftInfo.NFTId)
-		return fmt.Errorf("handleIntentWorkflow: could not resolve orgID")
+		return "", fmt.Errorf("handleIntentWorkflow: could not resolve orgID")
 	}
 	log.Printf("[intentWorkflow] orgID=%s intentID=%s", orgID, intentID)
 
@@ -375,9 +550,9 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 		}
 		eventTime := time.Unix(envelopes[idx].Epoch, 0).UTC()
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, eventTime,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, eventTime,
 		); err != nil {
-			return fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
+			return "", fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
 		}
 		if ix.Type == "tool_call" {
 			_ = h.db.StoreNewTool(ix.ToDID, ix.ToName, orgID)
@@ -387,6 +562,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 		for _, iss := range envelopes[idx].Issues {
 			issueReasons = append(issueReasons, iss.Reason)
 		}
+		env := envelopes[idx]
 		blockRec := &db.IntentBlockRecord{
 			ID:             iid,
 			IntentID:       intentID,
@@ -398,6 +574,12 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 			ThreatDetected: ix.Threat,
 			TrustIssues:    issueReasons,
 			CreatedAt:      eventTime,
+			FromDID:        actorDID(env.From),
+			FromName:       env.From.Name,
+			FromType:       env.From.Type,
+			ToDID:          actorDID(env.To),
+			ToName:         env.To.Name,
+			ToType:         env.To.Type,
 		}
 		if err := h.db.StoreIntentBlockData(blockRec); err != nil {
 			log.Printf("[intentWorkflow] block data save error idx=%d: %v", idx, err)
@@ -414,10 +596,10 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) error {
 
 	if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, chainDepth, threatDetected, interactionIDs); err != nil {
 		log.Printf("[intentWorkflow] intent save error: %v", err)
-		return err
+		return "", err
 	}
 	log.Printf("[intentWorkflow] saved intent_id=%s interactions=%d threat=%v flowType=%s", intentID, len(interactionIDs), threatDetected, flowType)
-	return nil
+	return intentID, nil
 }
 
 func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
@@ -503,7 +685,7 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 		iid := fmt.Sprintf("%s-%d", intentID, idx+1)
 		interactionIDs = append(interactionIDs, iid)
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message, time.Time{},
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message, ix.Signature, time.Time{},
 		); err != nil {
 			return fmt.Errorf("handleIntentNFT: StoreNewInteraction: %v", err)
 		}
@@ -584,48 +766,56 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
 		return
 	}
-	type blockOut struct {
-		ID             string   `json:"id"`
-		BlockIndex     int      `json:"block_index"`
-		AgentDID       string   `json:"agent_did"`
-		AgentName      string   `json:"agent_name"`
-		Direction      string   `json:"direction"`
-		BlockType      string   `json:"block_type"`
-		Message        string   `json:"message"`
-		Response       string   `json:"response"`
-		DelegateTo     string   `json:"delegate_to"`
-		ReceivedFrom   string   `json:"received_from"`
-		CbacApp        string   `json:"cbac_app"`
-		CbacDecision   string   `json:"cbac_decision"`
-		ThreatDetected bool     `json:"threat_detected"`
-		TrustIssues    []string `json:"trust_issues"`
-		CreatedAt      string   `json:"created_at"`
+	type blockActor struct {
+		DID  string `json:"did"`
+		Name string `json:"name"`
+		Type string `json:"type"`
 	}
-	out := make([]blockOut, 0, len(blocks))
+	type blockOut struct {
+		ID             string     `json:"id"`
+		BlockIndex     int        `json:"block_index"`
+		BlockType      string     `json:"block_type"`
+		From           blockActor `json:"from"`
+		To             blockActor `json:"to"`
+		Message        string     `json:"message"`
+		Signature      string     `json:"signature"`
+		ThreatDetected bool       `json:"threat_detected"`
+		TrustIssues    []string   `json:"trust_issues"`
+		CreatedAt      string     `json:"created_at"`
+		ParentBlock    *blockOut  `json:"parent_block"`
+	}
+	// Build nested structure: blocks[0] is innermost (no parent), each successive
+	// block wraps the previous as parent_block, outermost (latest) is the root.
+	var root *blockOut
 	for _, b := range blocks {
 		issues := b.TrustIssues
 		if issues == nil {
 			issues = []string{}
 		}
-		out = append(out, blockOut{
-			ID:             b.ID,
-			BlockIndex:     b.BlockIndex,
-			AgentDID:       b.AgentDID,
-			AgentName:      b.AgentName,
-			Direction:      b.Direction,
-			BlockType:      b.BlockType,
+		node := &blockOut{
+			ID:         b.ID,
+			BlockIndex: b.BlockIndex,
+			BlockType:  b.BlockType,
+			From: blockActor{
+				DID:  b.FromDID,
+				Name: b.FromName,
+				Type: b.FromType,
+			},
+			To: blockActor{
+				DID:  b.ToDID,
+				Name: b.ToName,
+				Type: b.ToType,
+			},
 			Message:        b.Message,
-			Response:       b.Response,
-			DelegateTo:     b.DelegateTo,
-			ReceivedFrom:   b.ReceivedFrom,
-			CbacApp:        b.CbacApp,
-			CbacDecision:   b.CbacDecision,
+			Signature:      b.Signature,
 			ThreatDetected: b.ThreatDetected,
 			TrustIssues:    issues,
 			CreatedAt:      b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-		})
+			ParentBlock:    root,
+		}
+		root = node
 	}
-	c.JSON(http.StatusOK, Response{Status: true, Data: out})
+	c.JSON(http.StatusOK, Response{Status: true, Data: root})
 }
 
 func (h *Handler) issueToken(claims JWTClaims) (string, error) {
@@ -1130,6 +1320,36 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 			"page":        page,
 			"pageSize":    pageSize,
 			"totalPages":  (total + pageSize - 1) / pageSize,
+		},
+	})
+}
+
+func (h *Handler) InteractionSeries(c *gin.Context) {
+	orgID := c.GetString(CtxOrgID)
+	rangeParam := c.DefaultQuery("range", "24h")
+	if rangeParam != "24h" && rangeParam != "7d" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "range must be 24h or 7d"})
+		return
+	}
+
+	buckets, err := h.db.GetInteractionSeries(orgID, rangeParam)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to fetch series"})
+		return
+	}
+
+	safe := make([]int, len(buckets))
+	threats := make([]int, len(buckets))
+	for i, b := range buckets {
+		safe[i] = b.Safe
+		threats[i] = b.Threats
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Status: true,
+		Data: gin.H{
+			"safe":    safe,
+			"threats": threats,
 		},
 	})
 }
@@ -1657,60 +1877,60 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 		return
 	}
 
-	type DiagramNode struct {
-		DID             string         `json:"did"`
-		Name            string         `json:"name"`
-		InteractionID   string         `json:"interactionID,omitempty"`
-		InteractionType string         `json:"interactionType,omitempty"`
-		Direction       string         `json:"direction,omitempty"`
-		Threat          bool           `json:"threat"`
-		CreatedAt       string         `json:"created_at"`
-		Children        []*DiagramNode `json:"children"`
+	type interactionOut struct {
+		InteractionID      string `json:"interactionID"`
+		Initiator          string `json:"initiator"`
+		InitiatorName      string `json:"initiatorName"`
+		To                 string `json:"to"`
+		ToName             string `json:"toName"`
+		Type               string `json:"type"`
+		Message            string `json:"message"`
+		IntentID           string `json:"intentID"`
+		Threat             bool   `json:"threat"`
+		Epoch              int64  `json:"epoch"`
+		Signature          string `json:"signature"`
+		ProvenanceReqID    string `json:"provenanceReqID"`
+		ProvenanceRecordID string `json:"provenanceRecordID"`
 	}
 
-	formatTime := func(t time.Time) string {
-		return t.UTC().Format("2006-01-02T15:04:05.000Z")
-	}
-
-	root := &DiagramNode{
-		DID:       intent.InitiatorDID,
-		Name:      intent.InitiatorName,
-		CreatedAt: formatTime(intent.StartedAt),
-		Children:  []*DiagramNode{},
-	}
-
-	// Stack tracks the current path from root to the active node.
-	stack := []*DiagramNode{root}
-
+	list := make([]interactionOut, 0, len(interactions))
 	for _, ix := range interactions {
-		current := stack[len(stack)-1]
+		list = append(list, interactionOut{
+			InteractionID:      ix.InteractionID,
+			Initiator:          ix.From,
+			InitiatorName:      ix.FromName,
+			To:                 ix.To,
+			ToName:             ix.ToName,
+			Type:               ix.Type,
+			Message:            ix.Message,
+			IntentID:           ix.IntentID,
+			Threat:             ix.Threat,
+			Epoch:              ix.Time.Unix(),
+			Signature:          ix.Signature,
+			ProvenanceReqID:    ix.ProvenanceReqID,
+			ProvenanceRecordID: ix.ProvenanceRecordID,
+		})
+	}
 
-		if ix.Direction == "outbound" {
-			child := &DiagramNode{
-				DID:             ix.To,
-				Name:            ix.ToName,
-				InteractionID:   ix.InteractionID,
-				InteractionType: ix.Type,
-				Direction:       ix.Direction,
-				Threat:          ix.Threat,
-				CreatedAt:       formatTime(ix.Time),
-				Children:        []*DiagramNode{},
-			}
-			current.Children = append(current.Children, child)
-			stack = append(stack, child)
-		} else {
-			// inbound — pop back up, but keep at least root on the stack
-			if len(stack) > 1 {
-				stack = stack[:len(stack)-1]
-			}
-		}
+	basicInfo := gin.H{
+		"intentID":          intent.IntentID,
+		"initiatorDID":      intent.InitiatorDID,
+		"initiatorName":     intent.InitiatorName,
+		"flowType":          intent.FlowType,
+		"status":            intent.Status,
+		"threatDetected":    intent.ThreatDetected,
+		"chainDepth":        intent.ChainDepth,
+		"interactionsCount": intent.InteractionsCount,
+		"agentsCount":       intent.AgentsCount,
+		"toolsCount":        intent.ToolsCount,
+		"startedAt":         intent.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"intentID": intentID,
-			"diagram":  root,
+			"basicInfo":    basicInfo,
+			"interactions": list,
 		},
 	})
 }
@@ -1784,19 +2004,26 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		return
 	}
 
+	provenanceRecordID := ""
 	txns := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
+		if provenanceRecordID == "" && i.ProvenanceRecordID != "" {
+			provenanceRecordID = i.ProvenanceRecordID
+		}
 		txns = append(txns, gin.H{
-			"interactionID": i.InteractionID,
-			"from":          i.From,
-			"fromName":      i.FromName,
-			"to":            i.To,
-			"toName":        i.ToName,
-			"type":          i.Type,
-			"direction":     i.Direction,
-			"threat":        i.Threat,
-			"time":          i.Time,
-			"message":       i.Message,
+			"interactionID":      i.InteractionID,
+			"from":               i.From,
+			"fromName":           i.FromName,
+			"to":                 i.To,
+			"toName":             i.ToName,
+			"type":               i.Type,
+			"direction":          i.Direction,
+			"threat":             i.Threat,
+			"time":               i.Time,
+			"message":            i.Message,
+			"signature":          i.Signature,
+			"provenanceReqID":    i.ProvenanceReqID,
+			"provenanceRecordID": i.ProvenanceRecordID,
 		})
 	}
 
@@ -1816,6 +2043,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"firstInteractionAt": intent.FirstInteractionAt,
 		"lastInteractionAt":  intent.LastInteractionAt,
 		"runtimeSeconds":     intent.RuntimeSeconds,
+		"provenanceRecordID": provenanceRecordID,
 		"interactions":       txns,
 	}
 	if intent.EndedAt != nil {

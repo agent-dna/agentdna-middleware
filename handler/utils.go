@@ -65,22 +65,33 @@ func walkEnvelopes(root *workflowEnvelope) []*workflowEnvelope {
 	return envs
 }
 
+// actorDID returns the actor's DID, falling back to the actor's name when the DID is absent.
+func actorDID(a workflowActor) string {
+	if a.ID != "" {
+		return a.ID
+	}
+	return a.Name
+}
+
 // extractInteractionsFromEnvelopes maps each envelope directly to one interaction hop.
 // Type is derived from actor types and position in chain (no direction field needed).
 func extractInteractionsFromEnvelopes(envs []*workflowEnvelope) []interactionExtract {
 	seenAsFrom := map[string]bool{}
 	var result []interactionExtract
 	for _, e := range envs {
+		fromDID := actorDID(e.From)
+		toDID := actorDID(e.To)
 		result = append(result, interactionExtract{
-			FromDID:  e.From.ID,
-			FromName: e.From.Name,
-			ToDID:    e.To.ID,
-			ToName:   e.To.Name,
-			Type:     deriveWorkflowInteractionType(e, seenAsFrom),
-			Threat:   len(e.Issues) > 0,
-			Message:  e.Payload,
+			FromDID:   fromDID,
+			FromName:  e.From.Name,
+			ToDID:     toDID,
+			ToName:    e.To.Name,
+			Type:      deriveWorkflowInteractionType(e, seenAsFrom),
+			Threat:    len(e.Issues) > 0,
+			Message:   e.Payload,
+			Signature: e.Signature,
 		})
-		seenAsFrom[e.From.ID] = true
+		seenAsFrom[fromDID] = true
 	}
 	return result
 }
@@ -92,11 +103,16 @@ func deriveWorkflowInteractionType(e *workflowEnvelope, seenAsFrom map[string]bo
 	if e.To.Type == "app" {
 		return "tool_call"
 	}
-	if e.From.ID == e.To.ID {
+	if e.From.Type == "app" {
+		return "tool_response"
+	}
+	fromDID := actorDID(e.From)
+	toDID := actorDID(e.To)
+	if fromDID == toDID {
 		return "tool_response"
 	}
 	// agent→agent: if the destination was already a sender earlier, we're going back up
-	if seenAsFrom[e.To.ID] {
+	if seenAsFrom[toDID] {
 		return "response"
 	}
 	return "delegate"
@@ -283,4 +299,20 @@ func extractInteractions(blocks []*chainBlock) []interactionExtract {
 	}
 
 	return result
+}
+
+// resolveActorName looks up a display name for the given DID from the agents
+// table first, then the users table. Falls back to the envelope-provided name
+// if neither has a record or the DID is empty.
+func (h *Handler) resolveActorName(did, fallback string) string {
+	if did == "" || did == "none" {
+		return fallback
+	}
+	if agent, err := h.db.GetAgentInfo(did); err == nil && agent.AgentName != "" {
+		return agent.AgentName
+	}
+	if name, err := h.db.GetOrgUserNameByDID(did); err == nil && name != "" {
+		return name
+	}
+	return fallback
 }

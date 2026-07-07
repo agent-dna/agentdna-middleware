@@ -49,6 +49,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/intent-list", h.IntentList)
 	dashboard.GET("/threats-list", h.ThreatsList)
 	dashboard.GET("/top-threat-agents", h.TopThreatAgents)
+	dashboard.GET("/interactions/series", h.InteractionSeries)
 
 	dashboard.GET("/agents-creation-requests-list", h.AgentsCreationRequestsList)
 	dashboard.GET("/agents-creation-requests-list-user", h.AgentsCreationRequestsListUser)
