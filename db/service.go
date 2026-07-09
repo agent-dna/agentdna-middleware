@@ -1836,6 +1836,84 @@ func (d *DB) GetInteractionSeries(orgID, rangeParam string) ([]InteractionSeries
 	return buckets, rows.Err()
 }
 
+type AgentsAppsMetrics struct {
+	TopAgents        []*AgentVolumeRecord
+	TopApps          []*ToolRecord
+	TotalInteractions int
+	TotalThreats      int
+	TotalAgents       int
+	TotalApps         int
+	AvgReliability    float64
+}
+
+func (d *DB) GetAgentsAppsMetrics(orgID string) (*AgentsAppsMetrics, error) {
+	out := &AgentsAppsMetrics{}
+
+	// Top 5 agents by interaction volume.
+	agentRows, err := d.GetTopAgentsByOrg(orgID, 5, 0)
+	if err != nil {
+		return nil, err
+	}
+	out.TopAgents = agentRows
+
+	// Top 5 apps by interaction volume.
+	appRows, err := d.GetToolsByOrg(orgID, 5, 0)
+	if err != nil {
+		return nil, err
+	}
+	out.TopApps = appRows
+
+	// Aggregate counts.
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_interactions WHERE organization_id = $1`, orgID,
+	).Scan(&out.TotalInteractions); err != nil {
+		return nil, err
+	}
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_interactions WHERE organization_id = $1 AND threat = 1`, orgID,
+	).Scan(&out.TotalThreats); err != nil {
+		return nil, err
+	}
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_agents WHERE organization_id = $1`, orgID,
+	).Scan(&out.TotalAgents); err != nil {
+		return nil, err
+	}
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(DISTINCT t.did) FROM new_tools t
+		 INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1`,
+		orgID,
+	).Scan(&out.TotalApps); err != nil {
+		return nil, err
+	}
+
+	// Average reliability across all agents: AVG(1 - threats/interactions) * 100.
+	// Agents with zero interactions are treated as 100% reliable.
+	if err := d.conn.QueryRow(`
+		SELECT COALESCE(AVG(
+			CASE
+				WHEN total_interactions = 0 THEN 100.0
+				ELSE ROUND(CAST((1.0 - total_threats * 1.0 / total_interactions) * 100 AS NUMERIC), 2)
+			END
+		), 100.0)
+		FROM (
+			SELECT
+				COUNT(i.interaction_id)                        AS total_interactions,
+				SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) AS total_threats
+			FROM new_agents a
+			LEFT JOIN new_interactions i
+			       ON i.initiator_did = a.did AND i.organization_id = $1
+			WHERE a.organization_id = $1
+			GROUP BY a.did
+		) agent_stats`,
+		orgID,
+	).Scan(&out.AvgReliability); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
 func (d *DB) Search(q, orgID string) (*SearchResults, error) {
 	out := &SearchResults{
 		Agents:  []SearchAgentResult{},

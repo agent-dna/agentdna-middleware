@@ -1318,6 +1318,66 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 	})
 }
 
+func (h *Handler) AgentsAppsMetrics(c *gin.Context) {
+	w := http.ResponseWriter(c.Writer)
+	enableCors(&w)
+
+	orgID := c.GetString(CtxOrgID)
+	if orgID == "" {
+		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
+		return
+	}
+
+	data, err := h.db.GetAgentsAppsMetrics(orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
+		return
+	}
+
+	type agentOut struct {
+		Name              string `json:"name"`
+		TotalInteractions int    `json:"totalInteractions"`
+		TotalThreats      int    `json:"totalThreats"`
+	}
+	type appOut struct {
+		Name              string `json:"name"`
+		TotalInteractions int    `json:"totalInteractions"`
+		TotalThreats      int    `json:"totalThreats"`
+	}
+
+	agents := make([]agentOut, 0, len(data.TopAgents))
+	for _, a := range data.TopAgents {
+		agents = append(agents, agentOut{
+			Name:              a.AgentName,
+			TotalInteractions: a.TotalInteractions,
+			TotalThreats:      a.TotalThreats,
+		})
+	}
+	apps := make([]appOut, 0, len(data.TopApps))
+	for _, a := range data.TopApps {
+		apps = append(apps, appOut{
+			Name:              a.Name,
+			TotalInteractions: a.TotalInteractions,
+			TotalThreats:      a.TotalThreats,
+		})
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Status: true,
+		Data: gin.H{
+			"topAgents": agents,
+			"topApps":   apps,
+			"metrics": gin.H{
+				"totalInteractions": data.TotalInteractions,
+				"totalThreats":      data.TotalThreats,
+				"totalAgents":       data.TotalAgents,
+				"totalApps":         data.TotalApps,
+				"avgReliability":    data.AvgReliability,
+			},
+		},
+	})
+}
+
 func (h *Handler) Search(c *gin.Context) {
 	w := http.ResponseWriter(c.Writer)
 	enableCors(&w)
