@@ -1835,3 +1835,81 @@ func (d *DB) GetInteractionSeries(orgID, rangeParam string) ([]InteractionSeries
 	}
 	return buckets, rows.Err()
 }
+
+func (d *DB) Search(q, orgID string) (*SearchResults, error) {
+	out := &SearchResults{
+		Agents:  []SearchAgentResult{},
+		Apps:    []SearchAppResult{},
+		Intents: []SearchIntentResult{},
+	}
+	pattern := "%" + q + "%"
+
+	// Agents — match name or DID, scoped to org.
+	agentRows, err := d.conn.Query(`
+		SELECT did, COALESCE(name,''), organization_id
+		FROM new_agents
+		WHERE organization_id = $1
+		  AND (name ILIKE $2 OR did ILIKE $2)
+		ORDER BY name ASC
+		LIMIT 20`,
+		orgID, pattern,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer agentRows.Close()
+	for agentRows.Next() {
+		var r SearchAgentResult
+		if err := agentRows.Scan(&r.DID, &r.Name, &r.OrgID); err != nil {
+			return nil, err
+		}
+		out.Agents = append(out.Agents, r)
+	}
+
+	// Apps/tools — match name, scoped to org.
+	appRows, err := d.conn.Query(`
+		SELECT did, COALESCE(name,'')
+		FROM new_tools
+		WHERE organization_id = $1
+		  AND name ILIKE $2
+		ORDER BY name ASC
+		LIMIT 20`,
+		orgID, pattern,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer appRows.Close()
+	for appRows.Next() {
+		var r SearchAppResult
+		if err := appRows.Scan(&r.DID, &r.Name); err != nil {
+			return nil, err
+		}
+		out.Apps = append(out.Apps, r)
+	}
+
+	// Intents — exact match on intent_id, scoped to org.
+	intentRows, err := d.conn.Query(`
+		SELECT intent_id, COALESCE(flow_type,''), COALESCE(status,''), threat_detected, started_at
+		FROM new_intents
+		WHERE organization_id = $1
+		  AND intent_id = $2
+		LIMIT 5`,
+		orgID, q,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer intentRows.Close()
+	for intentRows.Next() {
+		var r SearchIntentResult
+		var threatInt int
+		if err := intentRows.Scan(&r.IntentID, &r.FlowType, &r.Status, &threatInt, &r.StartedAt); err != nil {
+			return nil, err
+		}
+		r.ThreatDetected = threatInt == 1
+		out.Intents = append(out.Intents, r)
+	}
+
+	return out, nil
+}

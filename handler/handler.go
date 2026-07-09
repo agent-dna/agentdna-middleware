@@ -1113,12 +1113,6 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 		return
 	}
 
-	page := 1
-	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
-		page = p
-	}
-	offset := (page - 1) * 5
-
 	isAdmin := c.GetBool(CtxIsAdmin)
 	userDID := c.GetString(CtxDID)
 
@@ -1132,14 +1126,14 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
 			return
 		}
-		agents, err = h.db.GetTopAgentsByOrg(orgID, 5, offset)
+		agents, err = h.db.GetTopAgentsByOrg(orgID, 5, 0)
 	} else {
 		metrics, err = h.db.GetUserMetrics(userDID, orgID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
 			return
 		}
-		agents, err = h.db.GetTopAgentsByUser(userDID, orgID, 5, offset)
+		agents, err = h.db.GetTopAgentsByUser(userDID, orgID, 5, 0)
 	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch agents: %v", err)})
@@ -1164,7 +1158,7 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 			"interactionsCount": metrics.InteractionsCount,
 			"threatCount":       metrics.ThreatCount,
 			"agentList":         agentList,
-			"page":              page,
+			"flowEnabled":       metrics.AgentCount > 0,
 		},
 	})
 }
@@ -1320,6 +1314,69 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 			"page":        page,
 			"pageSize":    pageSize,
 			"totalPages":  (total + pageSize - 1) / pageSize,
+		},
+	})
+}
+
+func (h *Handler) Search(c *gin.Context) {
+	w := http.ResponseWriter(c.Writer)
+	enableCors(&w)
+
+	q := strings.TrimSpace(c.Query("q"))
+	if q == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "q is required"})
+		return
+	}
+
+	orgID := c.GetString(CtxOrgID)
+	results, err := h.db.Search(q, orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
+		return
+	}
+
+	type agentOut struct {
+		DID   string `json:"did"`
+		Name  string `json:"name"`
+		OrgID string `json:"orgID"`
+	}
+	type appOut struct {
+		DID  string `json:"did"`
+		Name string `json:"name"`
+	}
+	type intentOut struct {
+		IntentID       string `json:"intentID"`
+		FlowType       string `json:"flowType"`
+		Status         string `json:"status"`
+		ThreatDetected bool   `json:"threatDetected"`
+		StartedAt      string `json:"startedAt"`
+	}
+
+	agents := make([]agentOut, 0, len(results.Agents))
+	for _, a := range results.Agents {
+		agents = append(agents, agentOut{DID: a.DID, Name: a.Name, OrgID: a.OrgID})
+	}
+	apps := make([]appOut, 0, len(results.Apps))
+	for _, a := range results.Apps {
+		apps = append(apps, appOut{DID: a.DID, Name: a.Name})
+	}
+	intents := make([]intentOut, 0, len(results.Intents))
+	for _, i := range results.Intents {
+		intents = append(intents, intentOut{
+			IntentID:       i.IntentID,
+			FlowType:       i.FlowType,
+			Status:         i.Status,
+			ThreatDetected: i.ThreatDetected,
+			StartedAt:      i.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+		})
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Status: true,
+		Data: gin.H{
+			"agents":  agents,
+			"apps":    apps,
+			"intents": intents,
 		},
 	})
 }

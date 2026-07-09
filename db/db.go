@@ -103,6 +103,31 @@ type ToolRecord struct {
 	Score             float64
 }
 
+type SearchAgentResult struct {
+	DID   string
+	Name  string
+	OrgID string
+}
+
+type SearchAppResult struct {
+	DID  string
+	Name string
+}
+
+type SearchIntentResult struct {
+	IntentID       string
+	FlowType       string
+	Status         string
+	ThreatDetected bool
+	StartedAt      time.Time
+}
+
+type SearchResults struct {
+	Agents  []SearchAgentResult
+	Apps    []SearchAppResult
+	Intents []SearchIntentResult
+}
+
 type AgentVolumeRecord struct {
 	AgentDID          string
 	AgentNFTID        string
