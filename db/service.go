@@ -1835,3 +1835,159 @@ func (d *DB) GetInteractionSeries(orgID, rangeParam string) ([]InteractionSeries
 	}
 	return buckets, rows.Err()
 }
+
+type AgentsAppsMetrics struct {
+	TopAgents        []*AgentVolumeRecord
+	TopApps          []*ToolRecord
+	TotalInteractions int
+	TotalThreats      int
+	TotalAgents       int
+	TotalApps         int
+	AvgReliability    float64
+}
+
+func (d *DB) GetAgentsAppsMetrics(orgID string) (*AgentsAppsMetrics, error) {
+	out := &AgentsAppsMetrics{}
+
+	// Top 5 agents by interaction volume.
+	agentRows, err := d.GetTopAgentsByOrg(orgID, 5, 0)
+	if err != nil {
+		return nil, err
+	}
+	out.TopAgents = agentRows
+
+	// Top 5 apps by interaction volume.
+	appRows, err := d.GetToolsByOrg(orgID, 5, 0)
+	if err != nil {
+		return nil, err
+	}
+	out.TopApps = appRows
+
+	// Aggregate counts.
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_interactions WHERE organization_id = $1`, orgID,
+	).Scan(&out.TotalInteractions); err != nil {
+		return nil, err
+	}
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_interactions WHERE organization_id = $1 AND threat = 1`, orgID,
+	).Scan(&out.TotalThreats); err != nil {
+		return nil, err
+	}
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_agents WHERE organization_id = $1`, orgID,
+	).Scan(&out.TotalAgents); err != nil {
+		return nil, err
+	}
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(DISTINCT t.did) FROM new_tools t
+		 INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1`,
+		orgID,
+	).Scan(&out.TotalApps); err != nil {
+		return nil, err
+	}
+
+	// Average reliability across all agents: AVG(1 - threats/interactions) * 100.
+	// Agents with zero interactions are treated as 100% reliable.
+	if err := d.conn.QueryRow(`
+		SELECT COALESCE(AVG(
+			CASE
+				WHEN total_interactions = 0 THEN 100.0
+				ELSE ROUND(CAST((1.0 - total_threats * 1.0 / total_interactions) * 100 AS NUMERIC), 2)
+			END
+		), 100.0)
+		FROM (
+			SELECT
+				COUNT(i.interaction_id)                        AS total_interactions,
+				SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) AS total_threats
+			FROM new_agents a
+			LEFT JOIN new_interactions i
+			       ON i.initiator_did = a.did AND i.organization_id = $1
+			WHERE a.organization_id = $1
+			GROUP BY a.did
+		) agent_stats`,
+		orgID,
+	).Scan(&out.AvgReliability); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+func (d *DB) Search(q, orgID string) (*SearchResults, error) {
+	out := &SearchResults{
+		Agents:  []SearchAgentResult{},
+		Apps:    []SearchAppResult{},
+		Intents: []SearchIntentResult{},
+	}
+	pattern := "%" + q + "%"
+
+	// Agents — match name or DID, scoped to org.
+	agentRows, err := d.conn.Query(`
+		SELECT did, COALESCE(name,''), organization_id
+		FROM new_agents
+		WHERE organization_id = $1
+		  AND (name ILIKE $2 OR did ILIKE $2)
+		ORDER BY name ASC
+		LIMIT 20`,
+		orgID, pattern,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer agentRows.Close()
+	for agentRows.Next() {
+		var r SearchAgentResult
+		if err := agentRows.Scan(&r.DID, &r.Name, &r.OrgID); err != nil {
+			return nil, err
+		}
+		out.Agents = append(out.Agents, r)
+	}
+
+	// Apps/tools — match name, scoped to org.
+	appRows, err := d.conn.Query(`
+		SELECT did, COALESCE(name,'')
+		FROM new_tools
+		WHERE organization_id = $1
+		  AND name ILIKE $2
+		ORDER BY name ASC
+		LIMIT 20`,
+		orgID, pattern,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer appRows.Close()
+	for appRows.Next() {
+		var r SearchAppResult
+		if err := appRows.Scan(&r.DID, &r.Name); err != nil {
+			return nil, err
+		}
+		out.Apps = append(out.Apps, r)
+	}
+
+	// Intents — exact match on intent_id, scoped to org.
+	intentRows, err := d.conn.Query(`
+		SELECT intent_id, COALESCE(flow_type,''), COALESCE(status,''), threat_detected, started_at
+		FROM new_intents
+		WHERE organization_id = $1
+		  AND intent_id = $2
+		LIMIT 5`,
+		orgID, q,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer intentRows.Close()
+	for intentRows.Next() {
+		var r SearchIntentResult
+		var threatInt int
+		if err := intentRows.Scan(&r.IntentID, &r.FlowType, &r.Status, &threatInt, &r.StartedAt); err != nil {
+			return nil, err
+		}
+		r.ThreatDetected = threatInt == 1
+		out.Intents = append(out.Intents, r)
+	}
+
+	return out, nil
+}
