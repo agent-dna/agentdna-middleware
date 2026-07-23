@@ -2224,54 +2224,77 @@ func (h *Handler) ToolsList(c *gin.Context) {
 }
 
 func (h *Handler) ToolInfo(c *gin.Context) {
-	toolDID := c.Query("toolDID")
 	w := http.ResponseWriter(c.Writer)
 	enableCors(&w)
 
 	orgID := c.GetString(CtxOrgID)
-	if toolDID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "toolDID is required"})
+
+	// Accept either ?toolDID= or ?name= — whichever is provided.
+	query := c.Query("toolDID")
+	if query == "" {
+		query = c.Query("name")
+	}
+	if query == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "toolDID or name is required"})
 		return
 	}
 
-	tool, err := h.db.GetToolInfo(toolDID, orgID)
+	tool, err := h.db.GetToolByNameOrDID(query, orgID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "tool not found"})
 		return
 	}
 
 	const pageSize = 10
-	page := 1
-	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
-		page = p
-	}
-	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountInteractionsByTool(toolDID, orgID)
+	interactionsPage := 1
+	if p, err := strconv.Atoi(c.Query("interactionsPage")); err == nil && p > 0 {
+		interactionsPage = p
+	}
+	intentsPage := 1
+	if p, err := strconv.Atoi(c.Query("intentsPage")); err == nil && p > 0 {
+		intentsPage = p
+	}
+
+	// Interactions
+	totalInteractions, err := h.db.CountInteractionsByTool(tool.DID, orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count interactions: %v", err)})
 		return
 	}
-
-	interactions, err := h.db.GetInteractionsByTool(toolDID, orgID, pageSize, offset)
+	interactions, err := h.db.GetInteractionsByTool(tool.DID, orgID, pageSize, (interactionsPage-1)*pageSize)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch interactions: %v", err)})
 		return
 	}
-
-	list := make([]gin.H, 0, len(interactions))
+	interactionList := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
-		list = append(list, gin.H{
-			"interactionID": i.InteractionID,
-			"from":          i.From,
-			"fromName":      i.FromName,
-			"type":          i.Type,
-			"direction":     i.Direction,
-			"threat":        i.Threat,
-			"intentID":      i.IntentID,
-			"time":          i.Time,
-			"message":       i.Message,
+		interactionList = append(interactionList, gin.H{
+			"interactionID":      i.InteractionID,
+			"from":               i.From,
+			"fromName":           i.FromName,
+			"to":                 i.To,
+			"toName":             i.ToName,
+			"type":               i.Type,
+			"threat":             i.Threat,
+			"intentID":           i.IntentID,
+			"message":            i.Message,
+			"signature":          i.Signature,
+			"provenanceRecordID": i.ProvenanceRecordID,
+			"time":               i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
+	}
+
+	// Intents
+	totalIntents, err := h.db.CountIntentsByTool(tool.DID, orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count intents: %v", err)})
+		return
+	}
+	intents, err := h.db.GetIntentsByTool(tool.DID, orgID, pageSize, (intentsPage-1)*pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch intents: %v", err)})
+		return
 	}
 
 	c.JSON(http.StatusOK, Response{
@@ -2282,12 +2305,23 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 			"totalInteractions": tool.TotalInteractions,
 			"totalThreats":      tool.TotalThreats,
 			"totalIntents":      tool.TotalIntents,
+			"totalAgents":       tool.TotalAgents,
 			"score":             tool.Score,
-			"interactions":      list,
-			"total":             total,
-			"page":              page,
-			"pageSize":          pageSize,
-			"totalPages":        (total + pageSize - 1) / pageSize,
+			"lastInteractedAt":  tool.LastInteractedAt,
+			"interactions": gin.H{
+				"list":       interactionList,
+				"total":      totalInteractions,
+				"page":       interactionsPage,
+				"pageSize":   pageSize,
+				"totalPages": (totalInteractions + pageSize - 1) / pageSize,
+			},
+			"intents": gin.H{
+				"list":       buildIntentList(intents),
+				"total":      totalIntents,
+				"page":       intentsPage,
+				"pageSize":   pageSize,
+				"totalPages": (totalIntents + pageSize - 1) / pageSize,
+			},
 		},
 	})
 }

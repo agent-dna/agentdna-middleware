@@ -1558,6 +1558,116 @@ func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, err
 	return scanInteractionNewRows(rows)
 }
 
+func (d *DB) GetToolByNameOrDID(query, orgID string) (*ToolRecord, error) {
+	r := &ToolRecord{}
+	var lastAt sql.NullTime
+	err := d.conn.QueryRow(`
+		SELECT
+			t.did,
+			t.name,
+			COUNT(i.interaction_id)                                                     AS total_interactions,
+			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                              AS total_threats,
+			COUNT(DISTINCT i.intent_id)                                                 AS total_intents,
+			COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.initiator_did END)        AS total_agents,
+			CASE
+				WHEN COUNT(i.interaction_id) = 0 THEN 100.0
+				ELSE ROUND(CAST(
+					(1.0 - SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) * 1.0
+					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
+			END AS score,
+			MAX(i.time) AS last_interacted_at
+		FROM new_tools t
+		LEFT JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1
+		LEFT JOIN new_agents a ON a.did = i.initiator_did
+		WHERE t.organization_id = $1
+		  AND (t.did = $2 OR t.name = $2)
+		GROUP BY t.did, t.name
+		LIMIT 1`,
+		orgID, query,
+	).Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.TotalAgents, &r.Score, &lastAt)
+	if err != nil {
+		return nil, err
+	}
+	if lastAt.Valid {
+		r.LastInteractedAt = &lastAt.Time
+	}
+	return r, nil
+}
+
+func (d *DB) CountIntentsByTool(toolDID, orgID string) (int, error) {
+	var total int
+	err := d.conn.QueryRow(`
+		SELECT COUNT(DISTINCT ni.intent_id)
+		FROM new_intents ni
+		JOIN new_interactions i ON i.intent_id = ni.intent_id
+		WHERE i.interacted_to_did = $1 AND ni.organization_id = $2`,
+		toolDID, orgID,
+	).Scan(&total)
+	return total, err
+}
+
+func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
+	rows, err := d.conn.Query(`
+		SELECT ni.intent_id, ni.initiator_did,
+		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
+		       COALESCE(ni.organization_id, ''),
+		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
+		       COUNT(ix.interaction_id)                                                 AS interactions_count,
+		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN ix.interacted_to_did END) AS agents_count,
+		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN ix.interacted_to_did END) AS tools_count,
+		       SUM(CASE WHEN ix.threat = 1 THEN 1 ELSE 0 END)                           AS threat_count,
+		       MIN(ix.time)                                                              AS first_interaction_at,
+		       MAX(ix.time)                                                              AS last_interaction_at
+		FROM new_intents ni
+		JOIN new_interactions tool_ix ON tool_ix.intent_id = ni.intent_id AND tool_ix.interacted_to_did = $1
+		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
+		LEFT JOIN new_interactions ix ON ix.intent_id = ni.intent_id
+		LEFT JOIN new_agents a ON a.did = ix.interacted_to_did
+		LEFT JOIN new_tools t ON t.did = ix.interacted_to_did
+		WHERE ni.organization_id = $2
+		GROUP BY ni.intent_id, u.name, ag_init.name
+		ORDER BY ni.started_at DESC
+		LIMIT $3 OFFSET $4`,
+		toolDID, orgID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*IntentRecord
+	for rows.Next() {
+		r := &IntentRecord{}
+		var endedAt, firstAt, lastAt sql.NullTime
+		var threatInt int
+		if err := rows.Scan(
+			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
+			&r.StartedAt, &endedAt, &r.Status, &threatInt,
+			&r.FlowType, &r.Executor, &r.ChainDepth,
+			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
+			&firstAt, &lastAt,
+		); err != nil {
+			return nil, err
+		}
+		r.ThreatDetected = threatInt == 1
+		if endedAt.Valid {
+			r.EndedAt = &endedAt.Time
+		}
+		if firstAt.Valid {
+			r.FirstInteractionAt = &firstAt.Time
+		}
+		if lastAt.Valid {
+			r.LastInteractionAt = &lastAt.Time
+			if firstAt.Valid {
+				r.RuntimeSeconds = lastAt.Time.Sub(firstAt.Time).Seconds()
+			}
+		}
+		result = append(result, r)
+	}
+	return result, nil
+}
+
 func (d *DB) StoreNewTool(did, name, orgID string) error {
 	_, err := d.conn.Exec(
 		`INSERT INTO new_tools (did, name, organization_id) VALUES ($1, $2, $3) ON CONFLICT (did) DO NOTHING`,
@@ -1581,17 +1691,19 @@ func (d *DB) GetToolsByOrg(orgID string, limit, offset int) ([]*ToolRecord, erro
 		SELECT
 			t.did,
 			t.name,
-			COUNT(i.interaction_id)                          AS total_interactions,
-			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)   AS total_threats,
-			COUNT(DISTINCT i.intent_id)                      AS total_intents,
+			COUNT(i.interaction_id)                                                     AS total_interactions,
+			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                              AS total_threats,
+			COUNT(DISTINCT i.intent_id)                                                 AS total_intents,
+			COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.initiator_did END)        AS total_agents,
 			CASE
 				WHEN COUNT(i.interaction_id) = 0 THEN 100.0
 				ELSE ROUND(CAST(
 					(1.0 - SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) * 1.0
 					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
-			END                                              AS score
+			END                                                                         AS score
 		FROM new_tools t
 		INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1
+		LEFT JOIN new_agents a ON a.did = i.initiator_did
 		GROUP BY t.did, t.name
 		ORDER BY total_interactions DESC
 		LIMIT $2 OFFSET $3`,
@@ -1610,21 +1722,23 @@ func (d *DB) GetToolInfo(toolDID, orgID string) (*ToolRecord, error) {
 		SELECT
 			t.did,
 			t.name,
-			COUNT(i.interaction_id)                          AS total_interactions,
-			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)   AS total_threats,
-			COUNT(DISTINCT i.intent_id)                      AS total_intents,
+			COUNT(i.interaction_id)                                                     AS total_interactions,
+			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                              AS total_threats,
+			COUNT(DISTINCT i.intent_id)                                                 AS total_intents,
+			COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.initiator_did END)        AS total_agents,
 			CASE
 				WHEN COUNT(i.interaction_id) = 0 THEN 100.0
 				ELSE ROUND(CAST(
 					(1.0 - SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) * 1.0
 					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
-			END                                              AS score
+			END                                                                         AS score
 		FROM new_tools t
 		LEFT JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1
+		LEFT JOIN new_agents a ON a.did = i.initiator_did
 		WHERE t.did = $2
 		GROUP BY t.did, t.name`,
 		orgID, toolDID,
-	).Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.Score)
+	).Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.TotalAgents, &r.Score)
 	if err != nil {
 		return nil, err
 	}
@@ -1664,7 +1778,7 @@ func scanToolRows(rows *sql.Rows) ([]*ToolRecord, error) {
 	var result []*ToolRecord
 	for rows.Next() {
 		r := &ToolRecord{}
-		if err := rows.Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.Score); err != nil {
+		if err := rows.Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.TotalAgents, &r.Score); err != nil {
 			return nil, err
 		}
 		result = append(result, r)

@@ -18,24 +18,25 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	public.POST("/reset-password", h.ResetPassword)
 	public.POST("/register-user", h.RegisterUser)
 	public.POST("/signup", h.Signup)
-	public.POST("/create-admin", h.CreateAdmin)
-	public.POST("/register-admin", h.RegisterAdminMiddleware)
+
+	// public.POST("/create-admin", h.CreateAdmin)
+	// public.POST("/register-admin", h.RegisterAdminMiddleware)
 
 	// CBAC authorization gate — called by the agent runtime / SDK.
 	public.POST("/authorize-action", h.AuthorizeAction)
-
 	public.GET("/global-stats", h.GlobalStats)
 
 	// Dashboard — JWT protected
 	dashboard := r.Group("/dashboard/v1", h.JWTAuthMiddleware())
-	dashboard.GET("/user-profile", h.UserProfile)
-	dashboard.GET("/admin-profile", h.AdminProfile)
+	dashboard.GET("/user-profile", h.UserProfile) 
+	dashboard.GET("/admin-profile", h.AdminProfile) 
+
 	dashboard.GET("/home-metrics", h.HomeMetrics)
 	dashboard.GET("/interactions-list", h.InteractionsList)
-	dashboard.GET("/agent-metrics", h.AgentMetrics)
+	dashboard.GET("/agent-metrics", h.AgentMetrics) 
+
 	dashboard.GET("/agents-list", h.AgentsList)
-	dashboard.GET("/users-list", h.UsersList)
-	dashboard.GET("/search-user", h.SearchUser)
+	dashboard.GET("/users-list", h.UsersList) 
 	dashboard.POST("/create-user", h.CreateUser)
 	dashboard.GET("/agent-interactions", h.AgentInteractions)
 	dashboard.GET("/agent-intents", h.AgentIntents)
@@ -59,7 +60,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.POST("/agents-creation-requests-edit", h.AgentsCreationRequestsEdit)
 
 	dashboard.POST("/agent-creation-request-result-submit", h.AgentCreationRequestSubmit)
-	dashboard.POST("/agent-info-edit", h.AgentInfoEdit)
+	dashboard.POST("/agent-info-edit", h.AgentInfoEdit) 
 
 	dashboard.GET("/agent-access-requests-list-org", h.AgentAccessRequestsListOrg)
 	dashboard.GET("/agent-access-requests-list-user", h.AgentAccessRequestsListUser)

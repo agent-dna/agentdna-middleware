@@ -97,7 +97,6 @@ func (h *Handler) CoreRegisterAgent(c *gin.Context) {
 		}
 	}
 	
-
 	if agentID != "" {
 		if exists, err := h.db.ActiveRequestExistsForAgent(agentID); err != nil {
 			log.Printf("[CoreRegisterAgent] ActiveRequestExistsForAgent check failed agentID=%q err=%v", agentID, err)

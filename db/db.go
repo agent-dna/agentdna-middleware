@@ -100,7 +100,9 @@ type ToolRecord struct {
 	TotalInteractions int
 	TotalThreats      int
 	TotalIntents      int
+	TotalAgents       int
 	Score             float64
+	LastInteractedAt  *time.Time
 }
 
 type SearchAgentResult struct {
