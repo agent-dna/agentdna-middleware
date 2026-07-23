@@ -449,7 +449,9 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN i.interacted_to_did END) AS tools_count,
 		       SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                           AS threat_count,
 		       MIN(i.time)                                                               AS first_interaction_at,
-		       MAX(i.time)                                                               AS last_interaction_at
+		       MAX(i.time)                                                               AS last_interaction_at,
+		       (SELECT COALESCE(message,'') FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1)               AS title
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
@@ -476,7 +478,7 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 			&r.StartedAt, &endedAt, &r.Status, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
 			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
-			&firstAt, &lastAt,
+			&firstAt, &lastAt, &r.Title,
 		); err != nil {
 			return nil, err
 		}
@@ -1329,7 +1331,9 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN i.interacted_to_did END) AS tools_count,
 		       SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                          AS threat_count,
 		       MIN(i.time)                                                             AS first_interaction_at,
-		       MAX(i.time)                                                             AS last_interaction_at
+		       MAX(i.time)                                                             AS last_interaction_at,
+		       (SELECT COALESCE(message,'') FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1)             AS title
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
@@ -1356,7 +1360,7 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 			&r.StartedAt, &endedAt, &r.Status, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
 			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
-			&firstAt, &lastAt,
+			&firstAt, &lastAt, &r.Title,
 		); err != nil {
 			return nil, err
 		}
@@ -1392,13 +1396,16 @@ func (d *DB) CountAgentIntents(agentDID, orgID string) (int, error) {
 
 func (d *DB) GetAgentIntents(agentDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT DISTINCT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at,
+		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at,
 		       ni.ended_at, ni.status, ni.threat_detected,
-		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0)
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
+		       (SELECT COALESCE(message,'') FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1) AS title
 		FROM new_intents ni
 		JOIN new_interactions i ON i.intent_id = ni.intent_id
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		WHERE i.initiator_did = $1 AND ni.organization_id = $2
+		GROUP BY ni.intent_id, u.name
 		ORDER BY ni.started_at DESC
 		LIMIT $3 OFFSET $4`,
 		agentDID, orgID, limit, offset,
@@ -1423,7 +1430,9 @@ func (d *DB) GetUserIntents(userDID, orgID string, limit, offset int) ([]*Intent
 	rows, err := d.conn.Query(`
 		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at, ni.ended_at,
 		       ni.status, ni.threat_detected,
-		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0)
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
+		       (SELECT COALESCE(message,'') FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1) AS title
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		WHERE ni.initiator_did = $1 AND ni.organization_id = $2
@@ -1447,7 +1456,7 @@ func scanIntentRows(rows *sql.Rows) ([]*IntentRecord, error) {
 		if err := rows.Scan(
 			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.StartedAt, &endedAt,
 			&r.Status, &threatInt,
-			&r.FlowType, &r.Executor, &r.ChainDepth,
+			&r.FlowType, &r.Executor, &r.ChainDepth, &r.Title,
 		); err != nil {
 			return nil, err
 		}
@@ -1618,7 +1627,9 @@ func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*Inte
 		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN ix.interacted_to_did END) AS tools_count,
 		       SUM(CASE WHEN ix.threat = 1 THEN 1 ELSE 0 END)                           AS threat_count,
 		       MIN(ix.time)                                                              AS first_interaction_at,
-		       MAX(ix.time)                                                              AS last_interaction_at
+		       MAX(ix.time)                                                              AS last_interaction_at,
+		       (SELECT COALESCE(message,'') FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1)               AS title
 		FROM new_intents ni
 		JOIN new_interactions tool_ix ON tool_ix.intent_id = ni.intent_id AND tool_ix.interacted_to_did = $1
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
@@ -1646,7 +1657,7 @@ func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*Inte
 			&r.StartedAt, &endedAt, &r.Status, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
 			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
-			&firstAt, &lastAt,
+			&firstAt, &lastAt, &r.Title,
 		); err != nil {
 			return nil, err
 		}

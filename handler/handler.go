@@ -1938,11 +1938,20 @@ func (h *Handler) UserIntents(c *gin.Context) {
 	})
 }
 
+func firstNWords(s string, n int) string {
+	words := strings.Fields(s)
+	if len(words) <= n {
+		return s
+	}
+	return strings.Join(words[:n], " ") + "..."
+}
+
 func buildIntentList(intents []*db.IntentRecord) []gin.H {
 	list := make([]gin.H, 0, len(intents))
 	for _, i := range intents {
 		entry := gin.H{
 			"intentID":           i.IntentID,
+			"title":              firstNWords(i.Title, 5),
 			"initiatorDID":       i.InitiatorDID,
 			"initiatorName":      i.InitiatorName,
 			"startedAt":          i.StartedAt,

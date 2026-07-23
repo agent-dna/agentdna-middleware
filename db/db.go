@@ -92,6 +92,7 @@ type IntentRecord struct {
 	FirstInteractionAt   *time.Time
 	LastInteractionAt    *time.Time
 	RuntimeSeconds       float64
+	Title                string
 }
 
 type ToolRecord struct {
