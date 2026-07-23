@@ -47,6 +47,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/intent-block-data", h.GetIntentBlockData)
 	dashboard.GET("/tools-list", h.ToolsList)
 	dashboard.GET("/tool-info", h.ToolInfo)
+	dashboard.GET("/user-info", h.UserInfo)
 	dashboard.GET("/intent-list", h.IntentList)
 	dashboard.GET("/threats-list", h.ThreatsList)
 	dashboard.GET("/top-threat-agents", h.TopThreatAgents)

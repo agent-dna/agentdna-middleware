@@ -105,6 +105,29 @@ type ToolRecord struct {
 	LastInteractedAt  *time.Time
 }
 
+type UserInfoRecord struct {
+	UserDID           string
+	UserName          string
+	DisplayName       string
+	CreatedAt         time.Time
+	LastActive        *time.Time
+	IsActive          bool
+	AccessAgentCount  int
+	TotalInteractions int
+	TotalThreats      int
+	TotalIntents      int
+	TotalAgentsOwned  int
+}
+
+type UserAgentRecord struct {
+	AgentDID          string
+	AgentName         string
+	CreatedAt         time.Time
+	TotalInteractions int
+	TotalThreats      int
+	Score             float64
+}
+
 type SearchAgentResult struct {
 	DID   string
 	Name  string

@@ -2223,6 +2223,186 @@ func (h *Handler) ToolsList(c *gin.Context) {
 	})
 }
 
+func agentStatus(score float64, totalInteractions int) string {
+	if totalInteractions == 0 {
+		return "inactive"
+	}
+	if score >= 80 {
+		return "active"
+	}
+	if score >= 50 {
+		return "warn"
+	}
+	return "inactive"
+}
+
+func (h *Handler) UserInfo(c *gin.Context) {
+	w := http.ResponseWriter(c.Writer)
+	enableCors(&w)
+
+	orgID := c.GetString(CtxOrgID)
+
+	userID := c.Query("userID")
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "userID is required"})
+		return
+	}
+
+	const pageSize = 10
+
+	interactionsPage := 1
+	if p, err := strconv.Atoi(c.Query("interactionsPage")); err == nil && p > 0 {
+		interactionsPage = p
+	}
+	intentsPage := 1
+	if p, err := strconv.Atoi(c.Query("intentsPage")); err == nil && p > 0 {
+		intentsPage = p
+	}
+	threatsPage := 1
+	if p, err := strconv.Atoi(c.Query("threatsPage")); err == nil && p > 0 {
+		threatsPage = p
+	}
+	agentsPage := 1
+	if p, err := strconv.Atoi(c.Query("agentsPage")); err == nil && p > 0 {
+		agentsPage = p
+	}
+
+	user, err := h.db.GetUserDetail(userID, orgID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "user not found"})
+		return
+	}
+
+	// Interactions
+	totalInteractions, _ := h.db.CountInteractionsByUser(userID, orgID)
+	interactions, err := h.db.GetInteractionsByUser(userID, orgID, pageSize, (interactionsPage-1)*pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("interactions: %v", err)})
+		return
+	}
+	interactionList := make([]gin.H, 0, len(interactions))
+	for _, i := range interactions {
+		interactionList = append(interactionList, gin.H{
+			"interactionID":      i.InteractionID,
+			"from":               i.From,
+			"fromName":           i.FromName,
+			"to":                 i.To,
+			"toName":             i.ToName,
+			"type":               i.Type,
+			"threat":             i.Threat,
+			"intentID":           i.IntentID,
+			"message":            i.Message,
+			"signature":          i.Signature,
+			"provenanceRecordID": i.ProvenanceRecordID,
+			"time":               i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
+		})
+	}
+
+	// Intents
+	totalIntents, _ := h.db.CountUserIntents(userID, orgID)
+	intents, err := h.db.GetUserIntents(userID, orgID, pageSize, (intentsPage-1)*pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("intents: %v", err)})
+		return
+	}
+
+	// Threats
+	totalThreats, _ := h.db.CountThreatsByUser(userID, orgID)
+	threats, err := h.db.GetThreatsByUser(userID, orgID, pageSize, (threatsPage-1)*pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("threats: %v", err)})
+		return
+	}
+	threatList := make([]gin.H, 0, len(threats))
+	for _, i := range threats {
+		threatList = append(threatList, gin.H{
+			"interactionID":      i.InteractionID,
+			"from":               i.From,
+			"fromName":           i.FromName,
+			"to":                 i.To,
+			"toName":             i.ToName,
+			"type":               i.Type,
+			"threat":             i.Threat,
+			"intentID":           i.IntentID,
+			"message":            i.Message,
+			"signature":          i.Signature,
+			"provenanceRecordID": i.ProvenanceRecordID,
+			"time":               i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
+		})
+	}
+
+	// Owned agents
+	totalAgents, _ := h.db.CountAgentsByOwner(userID, orgID)
+	agents, err := h.db.GetAgentsByOwner(userID, orgID, pageSize, (agentsPage-1)*pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agents: %v", err)})
+		return
+	}
+	agentList := make([]gin.H, 0, len(agents))
+	for _, a := range agents {
+		agentList = append(agentList, gin.H{
+			"agentDID":          a.AgentDID,
+			"agentName":         a.AgentName,
+			"status":            agentStatus(a.Score, a.TotalInteractions),
+			"created":           a.CreatedAt.Unix(),
+			"totalInteractions": a.TotalInteractions,
+			"totalThreats":      a.TotalThreats,
+		})
+	}
+
+	var lastActive interface{}
+	if user.LastActive != nil {
+		lastActive = user.LastActive.UTC().Format(time.RFC3339)
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Status: true,
+		Data: gin.H{
+			"user": gin.H{
+				"userID":              user.UserDID,
+				"userName":            user.UserName,
+				"displayName":         user.DisplayName,
+				"createdAt":           user.CreatedAt.UTC().Format(time.RFC3339),
+				"lastActive":          lastActive,
+				"isActive":            user.IsActive,
+				"accessAgentCount":    user.AccessAgentCount,
+				"totalInteractions":   user.TotalInteractions,
+				"totalThreats":        user.TotalThreats,
+				"totalIntents":        user.TotalIntents,
+				"totalAgentsDeployed": user.TotalAgentsOwned,
+			},
+			"interactions": gin.H{
+				"list":       interactionList,
+				"total":      totalInteractions,
+				"page":       interactionsPage,
+				"pageSize":   pageSize,
+				"totalPages": (totalInteractions + pageSize - 1) / pageSize,
+			},
+			"intents": gin.H{
+				"list":       buildIntentList(intents),
+				"total":      totalIntents,
+				"page":       intentsPage,
+				"pageSize":   pageSize,
+				"totalPages": (totalIntents + pageSize - 1) / pageSize,
+			},
+			"threats": gin.H{
+				"list":       threatList,
+				"total":      totalThreats,
+				"page":       threatsPage,
+				"pageSize":   pageSize,
+				"totalPages": (totalThreats + pageSize - 1) / pageSize,
+			},
+			"agents": gin.H{
+				"list":       agentList,
+				"total":      totalAgents,
+				"page":       agentsPage,
+				"pageSize":   pageSize,
+				"totalPages": (totalAgents + pageSize - 1) / pageSize,
+			},
+		},
+	})
+}
+
 func (h *Handler) ToolInfo(c *gin.Context) {
 	w := http.ResponseWriter(c.Writer)
 	enableCors(&w)

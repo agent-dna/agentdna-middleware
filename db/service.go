@@ -2105,3 +2105,99 @@ func (d *DB) Search(q, orgID string) (*SearchResults, error) {
 
 	return out, nil
 }
+
+// ownerAgentFilter is the SQL fragment that resolves which agents a user "owns".
+// Bind: $1 = userDID, $2 = orgID.
+const ownerAgentFilter = `
+    a.organization_id = $2
+    AND (
+        a.deployer_did = $1
+        OR a.did IN (
+            SELECT agent_did FROM new_requests
+            WHERE creator_did = $1 AND request_type = 'deploy_agent' AND status = 'approved'
+        )
+    )`
+
+func (d *DB) GetUserDetail(userDID, orgID string) (*UserInfoRecord, error) {
+	r := &UserInfoRecord{}
+	var lastAt sql.NullTime
+	err := d.conn.QueryRow(`
+		SELECT
+			COALESCE(u.did, ''),
+			COALESCE(u.email, ''),
+			COALESCE(u.name, ''),
+			COALESCE(u.created_at, NOW()),
+			(SELECT COUNT(*) FROM json_array_elements_text(COALESCE(u.agent_access_list,'[]')::json)) AS access_agent_count,
+			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND initiator_did = $1) AS total_interactions,
+			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND initiator_did = $1 AND threat = 1) AS total_threats,
+			(SELECT COUNT(*) FROM new_intents WHERE organization_id = $2 AND initiator_did = $1) AS total_intents,
+			(SELECT COUNT(DISTINCT a.did) FROM new_agents a
+			 WHERE a.organization_id = $2
+			   AND (a.deployer_did = $1
+			        OR a.did IN (SELECT agent_did FROM new_requests
+			                     WHERE creator_did = $1 AND request_type = 'deploy_agent' AND status = 'approved'))
+			) AS total_agents_owned,
+			(SELECT MAX(i.time) FROM new_interactions i WHERE i.organization_id = $2 AND i.initiator_did = $1) AS last_active
+		FROM new_org_users u
+		WHERE u.did = $1`,
+		userDID, orgID,
+	).Scan(
+		&r.UserDID, &r.UserName, &r.DisplayName, &r.CreatedAt,
+		&r.AccessAgentCount, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents,
+		&r.TotalAgentsOwned, &lastAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if lastAt.Valid {
+		r.LastActive = &lastAt.Time
+		r.IsActive = true
+	}
+	return r, nil
+}
+
+func (d *DB) CountAgentsByOwner(userDID, orgID string) (int, error) {
+	var total int
+	err := d.conn.QueryRow(`
+		SELECT COUNT(DISTINCT a.did) FROM new_agents a
+		WHERE `+ownerAgentFilter,
+		userDID, orgID,
+	).Scan(&total)
+	return total, err
+}
+
+func (d *DB) GetAgentsByOwner(userDID, orgID string, limit, offset int) ([]*UserAgentRecord, error) {
+	rows, err := d.conn.Query(`
+		SELECT
+			a.did,
+			COALESCE(NULLIF(a.name,''), ''),
+			COALESCE(a.created_at, NOW()),
+			COUNT(i.interaction_id) AS total_interactions,
+			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) AS total_threats,
+			CASE WHEN COUNT(i.interaction_id) = 0 THEN 100.0
+			     ELSE ROUND(CAST((1.0 - SUM(CASE WHEN i.threat=1 THEN 1 ELSE 0 END)*1.0
+			          / COUNT(i.interaction_id))*100 AS NUMERIC), 2)
+			END AS score
+		FROM new_agents a
+		LEFT JOIN new_interactions i ON i.initiator_did = a.did
+		WHERE `+ownerAgentFilter+`
+		GROUP BY a.did, a.name, a.created_at
+		ORDER BY total_interactions DESC
+		LIMIT $3 OFFSET $4`,
+		userDID, orgID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*UserAgentRecord
+	for rows.Next() {
+		r := &UserAgentRecord{}
+		if err := rows.Scan(&r.AgentDID, &r.AgentName, &r.CreatedAt,
+			&r.TotalInteractions, &r.TotalThreats, &r.Score); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, nil
+}
