@@ -9,6 +9,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	r.GET("/healthz", h.Healthz)
 	r.POST("/core/v1/register-user", h.CoreRegisterUser)
 	r.POST("/core/v1/register-agent", h.CoreRegisterAgent)
+	r.GET("/core/v1/did-by-email", h.CoreDIDByEmail)
 
 	// Dashboard — public
 	public := r.Group("/dashboard/v1")
