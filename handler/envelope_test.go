@@ -165,22 +165,22 @@ func TestParseIntentWorkflow_NewSchema(t *testing.T) {
 		"type": "intent_workflow",
 		"version": "1.0",
 		"envelope": {
-			"from": "agentA",
+			"from_": "agentA",
 			"payload": "final reply",
 			"epoch": 1720000003,
-			"code": 1000,
+			"status_code": 1000,
 			"signature": "sig3",
 			"parent_envelope": [{
-				"from": "agentB",
+				"from_": "agentB",
 				"payload": "delegated work",
 				"epoch": 1720000002,
-				"code": 1000,
+				"status_code": 1000,
 				"signature": "sig2",
 				"parent_envelope": [{
-					"from": "user",
+					"from_": "user",
 					"payload": "hello",
 					"epoch": 1720000001,
-					"code": 1000,
+					"status_code": 1000,
 					"signature": "sig1"
 				}]
 			}]

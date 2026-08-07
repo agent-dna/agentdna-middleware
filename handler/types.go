@@ -32,7 +32,8 @@ type FTInfo struct {
 type NFTInfo struct {
 	NFTId string  `json:"nftId"`
 	Value float64 `json:"value"`
-	Data  string  `json:"data"`
+	Data       string  `json:"data"`
+	ParentNFTId string  `json:"parentNFTId,omitempty"`
 }
 
 type SmartContractInfo struct {
@@ -122,10 +123,10 @@ type intentWorkflowData struct {
 }
 
 type workflowEnvelope struct {
-	From           string              `json:"from"`
+	From           string              `json:"from_"`
 	Payload        string              `json:"payload"`
 	Epoch          int64               `json:"epoch"`
-	Code           int                 `json:"code"`   // 1000 = OK; 2001-2003 = verification failures
+	Code           int                 `json:"status_code"` // 1000 = OK; 2001-2003 = verification failures
 	RunID          string              `json:"run_id"`
 	Signature      string              `json:"signature"`
 	ParentEnvelope []*workflowEnvelope `json:"parent_envelope"`
