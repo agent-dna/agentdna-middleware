@@ -1106,7 +1106,13 @@ func (d *DB) StoreNewAgent(nftID, did, deployerDID, orgID, policy, agentName str
 
 func (d *DB) GetAgentOrgID(agentDID string) (string, error) {
 	var orgID sql.NullString
-	err := d.conn.QueryRow(`SELECT organization_id FROM new_agents WHERE did = $1`, agentDID).Scan(&orgID)
+	err := d.conn.QueryRow(`
+		SELECT organization_id FROM new_agents WHERE did = $1
+		UNION ALL
+		SELECT organization_id FROM new_org_users WHERE did = $1
+		UNION ALL
+		SELECT organization_id FROM new_admins WHERE did = $1
+		LIMIT 1`, agentDID).Scan(&orgID)
 	return orgID.String, err
 }
 

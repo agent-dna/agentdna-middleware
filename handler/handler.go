@@ -281,6 +281,9 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 		var payload txPayload
 		if jsonErr := json.Unmarshal(bodyBytes, &payload); jsonErr == nil && len(payload.Tokens.NFT) > 0 {
 			nftInfo := payload.Tokens.NFT[0]
+			if nftInfo.NFTId == "" {
+				nftInfo.NFTId = nftInfo.ParentNFTId
+			}
 			nftType, typeErr := parseNFTType(nftInfo.Data)
 			log.Printf("[NFT] received 101 %v", nftInfo)
 			log.Printf("[NFT] received nft_id=%s type=%s data=%s", nftInfo.NFTId, nftType, nftInfo.Data)
@@ -377,11 +380,12 @@ func (h *Handler) captureTxResponse(resp *http.Response) {
 		log.Printf("[provenance] tx: empty result.id intent_id=%s", intentID)
 		return
 	}
+	log.Printf("[provenance] tx: updating provenance_req_id intent_id=%s req_id=%s", intentID, txResp.Result.ID)
 	if err := h.db.SetProvenanceReqID(intentID, txResp.Result.ID); err != nil {
-		log.Printf("[provenance] tx: set provenance_req_id failed intent_id=%s id=%s: %v", intentID, txResp.Result.ID, err)
+		log.Printf("[provenance] tx: set provenance_req_id failed intent_id=%s req_id=%s: %v", intentID, txResp.Result.ID, err)
 		return
 	}
-	log.Printf("[provenance] tx: intent_id=%s provenance_req_id=%s", intentID, txResp.Result.ID)
+	log.Printf("[provenance] tx: provenance_req_id updated ok intent_id=%s req_id=%s", intentID, txResp.Result.ID)
 }
 
 // captureSignatureResponse handles POST /rubix/v1/signature: it writes transactionID
@@ -391,7 +395,7 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 	if reqID == "" {
 		return
 	}
-	log.Printf("test-0101 reqID=%s", reqID)
+	log.Printf("[provenance] signature: received hook req_id=%s", reqID)
 
 	body, err := readAndRestoreBody(resp)
 	if err != nil {
@@ -409,12 +413,7 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 		return
 	}
 	if len(sigResp.Result.MintedNFTChildren) == 0 {
-		log.Printf("[provenance] signature: no mintedNFTChildren id=%s", reqID)
-		return
-	}
-
-	if len(sigResp.Result.MintedNFTChildren) == 0 {
-		log.Printf("[provenance] signature: no mintedNFTChildren id=%s", reqID)
+		log.Printf("[provenance] signature: no mintedNFTChildren req_id=%s", reqID)
 		return
 	}
 
@@ -422,26 +421,26 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 	transactionID := sigResp.Result.TransactionID
 
 	if childNFTId == "" {
-		log.Printf("[provenance] signature: empty childNFTId id=%s, skipping", reqID)
+		log.Printf("[provenance] signature: empty childNFTId req_id=%s, skipping", reqID)
 		return
 	}
 	if transactionID == "" {
-		log.Printf("[provenance] signature: empty transactionID id=%s, skipping", reqID)
+		log.Printf("[provenance] signature: empty transactionID req_id=%s, skipping", reqID)
 		return
 	}
 
+	log.Printf("[provenance] signature: updating provenance_record req_id=%s transactionID=%s childNFTId=%s", reqID, transactionID, childNFTId)
 	rows, err := h.db.SetProvenanceRecord(reqID, transactionID, childNFTId)
 	if err != nil {
-		log.Printf("[provenance] signature: update failed id=%s: %v", reqID, err)
+		log.Printf("[provenance] signature: update failed req_id=%s: %v", reqID, err)
 		return
 	}
 
 	if rows == 0 {
-		// No matching row — the /tx write likely has not landed yet (or failed). Skip.
 		log.Printf("[provenance] signature: no rows matched provenance_req_id=%s (tx write pending?)", reqID)
 		return
 	}
-	log.Printf("[provenance] signature: updated rows=%d provenance_req_id=%s transactionID=%s childNFTId=%s",
+	log.Printf("[provenance] signature: provenance_record updated ok rows=%d req_id=%s transactionID=%s childNFTId=%s",
 		rows, reqID, transactionID, childNFTId)
 }
 
@@ -506,22 +505,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	}
 
 	// ── Resolve org ──────────────────────────────────────────────────────────
-	orgID := ""
-	for _, ix := range interactions {
-		if orgID == "" {
-			orgID, _ = h.db.GetAgentOrgID(ix.FromDID)
-		}
-		if orgID == "" {
-			orgID, _ = h.db.GetAgentOrgID(ix.ToDID)
-		}
-		if orgID != "" {
-			break
-		}
-	}
-	if orgID == "" {
-		log.Printf("[intentWorkflow] could not resolve orgID for intent, dropping nft_id=%s", nftInfo.NFTId)
-		return "", fmt.Errorf("handleIntentWorkflow: could not resolve orgID")
-	}
+	orgID := h.orgID
 	log.Printf("[intentWorkflow] orgID=%s intentID=%s", orgID, intentID)
 
 	// ── Ensure agents exist — all unique DIDs across every branch ────────────
@@ -635,19 +619,7 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 	}
 
 	// ── 3. Resolve org ───────────────────────────────────────────────────────
-	orgID := ""
-	for _, b := range blocks {
-		if b.Type == "delegate" || b.Type == "execute" {
-			orgID, _ = h.db.GetAgentOrgID(b.Agent)
-			if orgID != "" {
-				break
-			}
-		}
-	}
-	if orgID == "" {
-		log.Printf("[intentNFT] could not resolve orgID for intent, dropping nft_id=%s", intentID)
-		return fmt.Errorf("handleIntentNFT: could not resolve orgID")
-	}
+	orgID := h.orgID
 
 	initiatorDID := ""
 	if len(blocks) > 0 {
