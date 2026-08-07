@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	cid "github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
@@ -54,10 +55,17 @@ func parseIntentWorkflow(data string) (*intentWorkflowData, error) {
 }
 
 // walkEnvelopes unrolls the parent_envelope chain into chronological order (oldest first).
+// Follows only the first parent at each step — used for display/raw endpoints.
+// For interaction extraction use extractInteractionsFromEnvelopes which handles parallel branches.
 func walkEnvelopes(root *workflowEnvelope) []*workflowEnvelope {
 	var envs []*workflowEnvelope
-	for e := root; e != nil; e = e.ParentEnvelope {
+	for e := root; e != nil; {
 		envs = append(envs, e)
+		if len(e.ParentEnvelope) > 0 {
+			e = e.ParentEnvelope[0]
+		} else {
+			e = nil
+		}
 	}
 	for i, j := 0, len(envs)-1; i < j; i, j = i+1, j-1 {
 		envs[i], envs[j] = envs[j], envs[i]
@@ -65,54 +73,106 @@ func walkEnvelopes(root *workflowEnvelope) []*workflowEnvelope {
 	return envs
 }
 
-// actorDID returns the actor's DID, falling back to the actor's name when the DID is absent.
-func actorDID(a workflowActor) string {
-	if a.ID != "" {
-		return a.ID
+// collectAllEnvelopes does a full DFS over the envelope DAG, visiting every branch.
+// Returns all unique envelopes sorted by epoch ascending (oldest first).
+func collectAllEnvelopes(root *workflowEnvelope) []*workflowEnvelope {
+	seen := map[*workflowEnvelope]bool{}
+	var all []*workflowEnvelope
+	var dfs func(e *workflowEnvelope)
+	dfs = func(e *workflowEnvelope) {
+		if e == nil || seen[e] {
+			return
+		}
+		seen[e] = true
+		all = append(all, e)
+		for _, p := range e.ParentEnvelope {
+			dfs(p)
+		}
 	}
-	return a.Name
+	dfs(root)
+	sort.Slice(all, func(i, j int) bool { return all[i].Epoch < all[j].Epoch })
+	return all
 }
 
-// extractInteractionsFromEnvelopes maps each envelope directly to one interaction hop.
-// Type is derived from actor types and position in chain (no direction field needed).
-func extractInteractionsFromEnvelopes(envs []*workflowEnvelope) []interactionExtract {
+// extractInteractionsFromEnvelopes traverses the full envelope DAG and returns one
+// interaction per parent→child edge, plus a final edge from the newest envelope back
+// to the original initiator. Handles parallel branches via the full parent_envelope array.
+func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtract {
+	if root == nil {
+		return nil
+	}
+
+	all := collectAllEnvelopes(root)
+	if len(all) == 0 {
+		return nil
+	}
+	initiatorDID := all[0].From // oldest envelope's sender = initiator
+
+	// Build parent→child edges by walking from the root (newest) down each branch.
+	type edge struct {
+		parent *workflowEnvelope
+		child  *workflowEnvelope
+	}
+	var edges []edge
+	visited := map[*workflowEnvelope]bool{}
+	var buildEdges func(e *workflowEnvelope)
+	buildEdges = func(e *workflowEnvelope) {
+		if e == nil || visited[e] {
+			return
+		}
+		visited[e] = true
+		for _, p := range e.ParentEnvelope {
+			edges = append(edges, edge{parent: p, child: e})
+			buildEdges(p)
+		}
+	}
+	buildEdges(root)
+
+	// Sort edges chronologically by child epoch (the child is the "newer" side).
+	sort.Slice(edges, func(i, j int) bool { return edges[i].child.Epoch < edges[j].child.Epoch })
+
 	seenAsFrom := map[string]bool{}
 	var result []interactionExtract
-	for _, e := range envs {
-		fromDID := actorDID(e.From)
-		toDID := actorDID(e.To)
+
+	for i, ed := range edges {
+		fromDID := ed.parent.From
+		toDID := ed.child.From
+		threat := ed.parent.Code != 0 && ed.parent.Code != 1000
 		result = append(result, interactionExtract{
 			FromDID:   fromDID,
-			FromName:  e.From.Name,
 			ToDID:     toDID,
-			ToName:    e.To.Name,
-			Type:      deriveWorkflowInteractionType(e, seenAsFrom),
-			Threat:    len(e.Issues) > 0,
-			Message:   e.Payload,
-			Signature: e.Signature,
+			Type:      deriveWorkflowInteractionType(fromDID, toDID, i, seenAsFrom),
+			Threat:    threat,
+			Message:   ed.parent.Payload,
+			Signature: ed.parent.Signature,
+			Epoch:     ed.parent.Epoch,
 		})
 		seenAsFrom[fromDID] = true
 	}
+
+	// Final edge: newest envelope replies back to the original initiator.
+	threat := root.Code != 0 && root.Code != 1000
+	result = append(result, interactionExtract{
+		FromDID:   root.From,
+		ToDID:     initiatorDID,
+		Type:      deriveWorkflowInteractionType(root.From, initiatorDID, len(result), seenAsFrom),
+		Threat:    threat,
+		Message:   root.Payload,
+		Signature: root.Signature,
+		Epoch:     root.Epoch,
+	})
+
 	return result
 }
 
-func deriveWorkflowInteractionType(e *workflowEnvelope, seenAsFrom map[string]bool) string {
-	if e.From.Type == "human" {
+// deriveWorkflowInteractionType infers type from position and chain history.
+// First hop is always a trigger; return hops (destination already sent) are responses;
+// forward hops are delegates.
+func deriveWorkflowInteractionType(fromDID, toDID string, idx int, seenAsFrom map[string]bool) string {
+	if idx == 0 {
 		return "trigger"
 	}
-	if e.To.Type == "app" {
-		return "tool_call"
-	}
-	if e.From.Type == "app" {
-		return "tool_response"
-	}
-	fromDID := actorDID(e.From)
-	toDID := actorDID(e.To)
-	if fromDID == toDID {
-		return "tool_response"
-	}
-	// agent→agent: if the destination was already a sender earlier, we're going back up
-	if seenAsFrom[toDID] {
+	if seenAsFrom[toDID] || fromDID == toDID {
 		return "response"
 	}
 	return "delegate"

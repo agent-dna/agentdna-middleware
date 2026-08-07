@@ -121,27 +121,14 @@ type intentWorkflowData struct {
 	Envelope *workflowEnvelope `json:"envelope"`
 }
 
-type workflowActor struct {
-	ID       string         `json:"id"`
-	Name     string         `json:"name"`
-	Type     string         `json:"type"` // "human", "agent", "app"
-	Metadata map[string]any `json:"metadata"`
-}
-
-type workflowIssue struct {
-	Depth  int    `json:"depth"`
-	Reason string `json:"reason"`
-}
-
 type workflowEnvelope struct {
-	From           workflowActor     `json:"from_"`
-	To             workflowActor     `json:"to"`
-	Payload        string            `json:"payload"`
-	Epoch          int64             `json:"epoch"`
-	Metadata       map[string]any    `json:"metadata"`
-	Signature      string            `json:"signature"`
-	Issues         []workflowIssue   `json:"issues"`
-	ParentEnvelope *workflowEnvelope `json:"parent_envelope"`
+	From           string              `json:"from"`
+	Payload        string              `json:"payload"`
+	Epoch          int64               `json:"epoch"`
+	Code           int                 `json:"code"`   // 1000 = OK; 2001-2003 = verification failures
+	RunID          string              `json:"run_id"`
+	Signature      string              `json:"signature"`
+	ParentEnvelope []*workflowEnvelope `json:"parent_envelope"`
 }
 
 // chainNFTData is the top-level structure of an intent NFT using the chain spec.
@@ -191,4 +178,5 @@ type interactionExtract struct {
 	Threat    bool
 	Message   string
 	Signature string
+	Epoch     int64
 }

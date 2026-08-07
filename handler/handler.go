@@ -480,14 +480,22 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		return "", fmt.Errorf("handleIntentWorkflow: envelope is nil")
 	}
 
-	envelopes := walkEnvelopes(data.Envelope)
 	intentID := uuid.New().String()
-	interactions := extractInteractionsFromEnvelopes(envelopes)
+	interactions := extractInteractionsFromEnvelopes(data.Envelope)
 
-	// Resolve display ames from DB; fall back to envelope name if not found.
+	// Resolve display names from DB.
 	for i, ix := range interactions {
 		interactions[i].FromName = h.resolveActorName(ix.FromDID, ix.FromName)
 		interactions[i].ToName = h.resolveActorName(ix.ToDID, ix.ToName)
+	}
+
+	// Oldest envelope (via linear walk) gives us the initiator.
+	envelopes := walkEnvelopes(data.Envelope)
+	initiatorDID := ""
+	initiatorName := ""
+	if len(envelopes) > 0 {
+		initiatorDID = envelopes[0].From
+		initiatorName = h.resolveActorName(initiatorDID, "")
 	}
 
 	log.Printf("[intentWorkflow] parsed ok — envelopes=%d interactions=%d", len(envelopes), len(interactions))
@@ -515,26 +523,19 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	}
 	log.Printf("[intentWorkflow] orgID=%s intentID=%s", orgID, intentID)
 
-	// ── Initiator is the from-actor of the oldest envelope ───────────────────
-	initiatorDID := ""
-	initiatorName := ""
-	if len(envelopes) > 0 {
-		initiatorDID = envelopes[0].From.ID
-		initiatorName = envelopes[0].From.Name
-	}
-
-	// ── Ensure agents exist ──────────────────────────────────────────────────
+	// ── Ensure agents exist — all unique DIDs across every branch ────────────
 	seen := map[string]bool{}
-	for _, e := range envelopes {
-		for _, actor := range []workflowActor{e.From, e.To} {
-			if actor.Type != "agent" || actor.ID == "" || seen[actor.ID] {
+	for _, ix := range interactions {
+		for _, did := range []string{ix.FromDID, ix.ToDID} {
+			if did == "" || seen[did] {
 				continue
 			}
-			seen[actor.ID] = true
-			if err := h.db.StoreNewAgent(uuid.New().String(), actor.ID, initiatorDID, orgID, "", actor.Name); err != nil {
-				log.Printf("[intentWorkflow] StoreNewAgent did=%s name=%s: %v", actor.ID, actor.Name, err)
+			seen[did] = true
+			name := h.resolveActorName(did, "")
+			if err := h.db.StoreNewAgent(uuid.New().String(), did, initiatorDID, orgID, "", name); err != nil {
+				log.Printf("[intentWorkflow] StoreNewAgent did=%s name=%s: %v", did, name, err)
 			} else {
-				log.Printf("[intentWorkflow] agent saved did=%s name=%s", actor.ID, actor.Name)
+				log.Printf("[intentWorkflow] agent saved did=%s name=%s", did, name)
 			}
 		}
 	}
@@ -548,7 +549,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		if ix.Threat {
 			threatDetected = true
 		}
-		eventTime := time.Unix(envelopes[idx].Epoch, 0).UTC()
+		eventTime := time.Unix(ix.Epoch, 0).UTC()
 		if err := h.db.StoreNewInteraction(
 			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, eventTime,
 		); err != nil {
@@ -558,11 +559,6 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 			_ = h.db.StoreNewTool(ix.ToDID, ix.ToName, orgID)
 		}
 
-		issueReasons := make([]string, 0, len(envelopes[idx].Issues))
-		for _, iss := range envelopes[idx].Issues {
-			issueReasons = append(issueReasons, iss.Reason)
-		}
-		env := envelopes[idx]
 		blockRec := &db.IntentBlockRecord{
 			ID:             iid,
 			IntentID:       intentID,
@@ -572,14 +568,14 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 			BlockType:      ix.Type,
 			Message:        ix.Message,
 			ThreatDetected: ix.Threat,
-			TrustIssues:    issueReasons,
+			TrustIssues:    []string{},
 			CreatedAt:      eventTime,
-			FromDID:        actorDID(env.From),
-			FromName:       env.From.Name,
-			FromType:       env.From.Type,
-			ToDID:          actorDID(env.To),
-			ToName:         env.To.Name,
-			ToType:         env.To.Type,
+			FromDID:        ix.FromDID,
+			FromName:       ix.FromName,
+			FromType:       "",
+			ToDID:          ix.ToDID,
+			ToName:         ix.ToName,
+			ToType:         "",
 		}
 		if err := h.db.StoreIntentBlockData(blockRec); err != nil {
 			log.Printf("[intentWorkflow] block data save error idx=%d: %v", idx, err)
@@ -588,7 +584,8 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 
 	// ── Store intent ─────────────────────────────────────────────────────────
 	flowType := detectFlowTypeFromExtracts(interactions)
-	chainDepth := len(envelopes)
+	// Chain depth = unique envelopes across all branches (full DAG size).
+	chainDepth := len(collectAllEnvelopes(data.Envelope))
 	executor := initiatorName
 	if executor == "" {
 		executor = initiatorDID
@@ -603,7 +600,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 }
 
 func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
-	log.Printf("[intentNFT] received nft_id=%s", nftInfo)
+	log.Printf("[intentNFT] received nft_id=%s", nftInfo.NFTId)
 
 	data, err := parseChainNFT(nftInfo.Data)
 	if err != nil {
