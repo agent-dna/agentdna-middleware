@@ -282,6 +282,7 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 		if jsonErr := json.Unmarshal(bodyBytes, &payload); jsonErr == nil && len(payload.Tokens.NFT) > 0 {
 			nftInfo := payload.Tokens.NFT[0]
 			nftType, typeErr := parseNFTType(nftInfo.Data)
+			log.Printf("[NFT] received 101 %v", nftInfo)
 			log.Printf("[NFT] received nft_id=%s type=%s data=%s", nftInfo.NFTId, nftType, nftInfo.Data)
 			if typeErr == nil {
 				switch nftType {
