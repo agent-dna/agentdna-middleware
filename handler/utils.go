@@ -357,6 +357,9 @@ func (h *Handler) resolveActorName(did, fallback string) string {
 	if agent, err := h.db.GetAgentInfo(did); err == nil && agent.AgentName != "" {
 		return agent.AgentName
 	}
+	if name, err := h.db.GetAgentNameByRequestDID(did); err == nil && name != "" {
+		return name
+	}
 	if name, err := h.db.GetOrgUserNameByDID(did); err == nil && name != "" {
 		return name
 	}

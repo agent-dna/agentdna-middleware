@@ -133,6 +133,15 @@ func (d *DB) GetRequestByID(id string) (*RequestRecord, error) {
 	return r, nil
 }
 
+func (d *DB) GetAgentNameByRequestDID(agentDID string) (string, error) {
+	var name string
+	err := d.conn.QueryRow(
+		`SELECT COALESCE(agent_name, '') FROM new_requests WHERE agent_did = $1 AND agent_name <> '' LIMIT 1`,
+		agentDID,
+	).Scan(&name)
+	return name, err
+}
+
 func (d *DB) UpdateRequestStatus(id, status string) error {
 	_, err := d.conn.Exec(`UPDATE new_requests SET status = $1 WHERE request_id = $2`, status, id)
 	return err
