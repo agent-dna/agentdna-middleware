@@ -106,8 +106,6 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtra
 	if len(all) == 0 {
 		return nil
 	}
-	initiatorDID := all[0].From // oldest envelope's sender = initiator
-
 	// Build parent→child edges by walking from the root (newest) down each branch.
 	type edge struct {
 		parent *workflowEnvelope
@@ -149,18 +147,6 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtra
 		})
 		seenAsFrom[fromDID] = true
 	}
-
-	// Final edge: newest envelope replies back to the original initiator.
-	threat := root.Code != 0 && root.Code != 1000
-	result = append(result, interactionExtract{
-		FromDID:   root.From,
-		ToDID:     initiatorDID,
-		Type:      deriveWorkflowInteractionType(root.From, initiatorDID, len(result), seenAsFrom),
-		Threat:    threat,
-		Message:   root.Payload,
-		Signature: root.Signature,
-		Epoch:     root.Epoch,
-	})
 
 	return result
 }

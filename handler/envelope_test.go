@@ -67,9 +67,9 @@ func TestExtractInteractions_Linear(t *testing.T) {
 	agentA2 := &workflowEnvelope{From: "agentA", Payload: "final", Epoch: 4, Code: 1000, ParentEnvelope: []*workflowEnvelope{agentB}}
 
 	ixs := extractInteractionsFromEnvelopes(agentA2)
-	// Edges: user→agentA, agentA→agentB, agentB→agentA, + final agentA→user
-	if len(ixs) != 4 {
-		t.Fatalf("expected 4 interactions, got %d", len(ixs))
+	// Edges: user→agentA, agentA→agentB, agentB→agentA (no synthetic final)
+	if len(ixs) != 3 {
+		t.Fatalf("expected 3 interactions, got %d", len(ixs))
 	}
 
 	if ixs[0].FromDID != "user" || ixs[0].ToDID != "agentA" {
@@ -84,11 +84,6 @@ func TestExtractInteractions_Linear(t *testing.T) {
 	if ixs[2].Type != "response" {
 		t.Errorf("ixs[2] type: expected response, got %s", ixs[2].Type)
 	}
-	// Final: agentA → user
-	last := ixs[len(ixs)-1]
-	if last.FromDID != "agentA" || last.ToDID != "user" {
-		t.Errorf("final edge wrong: %s→%s", last.FromDID, last.ToDID)
-	}
 }
 
 func TestExtractInteractions_Parallel(t *testing.T) {
@@ -102,9 +97,9 @@ func TestExtractInteractions_Parallel(t *testing.T) {
 	merger := &workflowEnvelope{From: "agentA", Epoch: 4, Code: 1000, ParentEnvelope: []*workflowEnvelope{agentB, agentC}}
 
 	ixs := extractInteractionsFromEnvelopes(merger)
-	// Edges: user→agentA, agentA→agentB, agentA→agentC, agentB→agentA, agentC→agentA + final agentA→user
-	if len(ixs) != 6 {
-		t.Fatalf("expected 6 interactions (5 edges + 1 final), got %d", len(ixs))
+	// Edges: user→agentA, agentA→agentB, agentA→agentC, agentB→agentA, agentC→agentA (no synthetic final)
+	if len(ixs) != 5 {
+		t.Fatalf("expected 5 interactions, got %d", len(ixs))
 	}
 
 	// Collect from→to pairs for assertion (order may vary for parallel branches)
@@ -120,7 +115,6 @@ func TestExtractInteractions_Parallel(t *testing.T) {
 		{"agentA", "agentC"},
 		{"agentB", "agentA"},
 		{"agentC", "agentA"},
-		{"agentA", "user"}, // final
 	}
 	for _, p := range expected {
 		if !got[p] {
@@ -136,18 +130,17 @@ func TestExtractInteractions_ThreatDetection(t *testing.T) {
 
 	ixs := extractInteractionsFromEnvelopes(agentB)
 
-	// ixs[0]: edge user→agentA, threat comes from user envelope code=1000 → no threat
+	// 2 edges: user→agentA, agentA→agentB (no synthetic final)
+	if len(ixs) != 2 {
+		t.Fatalf("expected 2 interactions, got %d", len(ixs))
+	}
+	// ixs[0]: edge user→agentA, threat from user envelope code=1000 → no threat
 	if ixs[0].Threat {
 		t.Error("ixs[0]: code=1000 should not be threat")
 	}
 	// ixs[1]: edge agentA→agentB, threat from agentA envelope code=2001 → threat
 	if !ixs[1].Threat {
 		t.Error("ixs[1]: code=2001 should be threat")
-	}
-	// final: agentB→user, from agentB code=0 → no threat
-	last := ixs[len(ixs)-1]
-	if last.Threat {
-		t.Error("final: code=0 should not be threat")
 	}
 }
 
@@ -196,14 +189,14 @@ func TestParseIntentWorkflow_NewSchema(t *testing.T) {
 	}
 
 	ixs := extractInteractionsFromEnvelopes(wf.Envelope)
-	if len(ixs) != 3 {
-		t.Fatalf("expected 3 interactions, got %d", len(ixs))
+	// user→agentB, agentB→agentA (no synthetic final)
+	if len(ixs) != 2 {
+		t.Fatalf("expected 2 interactions, got %d", len(ixs))
 	}
-	// user→agentB, agentB→agentA, agentA→user (final)
 	if ixs[0].FromDID != "user" || ixs[0].ToDID != "agentB" {
 		t.Errorf("ixs[0]: expected user→agentB, got %s→%s", ixs[0].FromDID, ixs[0].ToDID)
 	}
-	if ixs[2].FromDID != "agentA" || ixs[2].ToDID != "user" {
-		t.Errorf("ixs[2]: expected agentA→user, got %s→%s", ixs[2].FromDID, ixs[2].ToDID)
+	if ixs[1].FromDID != "agentB" || ixs[1].ToDID != "agentA" {
+		t.Errorf("ixs[1]: expected agentB→agentA, got %s→%s", ixs[1].FromDID, ixs[1].ToDID)
 	}
 }
