@@ -498,7 +498,9 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		initiatorName = h.resolveActorName(initiatorDID, "")
 	}
 
-	log.Printf("[intentWorkflow] parsed ok — envelopes=%d interactions=%d", len(envelopes), len(interactions))
+	allEnvelopes := collectAllEnvelopes(data.Envelope)
+	log.Printf("[intentWorkflow] parsed ok — linear_envelopes=%d dag_envelopes=%d interactions=%d initiator=%s",
+		len(envelopes), len(allEnvelopes), len(interactions), initiatorDID)
 	for i, ix := range interactions {
 		log.Printf("[intentWorkflow] interaction[%d] from=%s(%s) to=%s(%s) type=%s threat=%v",
 			i, ix.FromName, ix.FromDID, ix.ToName, ix.ToDID, ix.Type, ix.Threat)
@@ -569,8 +571,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 
 	// ── Store intent ─────────────────────────────────────────────────────────
 	flowType := detectFlowTypeFromExtracts(interactions)
-	// Chain depth = unique envelopes across all branches (full DAG size).
-	chainDepth := len(collectAllEnvelopes(data.Envelope))
+	chainDepth := len(allEnvelopes)
 	executor := initiatorName
 	if executor == "" {
 		executor = initiatorDID

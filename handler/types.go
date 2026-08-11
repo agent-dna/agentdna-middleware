@@ -123,7 +123,7 @@ type intentWorkflowData struct {
 }
 
 type workflowEnvelope struct {
-	From           string              `json:"from_"`
+	From           string              `json:"from"`
 	Payload        string              `json:"payload"`
 	Epoch          int64               `json:"epoch"`
 	Code           int                 `json:"status_code"` // 1000 = OK; 2001-2003 = verification failures

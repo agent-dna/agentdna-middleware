@@ -156,21 +156,21 @@ func TestExtractInteractions_Nil(t *testing.T) {
 func TestParseIntentWorkflow_NewSchema(t *testing.T) {
 	raw := `{
 		"type": "intent_workflow",
-		"version": "1.0",
+		"version": "2.0",
 		"envelope": {
-			"from_": "agentA",
+			"from": "agentA",
 			"payload": "final reply",
 			"epoch": 1720000003,
 			"status_code": 1000,
 			"signature": "sig3",
 			"parent_envelope": [{
-				"from_": "agentB",
+				"from": "agentB",
 				"payload": "delegated work",
 				"epoch": 1720000002,
 				"status_code": 1000,
 				"signature": "sig2",
 				"parent_envelope": [{
-					"from_": "user",
+					"from": "user",
 					"payload": "hello",
 					"epoch": 1720000001,
 					"status_code": 1000,
