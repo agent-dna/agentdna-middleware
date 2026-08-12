@@ -755,56 +755,42 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
 		return
 	}
-	type blockActor struct {
-		DID  string `json:"did"`
-		Name string `json:"name"`
-		Type string `json:"type"`
+	envelope := buildEnvelopeChain(blocks)
+	c.JSON(http.StatusOK, Response{
+		Status: true,
+		Data: gin.H{
+			"type":     "intent_workflow",
+			"version":  "2.0",
+			"info":     gin.H{},
+			"envelope": envelope,
+		},
+	})
+}
+
+func (h *Handler) GetIntentRawData(c *gin.Context) {
+	intentID := c.Query("intent_id")
+	if intentID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intent_id is required"})
+		return
 	}
-	type blockOut struct {
-		ID             string     `json:"id"`
-		BlockIndex     int        `json:"block_index"`
-		BlockType      string     `json:"block_type"`
-		From           blockActor `json:"from"`
-		To             blockActor `json:"to"`
-		Message        string     `json:"message"`
-		Signature      string     `json:"signature"`
-		ThreatDetected bool       `json:"threat_detected"`
-		TrustIssues    []string   `json:"trust_issues"`
-		CreatedAt      string     `json:"created_at"`
-		ParentBlock    *blockOut  `json:"parent_block"`
+	blocks, err := h.db.GetIntentBlocksByIntent(intentID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
+		return
 	}
-	// Build nested structure: blocks[0] is innermost (no parent), each successive
-	// block wraps the previous as parent_block, outermost (latest) is the root.
-	var root *blockOut
+	type blockRaw struct {
+		BlockIndex int             `json:"block_index"`
+		RawData    json.RawMessage `json:"raw_data"`
+	}
+	result := make([]blockRaw, 0, len(blocks))
 	for _, b := range blocks {
-		issues := b.TrustIssues
-		if issues == nil {
-			issues = []string{}
+		raw := b.RawData
+		if len(raw) == 0 {
+			raw = json.RawMessage("{}")
 		}
-		node := &blockOut{
-			ID:         b.ID,
-			BlockIndex: b.BlockIndex,
-			BlockType:  b.BlockType,
-			From: blockActor{
-				DID:  b.FromDID,
-				Name: b.FromName,
-				Type: b.FromType,
-			},
-			To: blockActor{
-				DID:  b.ToDID,
-				Name: b.ToName,
-				Type: b.ToType,
-			},
-			Message:        b.Message,
-			Signature:      b.Signature,
-			ThreatDetected: b.ThreatDetected,
-			TrustIssues:    issues,
-			CreatedAt:      b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-			ParentBlock:    root,
-		}
-		root = node
+		result = append(result, blockRaw{BlockIndex: b.BlockIndex, RawData: raw})
 	}
-	c.JSON(http.StatusOK, Response{Status: true, Data: root})
+	c.JSON(http.StatusOK, Response{Status: true, Data: result})
 }
 
 func (h *Handler) issueToken(claims JWTClaims) (string, error) {
@@ -1986,48 +1972,15 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 		return
 	}
 
-	interactions, err := h.db.GetInteractionsByIntent(intentID)
+	blocks, err := h.db.GetIntentBlocksByIntent(intentID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch interactions: %v", err)})
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch blocks: %v", err)})
 		return
 	}
 
-	type interactionOut struct {
-		InteractionID      string `json:"interactionID"`
-		Initiator          string `json:"initiator"`
-		InitiatorName      string `json:"initiatorName"`
-		To                 string `json:"to"`
-		ToName             string `json:"toName"`
-		Type               string `json:"type"`
-		Message            string `json:"message"`
-		IntentID           string `json:"intentID"`
-		Threat             bool   `json:"threat"`
-		Epoch              int64  `json:"epoch"`
-		Signature          string `json:"signature"`
-		ProvenanceReqID    string `json:"provenanceReqID"`
-		ProvenanceRecordID string `json:"provenanceRecordID"`
-	}
+	envelope := buildEnvelopeChain(blocks)
 
-	list := make([]interactionOut, 0, len(interactions))
-	for _, ix := range interactions {
-		list = append(list, interactionOut{
-			InteractionID:      ix.InteractionID,
-			Initiator:          ix.From,
-			InitiatorName:      ix.FromName,
-			To:                 ix.To,
-			ToName:             ix.ToName,
-			Type:               ix.Type,
-			Message:            ix.Message,
-			IntentID:           ix.IntentID,
-			Threat:             ix.Threat,
-			Epoch:              ix.Time.Unix(),
-			Signature:          ix.Signature,
-			ProvenanceReqID:    ix.ProvenanceReqID,
-			ProvenanceRecordID: ix.ProvenanceRecordID,
-		})
-	}
-
-	basicInfo := gin.H{
+	info := gin.H{
 		"intentID":          intent.IntentID,
 		"initiatorDID":      intent.InitiatorDID,
 		"initiatorName":     intent.InitiatorName,
@@ -2044,8 +1997,10 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"basicInfo":    basicInfo,
-			"interactions": list,
+			"type":     "intent_workflow",
+			"version":  "2.0",
+			"info":     info,
+			"envelope": envelope,
 		},
 	})
 }

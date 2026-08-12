@@ -1822,18 +1822,22 @@ func (d *DB) StoreIntentBlockData(r *IntentBlockRecord) error {
 	if createdAt.IsZero() {
 		createdAt = time.Now()
 	}
+	rawData := r.RawData
+	if len(rawData) == 0 {
+		rawData = json.RawMessage("{}")
+	}
 	_, err := d.conn.Exec(`
 		INSERT INTO intent_block_data
 		  (id, intent_id, block_index, agent_did, agent_name, direction, block_type,
 		   message, response, delegate_to, received_from, cbac_app, cbac_decision,
 		   threat_detected, trust_issues, created_at,
-		   from_did, from_name, from_type, to_did, to_name, to_type)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+		   from_did, from_name, from_type, to_did, to_name, to_type, raw_data)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
 		ON CONFLICT (id) DO NOTHING`,
 		r.ID, r.IntentID, r.BlockIndex, r.AgentDID, r.AgentName, r.Direction, r.BlockType,
 		r.Message, r.Response, r.DelegateTo, r.ReceivedFrom, r.CbacApp, r.CbacDecision,
 		threatInt, string(trustJSON), createdAt,
-		r.FromDID, r.FromName, r.FromType, r.ToDID, r.ToName, r.ToType,
+		r.FromDID, r.FromName, r.FromType, r.ToDID, r.ToName, r.ToType, []byte(rawData),
 	)
 	return err
 }
@@ -1845,7 +1849,8 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 		       b.threat_detected, b.trust_issues, b.created_at,
 		       COALESCE(i.signature, ''),
 		       COALESCE(b.from_did, ''), COALESCE(b.from_name, ''), COALESCE(b.from_type, ''),
-		       COALESCE(b.to_did, ''),   COALESCE(b.to_name, ''),   COALESCE(b.to_type, '')
+		       COALESCE(b.to_did, ''),   COALESCE(b.to_name, ''),   COALESCE(b.to_type, ''),
+		       COALESCE(b.raw_data, '{}')
 		FROM intent_block_data b
 		LEFT JOIN new_interactions i
 		       ON i.intent_id      = b.intent_id
@@ -1864,18 +1869,20 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 		r := &IntentBlockRecord{}
 		var threatInt int
 		var trustJSON string
+		var rawData []byte
 		if err := rows.Scan(
 			&r.ID, &r.IntentID, &r.BlockIndex, &r.AgentDID, &r.AgentName,
 			&r.Direction, &r.BlockType, &r.Message, &r.Response,
 			&r.DelegateTo, &r.ReceivedFrom, &r.CbacApp, &r.CbacDecision,
 			&threatInt, &trustJSON, &r.CreatedAt, &r.Signature,
 			&r.FromDID, &r.FromName, &r.FromType,
-			&r.ToDID, &r.ToName, &r.ToType,
+			&r.ToDID, &r.ToName, &r.ToType, &rawData,
 		); err != nil {
 			return nil, err
 		}
 		r.ThreatDetected = threatInt == 1
 		_ = json.Unmarshal([]byte(trustJSON), &r.TrustIssues)
+		r.RawData = json.RawMessage(rawData)
 		result = append(result, r)
 	}
 	return result, nil

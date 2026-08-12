@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"log"
 	"time"
 
@@ -202,6 +203,7 @@ type IntentBlockRecord struct {
 	ToDID          string
 	ToName         string
 	ToType         string
+	RawData        json.RawMessage
 }
 
 type DB struct {
@@ -353,6 +355,7 @@ func New(dsn string) *DB {
 	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_did    TEXT NOT NULL DEFAULT ''`)
 	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_name   TEXT NOT NULL DEFAULT ''`)
 	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_type   TEXT NOT NULL DEFAULT ''`)
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS raw_data  JSONB NOT NULL DEFAULT '{}'`)
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS message TEXT DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''`)

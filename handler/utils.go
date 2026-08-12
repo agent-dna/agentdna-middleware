@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 
+	"agentdna-ratelimit-auth/db"
 	cid "github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 )
@@ -369,6 +370,41 @@ func extractInteractions(blocks []*chainBlock) []interactionExtract {
 // resolveActorName looks up a display name for the given DID from the agents
 // table first, then the users table. Falls back to the envelope-provided name
 // if neither has a record or the DID is empty.
+// buildEnvelopeChain converts an ordered slice of IntentBlockRecords (oldest first,
+// as returned by GetIntentBlocksByIntent) into a nested *workflowEnvelope tree.
+// The oldest block has no parent; each subsequent block wraps the previous one as
+// its parent_envelope. The returned envelope is the newest block (the root).
+func buildEnvelopeChain(blocks []*db.IntentBlockRecord) *workflowEnvelope {
+	if len(blocks) == 0 {
+		return nil
+	}
+	var prev *workflowEnvelope
+	for _, b := range blocks {
+		code := 1000
+		if b.ThreatDetected {
+			code = 2001
+		}
+		env := &workflowEnvelope{
+			From:      b.FromDID,
+			Payload:   b.Message,
+			Epoch:     b.CreatedAt.Unix(),
+			Code:      code,
+			Signature: b.Signature,
+			RawData:   b.RawData,
+		}
+		if prev != nil {
+			env.ParentEnvelope = []*workflowEnvelope{prev}
+		}
+		prev = env
+	}
+	// Attach To from the last block onto the root envelope.
+	// The "to" of the whole chain is the recipient of the newest block.
+	if prev != nil && len(blocks) > 0 {
+		prev.To = blocks[len(blocks)-1].ToDID
+	}
+	return prev
+}
+
 func (h *Handler) resolveActorName(did, fallback string) string {
 	if did == "" || did == "none" {
 		return fallback
