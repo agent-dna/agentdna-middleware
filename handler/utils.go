@@ -390,7 +390,6 @@ func buildEnvelopeChain(blocks []*db.IntentBlockRecord) *workflowEnvelope {
 			Epoch:     b.CreatedAt.Unix(),
 			Code:      code,
 			Signature: b.Signature,
-			RawData:   b.RawData,
 		}
 		if prev != nil {
 			env.ParentEnvelope = []*workflowEnvelope{prev}

@@ -1,10 +1,6 @@
 package handler
 
-import (
-	"encoding/json"
-
-	"github.com/golang-jwt/jwt/v5"
-)
+import "github.com/golang-jwt/jwt/v5"
 
 type Response struct {
 	Status  bool   `json:"status"`
@@ -135,7 +131,6 @@ type workflowEnvelope struct {
 	RunID          string              `json:"run_id"`
 	Hash           string              `json:"hash"`
 	Signature      string              `json:"signature"`
-	RawData        json.RawMessage     `json:"raw_data,omitempty"`
 	ParentEnvelope []*workflowEnvelope `json:"parent_envelope"`
 }
 

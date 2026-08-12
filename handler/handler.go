@@ -767,32 +767,6 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 	})
 }
 
-func (h *Handler) GetIntentRawData(c *gin.Context) {
-	intentID := c.Query("intent_id")
-	if intentID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intent_id is required"})
-		return
-	}
-	blocks, err := h.db.GetIntentBlocksByIntent(intentID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
-		return
-	}
-	type blockRaw struct {
-		BlockIndex int             `json:"block_index"`
-		RawData    json.RawMessage `json:"raw_data"`
-	}
-	result := make([]blockRaw, 0, len(blocks))
-	for _, b := range blocks {
-		raw := b.RawData
-		if len(raw) == 0 {
-			raw = json.RawMessage("{}")
-		}
-		result = append(result, blockRaw{BlockIndex: b.BlockIndex, RawData: raw})
-	}
-	c.JSON(http.StatusOK, Response{Status: true, Data: result})
-}
-
 func (h *Handler) issueToken(claims JWTClaims) (string, error) {
 	claims.RegisteredClaims = jwt.RegisteredClaims{
 		ExpiresAt: jwt.NewNumericDate(time.Now().Add(7 * 24 * time.Hour)),
