@@ -129,6 +129,8 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtra
 	// Sort edges chronologically by child epoch (the child is the "newer" side).
 	sort.Slice(edges, func(i, j int) bool { return edges[i].child.Epoch < edges[j].child.Epoch })
 
+	initiatorDID := all[0].From
+
 	seenAsFrom := map[string]bool{}
 	var result []interactionExtract
 
@@ -147,6 +149,22 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtra
 			Epoch:     ed.parent.Epoch,
 		})
 		seenAsFrom[fromDID] = true
+	}
+
+	// If the last envelope's sender is different from the initiator, it means the
+	// final block is a response back to the initiator — add that closing edge.
+	if root.From != initiatorDID {
+		threat := root.Code != 0 && root.Code != 1000
+		result = append(result, interactionExtract{
+			FromDID:   root.From,
+			ToDID:     initiatorDID,
+			Type:      deriveWorkflowInteractionType(root.From, initiatorDID, len(result), seenAsFrom),
+			Threat:    threat,
+			Message:   root.Payload,
+			Signature: root.Signature,
+			Hash:      root.Hash,
+			Epoch:     root.Epoch,
+		})
 	}
 
 	return result
