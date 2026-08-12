@@ -143,6 +143,7 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtra
 			Threat:    threat,
 			Message:   ed.parent.Payload,
 			Signature: ed.parent.Signature,
+			Hash:      ed.parent.Hash,
 			Epoch:     ed.parent.Epoch,
 		})
 		seenAsFrom[fromDID] = true

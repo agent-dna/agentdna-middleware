@@ -128,6 +128,7 @@ type workflowEnvelope struct {
 	Epoch          int64               `json:"epoch"`
 	Code           int                 `json:"status_code"` // 1000 = OK; 2001-2003 = verification failures
 	RunID          string              `json:"run_id"`
+	Hash           string              `json:"hash"`
 	Signature      string              `json:"signature"`
 	ParentEnvelope []*workflowEnvelope `json:"parent_envelope"`
 }
@@ -179,5 +180,6 @@ type interactionExtract struct {
 	Threat    bool
 	Message   string
 	Signature string
+	Hash      string
 	Epoch     int64
 }

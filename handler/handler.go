@@ -481,7 +481,25 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	}
 
 	intentID := uuid.New().String()
-	interactions := extractInteractionsFromEnvelopes(data.Envelope)
+	rawInteractions := extractInteractionsFromEnvelopes(data.Envelope)
+
+	// Deduplicate: drop an interaction only when hash + from + to are all identical.
+	// Same hash but different to means two distinct agents sent the same block to
+	// different targets — both are real and must be kept.
+	type dedupKey struct{ hash, from, to string }
+	seenKey := map[dedupKey]bool{}
+	interactions := rawInteractions[:0]
+	for _, ix := range rawInteractions {
+		k := dedupKey{ix.Hash, ix.FromDID, ix.ToDID}
+		if ix.Hash != "" && seenKey[k] {
+			log.Printf("[intentWorkflow] dropping duplicate interaction hash=%s from=%s to=%s", ix.Hash, ix.FromDID, ix.ToDID)
+			continue
+		}
+		if ix.Hash != "" {
+			seenKey[k] = true
+		}
+		interactions = append(interactions, ix)
+	}
 
 	// Resolve display names from DB.
 	for i, ix := range interactions {
