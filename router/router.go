@@ -24,7 +24,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 
 	// CBAC authorization gate — called by the agent runtime / SDK.
 	public.POST("/authorize-action", h.AuthorizeAction)
-	public.POST("/app-registration", h.AppRegistration)
+	public.POST("/register-tool", h.AppRegistration)
 	public.GET("/global-stats", h.GlobalStats)
 
 	// Dashboard — JWT protected

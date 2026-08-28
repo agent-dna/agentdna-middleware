@@ -2197,19 +2197,19 @@ func (h *Handler) UpdateProfile(c *gin.Context) {
 
 func (h *Handler) AppRegistration(c *gin.Context) {
 	var req struct {
-		DID  string `json:"did" binding:"required"`
-		Name string `json:"name" binding:"required"`
+		ToolName string `json:"tool_name"`
+		ToolID   string `json:"tool_id"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.DID == "" || req.Name == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did and name are required"})
+	if err := c.ShouldBindJSON(&req); err != nil || req.ToolName == "" || req.ToolID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "tool_name and tool_id are required"})
 		return
 	}
-	if err := h.db.RegisterApp(req.DID, req.Name); err != nil {
-		log.Printf("[AppRegistration] db error did=%s err=%v", req.DID, err)
+	if err := h.db.RegisterApp(req.ToolID, req.ToolName); err != nil {
+		log.Printf("[AppRegistration] db error tool_id=%s err=%v", req.ToolID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to register app"})
 		return
 	}
-	log.Printf("[AppRegistration] registered app did=%s name=%s", req.DID, req.Name)
+	log.Printf("[AppRegistration] registered app tool_id=%s tool_name=%s", req.ToolID, req.ToolName)
 	c.JSON(http.StatusOK, Response{Status: true, Message: "app registered successfully"})
 }
 

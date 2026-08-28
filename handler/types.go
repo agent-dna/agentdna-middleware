@@ -4,7 +4,7 @@ import "github.com/golang-jwt/jwt/v5"
 
 type Response struct {
 	Status  bool   `json:"status"`
-	Data    any    `json:"data"`
+	Data    any    `json:"data,omitempty"`
 	Message string `json:"message"`
 }
 
