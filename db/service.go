@@ -21,8 +21,8 @@ func (d *DB) GetAdminByEmail(email string) (*AdminRecord, error) {
 	var a AdminRecord
 	var orgID, apiKey sql.NullString
 	err := d.conn.QueryRow(
-		`SELECT did, organization_id, api_key, email, password FROM new_admins WHERE email = $1`, email,
-	).Scan(&a.DID, &orgID, &apiKey, &a.Email, &a.PasswordHash)
+		`SELECT did, organization_id, api_key, email, COALESCE(name,''), password FROM new_admins WHERE email = $1`, email,
+	).Scan(&a.DID, &orgID, &apiKey, &a.Email, &a.Name, &a.PasswordHash)
 	if err != nil {
 		return nil, err
 	}
@@ -977,6 +977,35 @@ func (d *DB) GetOrgUserByAPIKey(apiKey string) (*OrgUserRecord, error) {
 	return u, nil
 }
 
+func (d *DB) UpdateUserName(email, name string) error {
+	res, err := d.conn.Exec(`UPDATE new_org_users SET name = $1 WHERE email = $2`, name, email)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("user not found")
+	}
+	return nil
+}
+
+func (d *DB) UpdateUserEmail(currentEmail, newEmail string) error {
+	var exists bool
+	d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM new_org_users WHERE email = $1)`, newEmail).Scan(&exists)
+	if exists {
+		return fmt.Errorf("email already in use")
+	}
+	res, err := d.conn.Exec(`UPDATE new_org_users SET email = $1 WHERE email = $2`, newEmail, currentEmail)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("user not found")
+	}
+	return nil
+}
+
 func (d *DB) UpdateUserDIDByAPIKey(apiKey, did string) error {
 	_, err := d.conn.Exec(
 		`UPDATE new_org_users SET did = $1 WHERE api_key = $2`,
@@ -1111,6 +1140,26 @@ func (d *DB) StoreNewAgent(nftID, did, deployerDID, orgID, policy, agentName str
 		nftID, did, deployerDID, orgID, policy, agentName,
 	)
 	return err
+}
+
+func (d *DB) RegisterApp(did, name string) error {
+	_, err := d.conn.Exec(
+		`INSERT INTO apps (did, name) VALUES ($1, $2) ON CONFLICT (did) DO UPDATE SET name = EXCLUDED.name`,
+		did, name,
+	)
+	return err
+}
+
+func (d *DB) RevokeAgent(agentDID string) error {
+	res, err := d.conn.Exec(`UPDATE new_agents SET revoked = TRUE WHERE did = $1`, agentDID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", agentDID)
+	}
+	return nil
 }
 
 func (d *DB) GetAgentOrgID(agentDID string) (string, error) {
@@ -1484,6 +1533,35 @@ func scanIntentRows(rows *sql.Rows) ([]*IntentRecord, error) {
 	return result, nil
 }
 
+// GetAgentInteractedApps returns the distinct apps (from the apps table) that the
+// agent has interacted with — either as initiator or recipient in new_interactions.
+func (d *DB) GetAgentInteractedApps(agentDID string) ([]string, error) {
+	rows, err := d.conn.Query(`
+		SELECT DISTINCT a.name
+		FROM apps a
+		WHERE a.did IN (
+			SELECT interacted_to_did FROM new_interactions WHERE initiator_did = $1
+			UNION
+			SELECT initiator_did FROM new_interactions WHERE interacted_to_did = $1
+		)
+		ORDER BY a.name ASC`,
+		agentDID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
 func (d *DB) GetAgentInfo(agentDID string) (*AgentDetailRecord, error) {
 	r := &AgentDetailRecord{}
 	err := d.conn.QueryRow(`
@@ -1822,18 +1900,22 @@ func (d *DB) StoreIntentBlockData(r *IntentBlockRecord) error {
 	if createdAt.IsZero() {
 		createdAt = time.Now()
 	}
+	rawData := r.RawData
+	if len(rawData) == 0 {
+		rawData = json.RawMessage("{}")
+	}
 	_, err := d.conn.Exec(`
 		INSERT INTO intent_block_data
 		  (id, intent_id, block_index, agent_did, agent_name, direction, block_type,
 		   message, response, delegate_to, received_from, cbac_app, cbac_decision,
 		   threat_detected, trust_issues, created_at,
-		   from_did, from_name, from_type, to_did, to_name, to_type)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+		   from_did, from_name, from_type, to_did, to_name, to_type, raw_data)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
 		ON CONFLICT (id) DO NOTHING`,
 		r.ID, r.IntentID, r.BlockIndex, r.AgentDID, r.AgentName, r.Direction, r.BlockType,
 		r.Message, r.Response, r.DelegateTo, r.ReceivedFrom, r.CbacApp, r.CbacDecision,
 		threatInt, string(trustJSON), createdAt,
-		r.FromDID, r.FromName, r.FromType, r.ToDID, r.ToName, r.ToType,
+		r.FromDID, r.FromName, r.FromType, r.ToDID, r.ToName, r.ToType, []byte(rawData),
 	)
 	return err
 }
@@ -1845,7 +1927,8 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 		       b.threat_detected, b.trust_issues, b.created_at,
 		       COALESCE(i.signature, ''),
 		       COALESCE(b.from_did, ''), COALESCE(b.from_name, ''), COALESCE(b.from_type, ''),
-		       COALESCE(b.to_did, ''),   COALESCE(b.to_name, ''),   COALESCE(b.to_type, '')
+		       COALESCE(b.to_did, ''),   COALESCE(b.to_name, ''),   COALESCE(b.to_type, ''),
+		       COALESCE(b.raw_data, '{}')
 		FROM intent_block_data b
 		LEFT JOIN new_interactions i
 		       ON i.intent_id      = b.intent_id
@@ -1864,18 +1947,20 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 		r := &IntentBlockRecord{}
 		var threatInt int
 		var trustJSON string
+		var rawData []byte
 		if err := rows.Scan(
 			&r.ID, &r.IntentID, &r.BlockIndex, &r.AgentDID, &r.AgentName,
 			&r.Direction, &r.BlockType, &r.Message, &r.Response,
 			&r.DelegateTo, &r.ReceivedFrom, &r.CbacApp, &r.CbacDecision,
 			&threatInt, &trustJSON, &r.CreatedAt, &r.Signature,
 			&r.FromDID, &r.FromName, &r.FromType,
-			&r.ToDID, &r.ToName, &r.ToType,
+			&r.ToDID, &r.ToName, &r.ToType, &rawData,
 		); err != nil {
 			return nil, err
 		}
 		r.ThreatDetected = threatInt == 1
 		_ = json.Unmarshal([]byte(trustJSON), &r.TrustIssues)
+		r.RawData = json.RawMessage(rawData)
 		result = append(result, r)
 	}
 	return result, nil
@@ -1891,6 +1976,35 @@ func (d *DB) UpdateUserPassword(email, passwordHash string) error {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return fmt.Errorf("no user found with email %s", email)
+	}
+	return nil
+}
+
+func (d *DB) UpdateAdminName(email, name string) error {
+	res, err := d.conn.Exec(`UPDATE new_admins SET name = $1 WHERE email = $2`, name, email)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("user not found")
+	}
+	return nil
+}
+
+func (d *DB) UpdateAdminEmail(currentEmail, newEmail string) error {
+	var exists bool
+	d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM new_admins WHERE email = $1)`, newEmail).Scan(&exists)
+	if exists {
+		return fmt.Errorf("email already in use")
+	}
+	res, err := d.conn.Exec(`UPDATE new_admins SET email = $1 WHERE email = $2`, newEmail, currentEmail)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("user not found")
 	}
 	return nil
 }

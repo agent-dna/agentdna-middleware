@@ -131,3 +131,5 @@ func (h *Handler) CoreRegisterAgent(c *gin.Context) {
 
 	c.JSON(http.StatusOK, Response{Status: true, Message: ""})
 }
+
+

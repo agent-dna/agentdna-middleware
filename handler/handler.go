@@ -237,6 +237,72 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{Status: true, Message: "password updated successfully"})
 }
 
+func (h *Handler) UpdatePassword(c *gin.Context) {
+	var req struct {
+		NewPassword string `json:"new_password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.NewPassword == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "new_password is required"})
+		return
+	}
+	if len(req.NewPassword) < 8 {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "password must be at least 8 characters"})
+		return
+	}
+
+	email := c.GetString(CtxEmail)
+	isAdmin := c.GetBool(CtxIsAdmin)
+
+	if isAdmin {
+		admin, err := h.db.GetAdminByEmail(email)
+		if err != nil {
+			c.JSON(http.StatusNotFound, Response{Status: false, Message: "account not found"})
+			return
+		}
+
+		// Call admin server to update password there.
+		endpoint := h.adminServiceURL + "agent-admin/v1/update-password"
+		b, _ := json.Marshal(map[string]string{"username": admin.Name, "new_password": req.NewPassword})
+		resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
+		if err != nil {
+			log.Printf("[UpdatePassword] admin server http error email=%s err=%v", email, err)
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to reach admin server: %v", err)})
+			return
+		}
+		defer resp.Body.Close()
+
+		var adminResp struct {
+			Status  bool   `json:"status"`
+			Message string `json:"message"`
+		}
+		rawBody, _ := io.ReadAll(resp.Body)
+		if err := json.Unmarshal(rawBody, &adminResp); err != nil {
+			log.Printf("[UpdatePassword] failed to parse admin server response email=%s body=%s", email, string(rawBody))
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "invalid response from admin server"})
+			return
+		}
+		if !adminResp.Status {
+			log.Printf("[UpdatePassword] admin server rejected update email=%s message=%s", email, adminResp.Message)
+			c.JSON(http.StatusBadRequest, Response{Status: false, Message: adminResp.Message})
+			return
+		}
+
+	} else {
+		hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
+			return
+		}
+		if err := h.db.UpdateUserPassword(email, string(hash)); err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to update password"})
+			return
+		}
+	}
+
+	log.Printf("[UpdatePassword] password updated email=%q isAdmin=%v", email, isAdmin)
+	c.JSON(http.StatusOK, Response{Status: true, Message: "password updated successfully"})
+}
+
 // sendMail enqueues an email for the worker pool. Never blocks the request path.
 func (h *Handler) sendMail(msg email.Message, err error) {
 	if err != nil {
@@ -805,6 +871,32 @@ func (h *Handler) GetIntentBlockData(c *gin.Context) {
 		root = node
 	}
 	c.JSON(http.StatusOK, Response{Status: true, Data: root})
+}
+
+func (h *Handler) GetIntentRawData(c *gin.Context) {
+	intentID := c.Query("intent_id")
+	if intentID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intent_id is required"})
+		return
+	}
+	blocks, err := h.db.GetIntentBlocksByIntent(intentID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
+		return
+	}
+	type blockRaw struct {
+		BlockIndex int             `json:"block_index"`
+		RawData    json.RawMessage `json:"raw_data"`
+	}
+	result := make([]blockRaw, 0, len(blocks))
+	for _, b := range blocks {
+		raw := b.RawData
+		if len(raw) == 0 {
+			raw = json.RawMessage("{}")
+		}
+		result = append(result, blockRaw{BlockIndex: b.BlockIndex, RawData: raw})
+	}
+	c.JSON(http.StatusOK, Response{Status: true, Data: result})
 }
 
 func (h *Handler) issueToken(claims JWTClaims) (string, error) {
@@ -2050,6 +2142,129 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 	})
 }
 
+func (h *Handler) UpdateProfile(c *gin.Context) {
+	var req struct {
+		Name  *string `json:"name,omitempty"`
+		Email *string `json:"email,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid request body"})
+		return
+	}
+	if req.Name == nil && req.Email == nil {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "name or email is required"})
+		return
+	}
+
+	callerEmail := c.GetString(CtxEmail)
+	isAdmin := c.GetBool(CtxIsAdmin)
+
+	if req.Name != nil {
+		var err error
+		if isAdmin {
+			err = h.db.UpdateAdminName(callerEmail, *req.Name)
+		} else {
+			err = h.db.UpdateUserName(callerEmail, *req.Name)
+		}
+		if err != nil {
+			log.Printf("[UpdateProfile] update name email=%s err=%v", callerEmail, err)
+			c.JSON(http.StatusBadRequest, Response{Status: false, Message: err.Error()})
+			return
+		}
+	}
+
+	if req.Email != nil {
+		if *req.Email == "" {
+			c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid email format"})
+			return
+		}
+		var err error
+		if isAdmin {
+			err = h.db.UpdateAdminEmail(callerEmail, *req.Email)
+		} else {
+			err = h.db.UpdateUserEmail(callerEmail, *req.Email)
+		}
+		if err != nil {
+			log.Printf("[UpdateProfile] update email from=%s to=%s err=%v", callerEmail, *req.Email, err)
+			c.JSON(http.StatusBadRequest, Response{Status: false, Message: err.Error()})
+			return
+		}
+	}
+
+	log.Printf("[UpdateProfile] profile updated email=%s isAdmin=%v", callerEmail, isAdmin)
+	c.JSON(http.StatusOK, Response{Status: true, Message: "Profile updated successfully"})
+}
+
+func (h *Handler) AppRegistration(c *gin.Context) {
+	var req struct {
+		DID  string `json:"did" binding:"required"`
+		Name string `json:"name" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.DID == "" || req.Name == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "did and name are required"})
+		return
+	}
+	if err := h.db.RegisterApp(req.DID, req.Name); err != nil {
+		log.Printf("[AppRegistration] db error did=%s err=%v", req.DID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to register app"})
+		return
+	}
+	log.Printf("[AppRegistration] registered app did=%s name=%s", req.DID, req.Name)
+	c.JSON(http.StatusOK, Response{Status: true, Message: "app registered successfully"})
+}
+
+func (h *Handler) RevokeAgent(c *gin.Context) {
+	if !c.GetBool(CtxIsAdmin) {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
+		return
+	}
+
+	var req struct {
+		AgentDID string `json:"agent_did" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.AgentDID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agent_did is required"})
+		return
+	}
+
+	// Mark revoked in DB.
+	if err := h.db.RevokeAgent(req.AgentDID); err != nil {
+		log.Printf("[RevokeAgent] db error agent_did=%s err=%v", req.AgentDID, err)
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: err.Error()})
+		return
+	}
+
+	// Call admin server to flip is_active = false on the agent.
+	endpoint := h.adminServiceURL + "agent-admin/v1/revoke-agent"
+	b, _ := json.Marshal(map[string]string{"agent_id": req.AgentDID})
+	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
+	if err != nil {
+		log.Printf("[RevokeAgent] admin server http error agent_did=%s err=%v", req.AgentDID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to reach admin server: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	var adminResp struct {
+		Status  bool   `json:"status"`
+		Message string `json:"message"`
+	}
+	rawBody, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(rawBody, &adminResp); err != nil {
+		log.Printf("[RevokeAgent] failed to parse admin server response agent_did=%s body=%s", req.AgentDID, string(rawBody))
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "invalid response from admin server"})
+		return
+	}
+	if !adminResp.Status {
+		log.Printf("[RevokeAgent] admin server rejected revocation agent_did=%s message=%s", req.AgentDID, adminResp.Message)
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: adminResp.Message})
+		return
+	}
+
+	log.Printf("[RevokeAgent] agent revoked agent_did=%s", req.AgentDID)
+	c.JSON(http.StatusOK, Response{Status: true, Message: adminResp.Message})
+}
+
 func (h *Handler) AgentInfo(c *gin.Context) {
 	agentDID := c.Query("agentDID")
 	w := http.ResponseWriter(c.Writer)
@@ -2075,6 +2290,15 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 
 	deployerName, _ := h.db.GetOrgUserNameByDID(agent.DeployerDID)
 
+	interactedApps, err := h.db.GetAgentInteractedApps(agentDID)
+	if err != nil {
+		log.Printf("[AgentInfo] failed to fetch interacted apps agentDID=%s err=%v", agentDID, err)
+		interactedApps = []string{}
+	}
+	if interactedApps == nil {
+		interactedApps = []string{}
+	}
+
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
@@ -2088,6 +2312,8 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 			"totalInteractions": agent.TotalInteractions,
 			"totalThreats":      agent.TotalThreats,
 			"score":             agent.Score,
+			"appsInteracted":    len(interactedApps),
+			"appsList":          interactedApps,
 		},
 	})
 }

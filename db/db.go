@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"log"
 	"time"
 
@@ -20,6 +21,7 @@ type AdminRecord struct {
 	OrganizationID string
 	APIKey         string
 	Email          string
+	Name           string
 	PasswordHash   string
 }
 
@@ -202,6 +204,7 @@ type IntentBlockRecord struct {
 	ToDID          string
 	ToName         string
 	ToType         string
+	RawData        json.RawMessage
 }
 
 type DB struct {
@@ -354,6 +357,7 @@ func New(dsn string) *DB {
 	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_name   TEXT NOT NULL DEFAULT ''`)
 	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_type   TEXT NOT NULL DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
+	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE`)
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS message TEXT DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
@@ -374,6 +378,11 @@ func New(dsn string) *DB {
 	conn.Exec(`ALTER TABLE new_tools DROP CONSTRAINT IF EXISTS new_tools_pkey`)
 	conn.Exec(`ALTER TABLE new_tools ADD PRIMARY KEY (did) `)
 	conn.Exec(`ALTER TABLE new_tools ALTER COLUMN organization_id DROP NOT NULL`)
+	conn.Exec(`CREATE TABLE IF NOT EXISTS apps (
+		did        TEXT PRIMARY KEY,
+		name       TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ DEFAULT NOW()
+	)`)
 
 	return &DB{conn: conn}
 }
