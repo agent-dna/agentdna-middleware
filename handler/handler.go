@@ -642,18 +642,26 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 			}
 			seenDIDs[did] = true
 			name := h.resolveActorName(did, "")
-			// Human user — already in new_org_users, skip.
+			// Already a known user — skip.
 			if uname, err := h.db.GetOrgUserNameByDID(did); err == nil && uname != "" {
+				log.Printf("[intentWorkflow] did=%s is a user, skipping", did)
 				continue
 			}
-			// App/tool — store in new_tools, skip new_agents.
+			// Already a known agent — skip.
+			if agent, err := h.db.GetAgentInfo(did); err == nil && agent.AgentDID != "" {
+				log.Printf("[intentWorkflow] did=%s is already an agent, skipping", did)
+				continue
+			}
+			// Found in apps table — skip (registered tool/app).
 			if h.db.IsApp(did) {
-				_ = h.db.StoreNewTool(did, name, orgID)
+				log.Printf("[intentWorkflow] did=%s is an app, skipping", did)
 				continue
 			}
-			// Otherwise treat as agent.
+			// Unknown DID — store as agent.
 			if err := h.db.StoreNewAgent(uuid.New().String(), did, initiatorDID, orgID, "", name); err != nil {
 				log.Printf("[intentWorkflow] StoreNewAgent did=%s: %v", did, err)
+			} else {
+				log.Printf("[intentWorkflow] new agent stored did=%s name=%s", did, name)
 			}
 		}
 	}
@@ -672,9 +680,6 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, eventTime,
 		); err != nil {
 			return "", fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
-		}
-		if ix.Type == "tool_call" {
-			_ = h.db.StoreNewTool(ix.ToDID, ix.ToName, orgID)
 		}
 		log.Printf("[intentWorkflow] interaction[%d] from=%s to=%s type=%s threat=%v", idx, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
 	}

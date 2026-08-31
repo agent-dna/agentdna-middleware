@@ -127,7 +127,7 @@ type intentWorkflowData struct {
 }
 
 type workflowEnvelope struct {
-	From           string              `json:"from_"`
+	From           string              `json:"from"`
 	To             string              `json:"to,omitempty"`
 	Payload        json.RawMessage     `json:"payload"`
 	Epoch          int64               `json:"epoch"`
