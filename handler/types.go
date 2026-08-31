@@ -1,6 +1,10 @@
 package handler
 
-import "github.com/golang-jwt/jwt/v5"
+import (
+	"encoding/json"
+
+	"github.com/golang-jwt/jwt/v5"
+)
 
 type Response struct {
 	Status  bool   `json:"status"`
@@ -123,13 +127,15 @@ type intentWorkflowData struct {
 }
 
 type workflowEnvelope struct {
-	From           string              `json:"from"`
-	Payload        string              `json:"payload"`
+	From           string              `json:"from_"`
+	To             string              `json:"to,omitempty"`
+	Payload        json.RawMessage     `json:"payload"`
 	Epoch          int64               `json:"epoch"`
-	Code           int                 `json:"status_code"` // 1000 = OK; 2001-2003 = verification failures
+	Code           int                 `json:"status_code"`
 	RunID          string              `json:"run_id"`
 	Hash           string              `json:"hash"`
 	Signature      string              `json:"signature"`
+	RawData        json.RawMessage     `json:"raw_data,omitempty"`
 	ParentEnvelope []*workflowEnvelope `json:"parent_envelope"`
 }
 

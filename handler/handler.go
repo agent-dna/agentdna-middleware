@@ -547,18 +547,75 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	}
 
 	intentID := uuid.New().String()
+	orgID := h.orgID
+
+	// All envelope nodes sorted oldest→newest.
+	allEnvelopes := collectAllEnvelopes(data.Envelope)
+	initiatorDID := allEnvelopes[0].From
+	initiatorName := h.resolveActorName(initiatorDID, "")
+
+	// Build child map: parent node → its children (envelopes that list it as parent).
+	// Used to derive the "to" of each node.
+	childMap := map[*workflowEnvelope][]*workflowEnvelope{}
+	visitedCM := map[*workflowEnvelope]bool{}
+	var buildChildMap func(e *workflowEnvelope)
+	buildChildMap = func(e *workflowEnvelope) {
+		if e == nil || visitedCM[e] {
+			return
+		}
+		visitedCM[e] = true
+		for _, p := range e.ParentEnvelope {
+			childMap[p] = append(childMap[p], e)
+			buildChildMap(p)
+		}
+	}
+	buildChildMap(data.Envelope)
+
+	// ── Store one raw block row per envelope node ─────────────────────────────
+	for idx, env := range allEnvelopes {
+		// Derive to: first child's From, or initiatorDID for root if different.
+		var toDID string
+		if children := childMap[env]; len(children) > 0 {
+			toDID = children[0].From
+		} else if env.From != initiatorDID {
+			toDID = initiatorDID
+		}
+
+		rawJSON, _ := json.Marshal(env)
+		msg := extractPayloadText(env.Payload)
+		threat := env.Code != 0 && env.Code != 1000
+
+		blockRec := &db.IntentBlockRecord{
+			ID:             fmt.Sprintf("%s-block-%d", intentID, idx),
+			IntentID:       intentID,
+			BlockIndex:     idx,
+			AgentDID:       env.From,
+			AgentName:      h.resolveActorName(env.From, ""),
+			Message:        msg,
+			Signature:      env.Signature,
+			ThreatDetected: threat,
+			TrustIssues:    []string{},
+			CreatedAt:      time.Unix(env.Epoch, 0).UTC(),
+			FromDID:        env.From,
+			ToDID:          toDID,
+			RawData:        json.RawMessage(rawJSON),
+		}
+		if err := h.db.StoreIntentBlockData(blockRec); err != nil {
+			log.Printf("[intentWorkflow] block data save error idx=%d: %v", idx, err)
+		}
+	}
+
+	// ── Extract interactions from DAG edges ──────────────────────────────────
 	rawInteractions := extractInteractionsFromEnvelopes(data.Envelope)
 
-	// Deduplicate: drop an interaction only when hash + from + to are all identical.
-	// Same hash but different to means two distinct agents sent the same block to
-	// different targets — both are real and must be kept.
+	// Deduplicate: drop only when hash + from + to are all identical.
 	type dedupKey struct{ hash, from, to string }
 	seenKey := map[dedupKey]bool{}
 	interactions := rawInteractions[:0]
 	for _, ix := range rawInteractions {
 		k := dedupKey{ix.Hash, ix.FromDID, ix.ToDID}
 		if ix.Hash != "" && seenKey[k] {
-			log.Printf("[intentWorkflow] dropping duplicate interaction hash=%s from=%s to=%s", ix.Hash, ix.FromDID, ix.ToDID)
+			log.Printf("[intentWorkflow] dropping duplicate hash=%s from=%s to=%s", ix.Hash, ix.FromDID, ix.ToDID)
 			continue
 		}
 		if ix.Hash != "" {
@@ -567,46 +624,36 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		interactions = append(interactions, ix)
 	}
 
-	// Resolve display names from DB.
+	// Resolve display names.
 	for i, ix := range interactions {
 		interactions[i].FromName = h.resolveActorName(ix.FromDID, ix.FromName)
 		interactions[i].ToName = h.resolveActorName(ix.ToDID, ix.ToName)
 	}
 
-	// Oldest envelope (via linear walk) gives us the initiator.
-	envelopes := walkEnvelopes(data.Envelope)
-	initiatorDID := ""
-	initiatorName := ""
-	if len(envelopes) > 0 {
-		initiatorDID = envelopes[0].From
-		initiatorName = h.resolveActorName(initiatorDID, "")
-	}
+	log.Printf("[intentWorkflow] parsed ok — dag_envelopes=%d interactions=%d initiator=%s intentID=%s orgID=%s",
+		len(allEnvelopes), len(interactions), initiatorDID, intentID, orgID)
 
-	allEnvelopes := collectAllEnvelopes(data.Envelope)
-	log.Printf("[intentWorkflow] parsed ok — linear_envelopes=%d dag_envelopes=%d interactions=%d initiator=%s",
-		len(envelopes), len(allEnvelopes), len(interactions), initiatorDID)
-	for i, ix := range interactions {
-		log.Printf("[intentWorkflow] interaction[%d] from=%s(%s) to=%s(%s) type=%s threat=%v",
-			i, ix.FromName, ix.FromDID, ix.ToName, ix.ToDID, ix.Type, ix.Threat)
-	}
-
-	// ── Resolve org ──────────────────────────────────────────────────────────
-	orgID := h.orgID
-	log.Printf("[intentWorkflow] orgID=%s intentID=%s", orgID, intentID)
-
-	// ── Ensure agents exist — all unique DIDs across every branch ────────────
-	seen := map[string]bool{}
+	// ── Ensure actors exist in the correct tables ────────────────────────────
+	seenDIDs := map[string]bool{}
 	for _, ix := range interactions {
 		for _, did := range []string{ix.FromDID, ix.ToDID} {
-			if did == "" || seen[did] {
+			if did == "" || seenDIDs[did] {
 				continue
 			}
-			seen[did] = true
+			seenDIDs[did] = true
 			name := h.resolveActorName(did, "")
+			// Human user — already in new_org_users, skip.
+			if uname, err := h.db.GetOrgUserNameByDID(did); err == nil && uname != "" {
+				continue
+			}
+			// App/tool — store in new_tools, skip new_agents.
+			if h.db.IsApp(did) {
+				_ = h.db.StoreNewTool(did, name, orgID)
+				continue
+			}
+			// Otherwise treat as agent.
 			if err := h.db.StoreNewAgent(uuid.New().String(), did, initiatorDID, orgID, "", name); err != nil {
-				log.Printf("[intentWorkflow] StoreNewAgent did=%s name=%s: %v", did, name, err)
-			} else {
-				log.Printf("[intentWorkflow] agent saved did=%s name=%s", did, name)
+				log.Printf("[intentWorkflow] StoreNewAgent did=%s: %v", did, err)
 			}
 		}
 	}
@@ -629,39 +676,16 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		if ix.Type == "tool_call" {
 			_ = h.db.StoreNewTool(ix.ToDID, ix.ToName, orgID)
 		}
-
-		blockRec := &db.IntentBlockRecord{
-			ID:             iid,
-			IntentID:       intentID,
-			BlockIndex:     idx,
-			AgentDID:       ix.FromDID,
-			AgentName:      ix.FromName,
-			BlockType:      ix.Type,
-			Message:        ix.Message,
-			ThreatDetected: ix.Threat,
-			TrustIssues:    []string{},
-			CreatedAt:      eventTime,
-			FromDID:        ix.FromDID,
-			FromName:       ix.FromName,
-			FromType:       "",
-			ToDID:          ix.ToDID,
-			ToName:         ix.ToName,
-			ToType:         "",
-		}
-		if err := h.db.StoreIntentBlockData(blockRec); err != nil {
-			log.Printf("[intentWorkflow] block data save error idx=%d: %v", idx, err)
-		}
+		log.Printf("[intentWorkflow] interaction[%d] from=%s to=%s type=%s threat=%v", idx, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
 	}
 
 	// ── Store intent ─────────────────────────────────────────────────────────
 	flowType := detectFlowTypeFromExtracts(interactions)
-	chainDepth := len(allEnvelopes)
 	executor := initiatorName
 	if executor == "" {
 		executor = initiatorDID
 	}
-
-	if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, chainDepth, threatDetected, interactionIDs); err != nil {
+	if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, len(allEnvelopes), threatDetected, interactionIDs); err != nil {
 		log.Printf("[intentWorkflow] intent save error: %v", err)
 		return "", err
 	}

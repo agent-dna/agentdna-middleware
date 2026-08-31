@@ -459,8 +459,8 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		       SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                           AS threat_count,
 		       MIN(i.time)                                                               AS first_interaction_at,
 		       MAX(i.time)                                                               AS last_interaction_at,
-		       (SELECT COALESCE(message,'') FROM new_interactions
-		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1)               AS title
+		       COALESCE((SELECT message FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
@@ -1142,6 +1142,12 @@ func (d *DB) StoreNewAgent(nftID, did, deployerDID, orgID, policy, agentName str
 	return err
 }
 
+func (d *DB) IsApp(did string) bool {
+	var exists bool
+	d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM apps WHERE did = $1)`, did).Scan(&exists)
+	return exists
+}
+
 func (d *DB) RegisterApp(did, name string) error {
 	_, err := d.conn.Exec(
 		`INSERT INTO apps (did, name) VALUES ($1, $2) ON CONFLICT (did) DO UPDATE SET name = EXCLUDED.name`,
@@ -1396,8 +1402,8 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 		       SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                          AS threat_count,
 		       MIN(i.time)                                                             AS first_interaction_at,
 		       MAX(i.time)                                                             AS last_interaction_at,
-		       (SELECT COALESCE(message,'') FROM new_interactions
-		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1)             AS title
+		       COALESCE((SELECT message FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
@@ -1463,8 +1469,8 @@ func (d *DB) GetAgentIntents(agentDID, orgID string, limit, offset int) ([]*Inte
 		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at,
 		       ni.ended_at, ni.status, ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
-		       (SELECT COALESCE(message,'') FROM new_interactions
-		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1) AS title
+		       COALESCE((SELECT message FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		JOIN new_interactions i ON i.intent_id = ni.intent_id
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
@@ -1495,8 +1501,8 @@ func (d *DB) GetUserIntents(userDID, orgID string, limit, offset int) ([]*Intent
 		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at, ni.ended_at,
 		       ni.status, ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
-		       (SELECT COALESCE(message,'') FROM new_interactions
-		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1) AS title
+		       COALESCE((SELECT message FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		WHERE ni.initiator_did = $1 AND ni.organization_id = $2
@@ -1721,8 +1727,8 @@ func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*Inte
 		       SUM(CASE WHEN ix.threat = 1 THEN 1 ELSE 0 END)                           AS threat_count,
 		       MIN(ix.time)                                                              AS first_interaction_at,
 		       MAX(ix.time)                                                              AS last_interaction_at,
-		       (SELECT COALESCE(message,'') FROM new_interactions
-		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1)               AS title
+		       COALESCE((SELECT message FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		JOIN new_interactions tool_ix ON tool_ix.intent_id = ni.intent_id AND tool_ix.interacted_to_did = $1
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did

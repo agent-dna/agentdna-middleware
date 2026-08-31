@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 
+	"agentdna-ratelimit-auth/db"
 	cid "github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 )
@@ -52,6 +53,34 @@ func parseIntentWorkflow(data string) (*intentWorkflowData, error) {
 		return nil, fmt.Errorf("parseIntentWorkflow: %v", err)
 	}
 	return &d, nil
+}
+
+// extractPayloadText returns the human-readable text from an envelope payload.
+// Payload can be a plain JSON string or a JSON array of content blocks
+// (e.g. [{type:"text", text:"..."}]). Returns the raw JSON bytes as a string
+// if neither form matches.
+func extractPayloadText(payload json.RawMessage) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	// Try array of content blocks.
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(payload, &blocks) == nil {
+		for _, b := range blocks {
+			if b.Type == "text" && b.Text != "" {
+				return b.Text
+			}
+		}
+	}
+	// Try plain string.
+	var s string
+	if json.Unmarshal(payload, &s) == nil {
+		return s
+	}
+	return string(payload)
 }
 
 // walkEnvelopes unrolls the parent_envelope chain into chronological order (oldest first).
@@ -143,7 +172,7 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtra
 			ToDID:     toDID,
 			Type:      deriveWorkflowInteractionType(fromDID, toDID, i, seenAsFrom),
 			Threat:    threat,
-			Message:   ed.parent.Payload,
+			Message:   extractPayloadText(ed.parent.Payload),
 			Signature: ed.parent.Signature,
 			Hash:      ed.parent.Hash,
 			Epoch:     ed.parent.Epoch,
@@ -160,7 +189,7 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtra
 			ToDID:     initiatorDID,
 			Type:      deriveWorkflowInteractionType(root.From, initiatorDID, len(result), seenAsFrom),
 			Threat:    threat,
-			Message:   root.Payload,
+			Message:   extractPayloadText(root.Payload),
 			Signature: root.Signature,
 			Hash:      root.Hash,
 			Epoch:     root.Epoch,
@@ -369,6 +398,38 @@ func extractInteractions(blocks []*chainBlock) []interactionExtract {
 // resolveActorName looks up a display name for the given DID from the agents
 // table first, then the users table. Falls back to the envelope-provided name
 // if neither has a record or the DID is empty.
+// buildEnvelopeChain converts an ordered slice of IntentBlockRecords (oldest first)
+// into a nested *workflowEnvelope tree for the /intent-block-data and /intent-diagram APIs.
+func buildEnvelopeChain(blocks []*db.IntentBlockRecord) *workflowEnvelope {
+	if len(blocks) == 0 {
+		return nil
+	}
+	var prev *workflowEnvelope
+	for _, b := range blocks {
+		code := 1000
+		if b.ThreatDetected {
+			code = 2001
+		}
+		payloadJSON, _ := json.Marshal(b.Message)
+		env := &workflowEnvelope{
+			From:      b.FromDID,
+			Payload:   json.RawMessage(payloadJSON),
+			Epoch:     b.CreatedAt.Unix(),
+			Code:      code,
+			Signature: b.Signature,
+			RawData:   b.RawData,
+		}
+		if prev != nil {
+			env.ParentEnvelope = []*workflowEnvelope{prev}
+		}
+		prev = env
+	}
+	if prev != nil && len(blocks) > 0 {
+		prev.To = blocks[len(blocks)-1].ToDID
+	}
+	return prev
+}
+
 func (h *Handler) resolveActorName(did, fallback string) string {
 	if did == "" || did == "none" {
 		return fallback
