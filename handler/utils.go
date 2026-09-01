@@ -125,8 +125,9 @@ func collectAllEnvelopes(root *workflowEnvelope) []*workflowEnvelope {
 
 // extractInteractionsFromEnvelopes traverses the full envelope DAG and returns one
 // interaction per parent→child edge, plus a final edge from the newest envelope back
-// to the original initiator. Handles parallel branches via the full parent_envelope array.
-func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID string) []interactionExtract {
+// to the executor (the entity that submitted the tx). Handles parallel branches via
+// the full parent_envelope array.
+func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID, executorDID string) []interactionExtract {
 	if root == nil {
 		return nil
 	}
@@ -139,6 +140,10 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID strin
 	// Fall back to base envelope's From if no explicit initiator was provided.
 	if initiatorDID == "" {
 		initiatorDID = all[0].From
+	}
+	// Fall back to initiator if no explicit executor was provided.
+	if executorDID == "" {
+		executorDID = initiatorDID
 	}
 
 	// Build parent→child edges by walking from the root (newest) down each branch.
@@ -196,15 +201,15 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID strin
 		seenAsFrom[fromDID] = true
 	}
 
-	// Closing edge: last envelope's sender → initiator (response back to caller).
-	// Always added, even when root.From == initiatorDID — in that case it's a
-	// self-loop (from == to == initiatorDID), so the provenance line's final
-	// "to" is always the initiator.
+	// Closing edge: last envelope's sender → executor (response back to whoever
+	// submitted the tx). Always added, even when root.From == executorDID — in
+	// that case it's a self-loop (from == to == executorDID), so the provenance
+	// line's final "to" is always the executor.
 	threat := root.Code != 0 && root.Code != 1000
 	result = append(result, interactionExtract{
 		FromDID:   root.From,
-		ToDID:     initiatorDID,
-		Type:      deriveWorkflowInteractionType(root.From, initiatorDID, len(result), seenAsFrom),
+		ToDID:     executorDID,
+		Type:      deriveWorkflowInteractionType(root.From, executorDID, len(result), seenAsFrom),
 		Threat:    threat,
 		Message:   extractPayloadText(root.Payload),
 		Signature: root.Signature,

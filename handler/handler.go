@@ -555,11 +555,21 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 
 	// All envelope nodes sorted oldest→newest.
 	allEnvelopes := collectAllEnvelopes(data.Envelope)
-	// Initiator is always the root envelope's From — the top-level envelope
-	// (data.Envelope, newest node in the chain) — not the NFT payload's
+	// Initiator is always the root (oldest/base, no-parent) envelope's From —
+	// the entity that actually kicked off the chain — not the NFT payload's
 	// initiator field.
-	initiatorDID := data.Envelope.From
+	initiatorDID := allEnvelopes[0].From
 	initiatorName := h.resolveActorName(initiatorDID, "")
+	// Executor is the NFT payload's initiator (the entity that submitted the
+	// transaction) — distinct from initiatorDID. Used to close the provenance
+	// line back to whoever actually submitted the tx.
+	executor := nftInfo.Initiator
+	if executor == "" {
+		executor = initiatorName
+	}
+	if executor == "" {
+		executor = initiatorDID
+	}
 
 	// Build child map: parent node → its children (envelopes that list it as parent).
 	// Used to derive the "to" of each node.
@@ -638,7 +648,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	}
 
 	// ── Extract interactions from DAG edges ──────────────────────────────────
-	rawInteractions := extractInteractionsFromEnvelopes(data.Envelope, initiatorDID)
+	rawInteractions := extractInteractionsFromEnvelopes(data.Envelope, initiatorDID, executor)
 
 	// Deduplicate: drop only when hash + from + to are all identical.
 	type dedupKey struct{ hash, from, to string }
@@ -719,10 +729,6 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 
 	// ── Store intent ─────────────────────────────────────────────────────────
 	flowType := detectFlowTypeFromExtracts(interactions)
-	executor := initiatorName
-	if executor == "" {
-		executor = initiatorDID
-	}
 	if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, len(allEnvelopes), threatDetected, interactionIDs); err != nil {
 		log.Printf("[intentWorkflow] intent save error: %v", err)
 		return "", err
