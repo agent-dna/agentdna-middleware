@@ -34,10 +34,11 @@ type FTInfo struct {
 }
 
 type NFTInfo struct {
-	NFTId string  `json:"nftId"`
-	Value float64 `json:"value"`
-	Data       string  `json:"data"`
+	NFTId       string  `json:"nftId"`
+	Value       float64 `json:"value"`
+	Data        string  `json:"data"`
 	ParentNFTId string  `json:"parentNFTId,omitempty"`
+	Initiator   string  `json:"initiator,omitempty"`
 }
 
 type SmartContractInfo struct {

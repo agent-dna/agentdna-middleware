@@ -1,13 +1,16 @@
 package handler
 
 import (
+	"encoding/json"
 	"testing"
 )
+
+func rp(s string) json.RawMessage { return json.RawMessage(`"` + s + `"`) }
 
 // --- walkEnvelopes (linear display walk) ---
 
 func TestWalkEnvelopes_SingleBlock(t *testing.T) {
-	root := &workflowEnvelope{From: "user", Payload: "hello", Epoch: 1}
+	root := &workflowEnvelope{From: "user", Payload: rp("hello"), Epoch: 1}
 	envs := walkEnvelopes(root)
 	if len(envs) != 1 {
 		t.Fatalf("expected 1, got %d", len(envs))
@@ -60,12 +63,12 @@ func TestCollectAllEnvelopes_Parallel(t *testing.T) {
 func TestExtractInteractions_Linear(t *testing.T) {
 	// user → agentA → agentB → agentA
 	// last block (agentA) != initiator (user) → final edge agentA→user is added
-	user := &workflowEnvelope{From: "user", Payload: "start", Epoch: 1, Code: 1000}
-	agentA1 := &workflowEnvelope{From: "agentA", Payload: "delegate", Epoch: 2, Code: 1000, ParentEnvelope: []*workflowEnvelope{user}}
-	agentB := &workflowEnvelope{From: "agentB", Payload: "reply", Epoch: 3, Code: 1000, ParentEnvelope: []*workflowEnvelope{agentA1}}
-	agentA2 := &workflowEnvelope{From: "agentA", Payload: "final", Epoch: 4, Code: 1000, ParentEnvelope: []*workflowEnvelope{agentB}}
+	user := &workflowEnvelope{From: "user", Payload: rp("start"), Epoch: 1, Code: 1000}
+	agentA1 := &workflowEnvelope{From: "agentA", Payload: rp("delegate"), Epoch: 2, Code: 1000, ParentEnvelope: []*workflowEnvelope{user}}
+	agentB := &workflowEnvelope{From: "agentB", Payload: rp("reply"), Epoch: 3, Code: 1000, ParentEnvelope: []*workflowEnvelope{agentA1}}
+	agentA2 := &workflowEnvelope{From: "agentA", Payload: rp("final"), Epoch: 4, Code: 1000, ParentEnvelope: []*workflowEnvelope{agentB}}
 
-	ixs := extractInteractionsFromEnvelopes(agentA2)
+	ixs := extractInteractionsFromEnvelopes(agentA2, "")
 	// Edges: user→agentA, agentA→agentB, agentB→agentA, + final agentA→user
 	if len(ixs) != 4 {
 		t.Fatalf("expected 4 interactions, got %d", len(ixs))
@@ -90,11 +93,11 @@ func TestExtractInteractions_Linear(t *testing.T) {
 
 func TestExtractInteractions_Linear_SameInitiator(t *testing.T) {
 	// user → agentA → user (last block's From == initiator → no final edge added)
-	user1 := &workflowEnvelope{From: "user", Payload: "start", Epoch: 1, Code: 1000}
-	agentA := &workflowEnvelope{From: "agentA", Payload: "work", Epoch: 2, Code: 1000, ParentEnvelope: []*workflowEnvelope{user1}}
-	user2 := &workflowEnvelope{From: "user", Payload: "done", Epoch: 3, Code: 1000, ParentEnvelope: []*workflowEnvelope{agentA}}
+	user1 := &workflowEnvelope{From: "user", Payload: rp("start"), Epoch: 1, Code: 1000}
+	agentA := &workflowEnvelope{From: "agentA", Payload: rp("work"), Epoch: 2, Code: 1000, ParentEnvelope: []*workflowEnvelope{user1}}
+	user2 := &workflowEnvelope{From: "user", Payload: rp("done"), Epoch: 3, Code: 1000, ParentEnvelope: []*workflowEnvelope{agentA}}
 
-	ixs := extractInteractionsFromEnvelopes(user2)
+	ixs := extractInteractionsFromEnvelopes(user2, "")
 	// Edges: user→agentA, agentA→user — no extra final edge (last.From == initiator)
 	if len(ixs) != 2 {
 		t.Fatalf("expected 2 interactions, got %d", len(ixs))
@@ -118,7 +121,7 @@ func TestExtractInteractions_Parallel(t *testing.T) {
 	agentC := &workflowEnvelope{From: "agentC", Epoch: 3, Code: 1000, ParentEnvelope: []*workflowEnvelope{agentA1}}
 	merger := &workflowEnvelope{From: "agentA", Epoch: 4, Code: 1000, ParentEnvelope: []*workflowEnvelope{agentB, agentC}}
 
-	ixs := extractInteractionsFromEnvelopes(merger)
+	ixs := extractInteractionsFromEnvelopes(merger, "")
 	// 5 edges + 1 final (agentA→user)
 	if len(ixs) != 6 {
 		t.Fatalf("expected 6 interactions, got %d", len(ixs))
@@ -151,7 +154,7 @@ func TestExtractInteractions_ThreatDetection(t *testing.T) {
 	agentA := &workflowEnvelope{From: "agentA", Epoch: 2, Code: 2001, ParentEnvelope: []*workflowEnvelope{user}}
 	agentB := &workflowEnvelope{From: "agentB", Epoch: 3, Code: 0, ParentEnvelope: []*workflowEnvelope{agentA}}
 
-	ixs := extractInteractionsFromEnvelopes(agentB)
+	ixs := extractInteractionsFromEnvelopes(agentB, "")
 
 	// 2 edges + 1 final (agentB→user)
 	if len(ixs) != 3 {
@@ -175,7 +178,7 @@ func TestExtractInteractions_ThreatDetection(t *testing.T) {
 }
 
 func TestExtractInteractions_Nil(t *testing.T) {
-	ixs := extractInteractionsFromEnvelopes(nil)
+	ixs := extractInteractionsFromEnvelopes(nil, "")
 	if len(ixs) != 0 {
 		t.Errorf("expected empty, got %d", len(ixs))
 	}
@@ -218,7 +221,7 @@ func TestParseIntentWorkflow_NewSchema(t *testing.T) {
 		t.Fatal("envelope is nil")
 	}
 
-	ixs := extractInteractionsFromEnvelopes(wf.Envelope)
+	ixs := extractInteractionsFromEnvelopes(wf.Envelope, "")
 	// user→agentB, agentB→agentA, + final agentA→user (agentA != user)
 	if len(ixs) != 3 {
 		t.Fatalf("expected 3 interactions, got %d", len(ixs))

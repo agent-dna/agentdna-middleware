@@ -67,12 +67,34 @@ type InteractionRecord struct {
 	Type                string
 	Direction           string
 	Threat              bool
+	ThreatID            string
 	IntentID            string
 	Message             string
 	Signature           string
 	ProvenanceReqID     string
 	ProvenanceRecordID  string
 	Time                time.Time
+}
+
+type ThreatRecord struct {
+	ID            string
+	IntentID      string
+	InteractionID string
+	Time          time.Time
+	ThreatCode    int
+	Message       string
+}
+
+type ThreatCodeRecord struct {
+	Code        int
+	Title       string
+	Description string
+}
+
+type TopThreatRecord struct {
+	ThreatCode int
+	Title      string
+	Count      int
 }
 
 type IntentRecord struct {
@@ -378,11 +400,54 @@ func New(dsn string) *DB {
 	conn.Exec(`ALTER TABLE new_tools DROP CONSTRAINT IF EXISTS new_tools_pkey`)
 	conn.Exec(`ALTER TABLE new_tools ADD PRIMARY KEY (did) `)
 	conn.Exec(`ALTER TABLE new_tools ALTER COLUMN organization_id DROP NOT NULL`)
+	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS threat_id TEXT NOT NULL DEFAULT ''`)
 	conn.Exec(`CREATE TABLE IF NOT EXISTS apps (
 		did        TEXT PRIMARY KEY,
 		name       TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMPTZ DEFAULT NOW()
 	)`)
+
+	conn.Exec(`CREATE TABLE IF NOT EXISTS threats (
+		id             TEXT PRIMARY KEY,
+		intent_id      TEXT NOT NULL,
+		interaction_id TEXT NOT NULL,
+		time           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		threat_code    INT NOT NULL DEFAULT 0,
+		message        TEXT NOT NULL DEFAULT ''
+	)`)
+
+	conn.Exec(`CREATE TABLE IF NOT EXISTS threat_codes (
+		code        INT PRIMARY KEY,
+		title       TEXT NOT NULL DEFAULT '',
+		description TEXT NOT NULL DEFAULT ''
+	)`)
+
+	// Seed known threat codes.
+	conn.Exec(`INSERT INTO threat_codes (code, title, description) VALUES
+		(2001, 'COCA Verification Failed (Light)',    'Light COCA verification failed — the interaction did not pass the lightweight consistency check'),
+		(2002, 'COCA Verification Failed (Heavy)',    'Heavy COCA verification failed — the interaction did not pass the full consistency check'),
+		(2003, 'COCA Verification Failed (Boundary)','Boundary COCA verification failed — the interaction violated a policy boundary constraint'),
+		(3001, 'Guard: Intended Action Empty',  'Pre-model guard failed — the intended action field is empty'),
+		(3002, 'Guard: Policy Lookup Failed',   'Pre-model guard failed — could not look up the policy for this agent'),
+		(3003, 'Guard: No Policy Available',    'Pre-model guard failed — no policy is available for this agent'),
+		(3004, 'Guard: Policy Index Failed',    'Pre-model guard failed — policy index could not be built or loaded'),
+		(3005, 'Guard: Policy No Content',      'Pre-model guard failed — the policy document has no usable content'),
+		(3101, 'Check 1: Drift Deny',           'Drift check denied — the request deviates from the established baseline'),
+		(3201, 'Tier 1: Gap Allow',             'Tier 1 cosine-gap check passed — action allowed'),
+		(3202, 'Tier 1: Gap Deny',              'Tier 1 cosine-gap check failed — semantic distance exceeds threshold'),
+		(3301, 'Tier 2: No Allowed Chunks',     'Tier 2 NLI check failed — no policy chunks were marked as allowed'),
+		(3302, 'Tier 2: Entailment Allow',      'Tier 2 NLI entailment check passed — action allowed'),
+		(3303, 'Tier 2: Contradiction Deny',    'Tier 2 NLI contradiction check failed — action contradicts policy'),
+		(3401, 'Tier 3: No Backend',            'Tier 3 LLM backend is not configured — decision deferred'),
+		(3402, 'Tier 3: LLM Error',             'Tier 3 LLM backend returned an error — decision deferred'),
+		(3403, 'Tier 3: LLM Keyword Deny',      'Tier 3 LLM detected a deny keyword in the response'),
+		(3404, 'Tier 3: LLM Keyword Allow',     'Tier 3 LLM detected an allow keyword in the response'),
+		(3405, 'Tier 3: LLM Inconclusive',      'Tier 3 LLM response was inconclusive — decision deferred'),
+		(3406, 'Tier 3: LLM Allow',             'Tier 3 LLM explicitly allowed the action'),
+		(3407, 'Tier 3: LLM Deny',              'Tier 3 LLM explicitly denied the action'),
+		(3408, 'Tier 3: LLM Advise',            'Tier 3 LLM returned an advisory — human review recommended'),
+		(3409, 'Tier 3: LLM Malformed',         'Tier 3 LLM response was malformed and could not be parsed')
+		ON CONFLICT (code) DO NOTHING`)
 
 	return &DB{conn: conn}
 }

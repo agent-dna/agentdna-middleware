@@ -67,6 +67,7 @@ type Handler struct {
 	jwtSecret           string
 	orgID               string
 	adminServiceURL     string
+	cbacServiceURL      string
 	createAgentEndpoint string
 	updateAgentEndpoint string
 	mailer              *email.Mailer
@@ -74,7 +75,7 @@ type Handler struct {
 	emailQueue          chan email.Message
 }
 
-func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
+func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
 	h := &Handler{
 		db:                  database,
@@ -83,6 +84,7 @@ func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL
 		jwtSecret:           jwtSecret,
 		orgID:               orgID,
 		adminServiceURL:     adminServiceURL,
+		cbacServiceURL:      cbacServiceURL,
 		createAgentEndpoint: createAgentEndpoint,
 		updateAgentEndpoint: updateAgentEndpoint,
 		emailQueue:          make(chan email.Message, emailQueueSize),
@@ -350,6 +352,7 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 			if nftInfo.NFTId == "" {
 				nftInfo.NFTId = nftInfo.ParentNFTId
 			}
+			nftInfo.Initiator = payload.Initiator
 			nftType, typeErr := parseNFTType(nftInfo.Data)
 			log.Printf("[NFT] received 101 %v", nftInfo)
 			log.Printf("[NFT] received nft_id=%s type=%s data=%s", nftInfo.NFTId, nftType, nftInfo.Data)
@@ -551,7 +554,10 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 
 	// All envelope nodes sorted oldest→newest.
 	allEnvelopes := collectAllEnvelopes(data.Envelope)
-	initiatorDID := allEnvelopes[0].From
+	initiatorDID := nftInfo.Initiator
+	if initiatorDID == "" {
+		initiatorDID = allEnvelopes[0].From
+	}
 	initiatorName := h.resolveActorName(initiatorDID, "")
 
 	// Build child map: parent node → its children (envelopes that list it as parent).
@@ -572,6 +578,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	buildChildMap(data.Envelope)
 
 	// ── Store one raw block row per envelope node ─────────────────────────────
+	hashToThreatID := map[string]string{} // envelope hash → threat ID, for linking interactions
 	for idx, env := range allEnvelopes {
 		// Derive to: first child's From, or initiatorDID for root if different.
 		var toDID string
@@ -585,8 +592,9 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		msg := extractPayloadText(env.Payload)
 		threat := env.Code != 0 && env.Code != 1000
 
+		blockID := fmt.Sprintf("%s-block-%d", intentID, idx)
 		blockRec := &db.IntentBlockRecord{
-			ID:             fmt.Sprintf("%s-block-%d", intentID, idx),
+			ID:             blockID,
 			IntentID:       intentID,
 			BlockIndex:     idx,
 			AgentDID:       env.From,
@@ -603,10 +611,33 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		if err := h.db.StoreIntentBlockData(blockRec); err != nil {
 			log.Printf("[intentWorkflow] block data save error idx=%d: %v", idx, err)
 		}
+
+		// If this envelope signals a threat, resolve the message and store it.
+		if threat {
+			var threatMsg string
+			if env.Code >= 2000 && env.Code < 3000 {
+				// COCA codes — use the threat title as the message (no external call).
+				if rec, err := h.db.GetThreatCodeDetail(env.Code); err == nil {
+					threatMsg = rec.Title
+				}
+			} else if env.Code >= 3000 && env.Hash != "" {
+				// CBAC/guard codes — fetch the detailed reason from the cbac-decisions service.
+				threatMsg = h.fetchCbacDecisionReason(env.Hash)
+			}
+			threatID := fmt.Sprintf("%s-threat-%d", intentID, idx)
+			if err := h.db.StoreThreat(threatID, intentID, blockID, env.Code, threatMsg, time.Unix(env.Epoch, 0).UTC()); err != nil {
+				log.Printf("[intentWorkflow] StoreThreat idx=%d code=%d: %v", idx, env.Code, err)
+			} else {
+				log.Printf("[intentWorkflow] threat stored idx=%d code=%d msg=%q", idx, env.Code, threatMsg)
+				if env.Hash != "" {
+					hashToThreatID[env.Hash] = threatID
+				}
+			}
+		}
 	}
 
 	// ── Extract interactions from DAG edges ──────────────────────────────────
-	rawInteractions := extractInteractionsFromEnvelopes(data.Envelope)
+	rawInteractions := extractInteractionsFromEnvelopes(data.Envelope, initiatorDID)
 
 	// Deduplicate: drop only when hash + from + to are all identical.
 	type dedupKey struct{ hash, from, to string }
@@ -676,8 +707,9 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 			threatDetected = true
 		}
 		eventTime := time.Unix(ix.Epoch, 0).UTC()
+		threatID := hashToThreatID[ix.Hash]
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, eventTime,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, threatID, eventTime,
 		); err != nil {
 			return "", fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
 		}
@@ -769,7 +801,7 @@ func (h *Handler) handleIntentNFT(nftInfo NFTInfo) error {
 		iid := fmt.Sprintf("%s-%d", intentID, idx+1)
 		interactionIDs = append(interactionIDs, iid)
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message, ix.Signature, time.Time{},
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, ix.Direction, ix.Threat, intentID, orgID, ix.Message, ix.Signature, "", time.Time{},
 		); err != nil {
 			return fmt.Errorf("handleIntentNFT: StoreNewInteraction: %v", err)
 		}
@@ -1336,6 +1368,7 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 			"type":          i.Type,
 			"direction":     i.Direction,
 			"threat":        i.Threat,
+			"threatID":      i.ThreatID,
 			"intentID":      i.IntentID,
 			"time":          i.Time,
 			"message":       i.Message,
@@ -1410,6 +1443,8 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 			"toName":        t.ToName,
 			"type":          t.Type,
 			"direction":     t.Direction,
+			"threat":        t.Threat,
+			"threatID":      t.ThreatID,
 			"intentID":      t.IntentID,
 			"time":          t.Time,
 			"message":       t.Message,
@@ -1940,6 +1975,7 @@ func (h *Handler) AgentInteractions(c *gin.Context) {
 			"type":          i.Type,
 			"direction":     i.Direction,
 			"threat":        i.Threat,
+			"threatID":      i.ThreatID,
 			"intentID":      i.IntentID,
 			"time":          i.Time,
 			"message":       i.Message,
@@ -2123,6 +2159,7 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 		Message            string `json:"message"`
 		IntentID           string `json:"intentID"`
 		Threat             bool   `json:"threat"`
+		ThreatID           string `json:"threatID"`
 		Epoch              int64  `json:"epoch"`
 		Signature          string `json:"signature"`
 		ProvenanceReqID    string `json:"provenanceReqID"`
@@ -2141,6 +2178,7 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 			Message:            ix.Message,
 			IntentID:           ix.IntentID,
 			Threat:             ix.Threat,
+			ThreatID:           ix.ThreatID,
 			Epoch:              ix.Time.Unix(),
 			Signature:          ix.Signature,
 			ProvenanceReqID:    ix.ProvenanceReqID,
@@ -2389,6 +2427,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 			"type":               i.Type,
 			"direction":          i.Direction,
 			"threat":             i.Threat,
+			"threatID":           i.ThreatID,
 			"time":               i.Time,
 			"message":            i.Message,
 			"signature":          i.Signature,
@@ -2543,6 +2582,7 @@ func (h *Handler) UserInfo(c *gin.Context) {
 			"toName":             i.ToName,
 			"type":               i.Type,
 			"threat":             i.Threat,
+			"threatID":           i.ThreatID,
 			"intentID":           i.IntentID,
 			"message":            i.Message,
 			"signature":          i.Signature,
@@ -2710,6 +2750,7 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 			"toName":             i.ToName,
 			"type":               i.Type,
 			"threat":             i.Threat,
+			"threatID":           i.ThreatID,
 			"intentID":           i.IntentID,
 			"message":            i.Message,
 			"signature":          i.Signature,
@@ -3655,5 +3696,200 @@ func (h *Handler) RegisterUser(c *gin.Context) {
 		"name":    req.Name,
 		"email":   req.Email,
 		"orgID":   req.OrgID,
+	}})
+}
+
+// GET /dashboard/v1/threat-by-id?threat_id=intent-abc-threat-3
+func (h *Handler) ThreatByID(c *gin.Context) {
+	threatID := c.Query("threat_id")
+	if threatID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "threat_id is required"})
+		return
+	}
+
+	threat, err := h.db.GetThreatByID(threatID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: fmt.Sprintf("threat %s not found", threatID)})
+		return
+	}
+
+	codeInfo, _ := h.db.GetThreatCodeDetail(threat.ThreatCode)
+
+	data := gin.H{
+		"id":             threat.ID,
+		"intent_id":      threat.IntentID,
+		"interaction_id": threat.InteractionID,
+		"time":           threat.Time.UTC().Format(time.RFC3339),
+		"threat_code":    threat.ThreatCode,
+		"message":        threat.Message,
+	}
+	if codeInfo != nil {
+		data["title"] = codeInfo.Title
+		data["description"] = codeInfo.Description
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: data})
+}
+
+// fetchCbacDecisionReason calls the cbac-decisions service for the given envelope hash
+// and returns the "reason" field from the response. Returns empty string on any error.
+func (h *Handler) fetchCbacDecisionReason(hash string) string {
+	if h.cbacServiceURL == "" || hash == "" {
+		return ""
+	}
+	url := h.cbacServiceURL + "cbac-decisions/by-hash/" + hash
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Printf("[cbac] GET %s: %v", url, err)
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[cbac] GET %s: status %d", url, resp.StatusCode)
+		return ""
+	}
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		log.Printf("[cbac] decode response for hash=%s: %v", hash, err)
+		return ""
+	}
+	return body.Reason
+}
+
+// GET /dashboard/v1/threat-events?page=1&limit=10
+func (h *Handler) ThreatEvents(c *gin.Context) {
+	orgID := c.GetString(CtxOrgID)
+	if orgID == "" {
+		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
+		return
+	}
+
+	limit := 10
+	if l, err := strconv.Atoi(c.Query("limit")); err == nil && l > 0 {
+		limit = l
+	}
+	page := 1
+	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
+		page = p
+	}
+	offset := (page - 1) * limit
+
+	threats, total, err := h.db.GetThreats(orgID, limit, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch threats: %v", err)})
+		return
+	}
+
+	type threatItem struct {
+		ID            string `json:"id"`
+		IntentID      string `json:"intent_id"`
+		InteractionID string `json:"interaction_id"`
+		Time          string `json:"time"`
+		ThreatCode    int    `json:"threat_code"`
+		Message       string `json:"message"`
+	}
+	items := make([]threatItem, 0, len(threats))
+	for _, t := range threats {
+		items = append(items, threatItem{
+			ID:            t.ID,
+			IntentID:      t.IntentID,
+			InteractionID: t.InteractionID,
+			Time:          t.Time.UTC().Format(time.RFC3339),
+			ThreatCode:    t.ThreatCode,
+			Message:       t.Message,
+		})
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
+		"threats": items,
+		"total":   total,
+		"page":    page,
+		"limit":   limit,
+	}})
+}
+
+// GET /dashboard/v1/top-threats
+func (h *Handler) TopThreats(c *gin.Context) {
+	orgID := c.GetString(CtxOrgID)
+	if orgID == "" {
+		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
+		return
+	}
+
+	top, err := h.db.GetTopThreats(orgID, 5)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch top threats: %v", err)})
+		return
+	}
+
+	type topItem struct {
+		ThreatCode int    `json:"threat_code"`
+		Title      string `json:"title"`
+		Count      int    `json:"count"`
+	}
+	items := make([]topItem, 0, len(top))
+	for _, t := range top {
+		items = append(items, topItem{
+			ThreatCode: t.ThreatCode,
+			Title:      t.Title,
+			Count:      t.Count,
+		})
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: items})
+}
+
+// GET /dashboard/v1/threat-detail?threat_code=2001
+func (h *Handler) ThreatDetail(c *gin.Context) {
+	orgID := c.GetString(CtxOrgID)
+	if orgID == "" {
+		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
+		return
+	}
+
+	code, err := strconv.Atoi(c.Query("threat_code"))
+	if err != nil || code == 0 {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "threat_code is required"})
+		return
+	}
+
+	codeInfo, err := h.db.GetThreatCodeDetail(code)
+	if err != nil {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: fmt.Sprintf("threat code %d not found", code)})
+		return
+	}
+
+	threats, total, err := h.db.GetThreatsByCode(orgID, code)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch threats: %v", err)})
+		return
+	}
+
+	type threatItem struct {
+		ID            string `json:"id"`
+		IntentID      string `json:"intent_id"`
+		InteractionID string `json:"interaction_id"`
+		Time          string `json:"time"`
+		Message       string `json:"message"`
+	}
+	items := make([]threatItem, 0, len(threats))
+	for _, t := range threats {
+		items = append(items, threatItem{
+			ID:            t.ID,
+			IntentID:      t.IntentID,
+			InteractionID: t.InteractionID,
+			Time:          t.Time.UTC().Format(time.RFC3339),
+			Message:       t.Message,
+		})
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
+		"threat_code": codeInfo.Code,
+		"title":       codeInfo.Title,
+		"description": codeInfo.Description,
+		"count":       total,
+		"threats":     items,
 	}})
 }

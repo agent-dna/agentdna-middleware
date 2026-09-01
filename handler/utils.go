@@ -126,7 +126,7 @@ func collectAllEnvelopes(root *workflowEnvelope) []*workflowEnvelope {
 // extractInteractionsFromEnvelopes traverses the full envelope DAG and returns one
 // interaction per parent→child edge, plus a final edge from the newest envelope back
 // to the original initiator. Handles parallel branches via the full parent_envelope array.
-func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtract {
+func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID string) []interactionExtract {
 	if root == nil {
 		return nil
 	}
@@ -135,6 +135,12 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtra
 	if len(all) == 0 {
 		return nil
 	}
+
+	// Fall back to base envelope's From if no explicit initiator was provided.
+	if initiatorDID == "" {
+		initiatorDID = all[0].From
+	}
+
 	// Build parent→child edges by walking from the root (newest) down each branch.
 	type edge struct {
 		parent *workflowEnvelope
@@ -158,10 +164,25 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtra
 	// Sort edges chronologically by child epoch (the child is the "newer" side).
 	sort.Slice(edges, func(i, j int) bool { return edges[i].child.Epoch < edges[j].child.Epoch })
 
-	initiatorDID := all[0].From
-
 	seenAsFrom := map[string]bool{}
 	var result []interactionExtract
+
+	// Provenance trigger: initiator → first agent in chain (base envelope's From).
+	// Represents the user submitting the intent to the agent network.
+	base := all[0]
+	if initiatorDID != base.From {
+		result = append(result, interactionExtract{
+			FromDID:   initiatorDID,
+			ToDID:     base.From,
+			Type:      "trigger",
+			Threat:    false,
+			Message:   extractPayloadText(base.Payload),
+			Signature: base.Signature,
+			Hash:      base.Hash,
+			Epoch:     base.Epoch,
+		})
+		seenAsFrom[initiatorDID] = true
+	}
 
 	for i, ed := range edges {
 		fromDID := ed.parent.From
@@ -180,8 +201,7 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope) []interactionExtra
 		seenAsFrom[fromDID] = true
 	}
 
-	// If the last envelope's sender is different from the initiator, it means the
-	// final block is a response back to the initiator — add that closing edge.
+	// Closing edge: last envelope's sender → initiator (response back to caller).
 	if root.From != initiatorDID {
 		threat := root.Code != 0 && root.Code != 1000
 		result = append(result, interactionExtract{
