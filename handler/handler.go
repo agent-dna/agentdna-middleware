@@ -555,9 +555,10 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 
 	// All envelope nodes sorted oldest→newest.
 	allEnvelopes := collectAllEnvelopes(data.Envelope)
-	// Initiator is always the root (oldest/base) envelope's From — the entity that
-	// kicked off the intent — not the NFT payload's initiator field.
-	initiatorDID := allEnvelopes[0].From
+	// Initiator is always the root envelope's From — the top-level envelope
+	// (data.Envelope, newest node in the chain) — not the NFT payload's
+	// initiator field.
+	initiatorDID := data.Envelope.From
 	initiatorName := h.resolveActorName(initiatorDID, "")
 
 	// Build child map: parent node → its children (envelopes that list it as parent).

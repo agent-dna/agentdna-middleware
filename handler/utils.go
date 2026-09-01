@@ -142,9 +142,12 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID strin
 	}
 
 	// Build parent→child edges by walking from the root (newest) down each branch.
+	// origIdx records construction order: buildEdges walks root→base (newest→oldest),
+	// so a higher origIdx was appended later and is therefore structurally older.
 	type edge struct {
-		parent *workflowEnvelope
-		child  *workflowEnvelope
+		parent  *workflowEnvelope
+		child   *workflowEnvelope
+		origIdx int
 	}
 	var edges []edge
 	visited := map[*workflowEnvelope]bool{}
@@ -155,14 +158,23 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID strin
 		}
 		visited[e] = true
 		for _, p := range e.ParentEnvelope {
-			edges = append(edges, edge{parent: p, child: e})
+			edges = append(edges, edge{parent: p, child: e, origIdx: len(edges)})
 			buildEdges(p)
 		}
 	}
 	buildEdges(root)
 
 	// Sort edges chronologically by child epoch (the child is the "newer" side).
-	sort.Slice(edges, func(i, j int) bool { return edges[i].child.Epoch < edges[j].child.Epoch })
+	// Envelope epochs are only second-resolution, so a fast hop (e.g. an agent
+	// immediately forwarding to its child) can tie on epoch with its neighbor —
+	// break ties using the DAG structure itself (origIdx) rather than leaving it
+	// to sort.Slice's unstable ordering, which produced nondeterministic results.
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].child.Epoch != edges[j].child.Epoch {
+			return edges[i].child.Epoch < edges[j].child.Epoch
+		}
+		return edges[i].origIdx > edges[j].origIdx
+	})
 
 	seenAsFrom := map[string]bool{}
 	var result []interactionExtract
