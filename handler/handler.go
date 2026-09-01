@@ -555,11 +555,9 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 
 	// All envelope nodes sorted oldest→newest.
 	allEnvelopes := collectAllEnvelopes(data.Envelope)
-	// Initiator comes from the top-level transaction field — the entity that initiated the intent.
-	initiatorDID := nftInfo.Initiator
-	if initiatorDID == "" {
-		initiatorDID = allEnvelopes[0].From
-	}
+	// Initiator is always the root (oldest/base) envelope's From — the entity that
+	// kicked off the intent — not the NFT payload's initiator field.
+	initiatorDID := allEnvelopes[0].From
 	initiatorName := h.resolveActorName(initiatorDID, "")
 
 	// Build child map: parent node → its children (envelopes that list it as parent).
@@ -685,9 +683,9 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 				log.Printf("[intentWorkflow] did=%s is already an agent, skipping", did)
 				continue
 			}
-			// Found in apps table — skip (registered tool/app).
-			if h.db.IsApp(did) {
-				log.Printf("[intentWorkflow] did=%s is an app, skipping", did)
+			// Found in new_tools table — skip (registered tool/app).
+			if h.db.IsNewTool(did) {
+				log.Printf("[intentWorkflow] did=%s is a registered tool, skipping", did)
 				continue
 			}
 			// Unknown DID — store as agent.
@@ -2273,7 +2271,7 @@ func (h *Handler) AppRegistration(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "tool_name and tool_id are required"})
 		return
 	}
-	if err := h.db.RegisterApp(req.ToolID, req.ToolName); err != nil {
+	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, "AGENT_DNA_BETA"); err != nil {
 		log.Printf("[AppRegistration] db error tool_id=%s err=%v", req.ToolID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to register app"})
 		return

@@ -1142,18 +1142,10 @@ func (d *DB) StoreNewAgent(nftID, did, deployerDID, orgID, policy, agentName str
 	return err
 }
 
-func (d *DB) IsApp(did string) bool {
+func (d *DB) IsNewTool(did string) bool {
 	var exists bool
-	d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM apps WHERE did = $1)`, did).Scan(&exists)
+	d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM new_tools WHERE did = $1)`, did).Scan(&exists)
 	return exists
-}
-
-func (d *DB) RegisterApp(did, name string) error {
-	_, err := d.conn.Exec(
-		`INSERT INTO apps (did, name) VALUES ($1, $2) ON CONFLICT (did) DO UPDATE SET name = EXCLUDED.name`,
-		did, name,
-	)
-	return err
 }
 
 func (d *DB) RevokeAgent(agentDID string) error {
@@ -1539,12 +1531,12 @@ func scanIntentRows(rows *sql.Rows) ([]*IntentRecord, error) {
 	return result, nil
 }
 
-// GetAgentInteractedApps returns the distinct apps (from the apps table) that the
+// GetAgentInteractedApps returns the distinct tools (from the new_tools table) that the
 // agent has interacted with — either as initiator or recipient in new_interactions.
 func (d *DB) GetAgentInteractedApps(agentDID string) ([]string, error) {
 	rows, err := d.conn.Query(`
 		SELECT DISTINCT a.name
-		FROM apps a
+		FROM new_tools a
 		WHERE a.did IN (
 			SELECT interacted_to_did FROM new_interactions WHERE initiator_did = $1
 			UNION

@@ -167,23 +167,6 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID strin
 	seenAsFrom := map[string]bool{}
 	var result []interactionExtract
 
-	// Provenance trigger: initiator → first agent in chain (base envelope's From).
-	// Represents the user submitting the intent to the agent network.
-	base := all[0]
-	if initiatorDID != base.From {
-		result = append(result, interactionExtract{
-			FromDID:   initiatorDID,
-			ToDID:     base.From,
-			Type:      "trigger",
-			Threat:    false,
-			Message:   extractPayloadText(base.Payload),
-			Signature: base.Signature,
-			Hash:      base.Hash,
-			Epoch:     base.Epoch,
-		})
-		seenAsFrom[initiatorDID] = true
-	}
-
 	for i, ed := range edges {
 		fromDID := ed.parent.From
 		toDID := ed.child.From
