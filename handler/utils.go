@@ -185,19 +185,20 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID strin
 	}
 
 	// Closing edge: last envelope's sender → initiator (response back to caller).
-	if root.From != initiatorDID {
-		threat := root.Code != 0 && root.Code != 1000
-		result = append(result, interactionExtract{
-			FromDID:   root.From,
-			ToDID:     initiatorDID,
-			Type:      deriveWorkflowInteractionType(root.From, initiatorDID, len(result), seenAsFrom),
-			Threat:    threat,
-			Message:   extractPayloadText(root.Payload),
-			Signature: root.Signature,
-			Hash:      root.Hash,
-			Epoch:     root.Epoch,
-		})
-	}
+	// Always added, even when root.From == initiatorDID — in that case it's a
+	// self-loop (from == to == initiatorDID), so the provenance line's final
+	// "to" is always the initiator.
+	threat := root.Code != 0 && root.Code != 1000
+	result = append(result, interactionExtract{
+		FromDID:   root.From,
+		ToDID:     initiatorDID,
+		Type:      deriveWorkflowInteractionType(root.From, initiatorDID, len(result), seenAsFrom),
+		Threat:    threat,
+		Message:   extractPayloadText(root.Payload),
+		Signature: root.Signature,
+		Hash:      root.Hash,
+		Epoch:     root.Epoch,
+	})
 
 	return result
 }
