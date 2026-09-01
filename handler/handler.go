@@ -353,6 +353,7 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 				nftInfo.NFTId = nftInfo.ParentNFTId
 			}
 			nftInfo.Initiator = payload.Initiator
+			log.Printf("[NFT] payload.Initiator=%s payload.Owner=%s", payload.Initiator, payload.Owner)
 			nftType, typeErr := parseNFTType(nftInfo.Data)
 			log.Printf("[NFT] received 101 %v", nftInfo)
 			log.Printf("[NFT] received nft_id=%s type=%s data=%s", nftInfo.NFTId, nftType, nftInfo.Data)
@@ -554,6 +555,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 
 	// All envelope nodes sorted oldest→newest.
 	allEnvelopes := collectAllEnvelopes(data.Envelope)
+	// Initiator comes from the top-level transaction field — the entity that initiated the intent.
 	initiatorDID := nftInfo.Initiator
 	if initiatorDID == "" {
 		initiatorDID = allEnvelopes[0].From
@@ -3039,6 +3041,7 @@ func (h *Handler) GetAgentPolicy(c *gin.Context) {
 // all chain entries (skipping index 0 which is the initial deployment).
 func (h *Handler) fetchAgentChain(nftID string) ([]struct {
 	TransactionID string
+	Initiator     string
 	Epoch         int64
 	Data          string
 }, error) {
@@ -3052,6 +3055,7 @@ func (h *Handler) fetchAgentChain(nftID string) ([]struct {
 	var chainResp struct {
 		Result []struct {
 			TransactionID string `json:"transactionId"`
+			Initiator     string `json:"initiator"`
 			Epoch         int64  `json:"epoch"`
 			Data          string `json:"data"`
 		} `json:"result"`
@@ -3066,15 +3070,17 @@ func (h *Handler) fetchAgentChain(nftID string) ([]struct {
 
 	var out []struct {
 		TransactionID string
+		Initiator     string
 		Epoch         int64
 		Data          string
 	}
 	for _, e := range chainResp.Result {
 		out = append(out, struct {
 			TransactionID string
+			Initiator     string
 			Epoch         int64
 			Data          string
-		}{e.TransactionID, e.Epoch, e.Data})
+		}{e.TransactionID, e.Initiator, e.Epoch, e.Data})
 	}
 	return out, nil
 }
