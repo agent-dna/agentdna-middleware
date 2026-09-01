@@ -626,13 +626,13 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		// If this envelope signals a threat, resolve the message and store it.
 		if threat {
 			var threatMsg string
-			if env.Code >= 2000 && env.Code < 3000 {
-				// COCA codes — use the threat title as the message (no external call).
-				if rec, err := h.db.GetThreatCodeDetail(env.Code); err == nil {
-					threatMsg = rec.Title
-				}
+			if rec, err := h.db.GetThreatCodeDetail(env.Code); err == nil {
+				// Known code (1001 whitelist, 2xxx COCA, 4001 MCP tool exec, etc.)
+				// — use the seeded title, no external call needed.
+				threatMsg = rec.Title
 			} else if env.Code >= 3000 && env.Hash != "" {
-				// CBAC/guard codes — fetch the detailed reason from the cbac-decisions service.
+				// CBAC/guard codes not in our local map — fetch the detailed reason
+				// from the cbac-decisions service.
 				threatMsg = h.fetchCbacDecisionReason(env.Hash)
 			}
 			threatID := fmt.Sprintf("%s-threat-%d", intentID, idx)

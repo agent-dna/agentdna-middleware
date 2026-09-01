@@ -18,7 +18,6 @@ type OrgUser struct {
 	DID             string   `json:"id" db:"did"`
 	OrganizationID  string   `json:"organizationID" db:"organization_id"`
 	APIKey		  string   `json:"apiKey" db:"api_key"`
-	
 	NFTID 		 string   `json:"nftID" db:"nft_id"`	
 	Email          string   `json:"email" db:"email"`
 	Password        string   `json:"password" db:"password"`

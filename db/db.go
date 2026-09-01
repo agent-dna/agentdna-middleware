@@ -424,6 +424,7 @@ func New(dsn string) *DB {
 
 	// Seed known threat codes.
 	conn.Exec(`INSERT INTO threat_codes (code, title, description) VALUES
+		(1001, 'Whitelist Error',               'The agent is not on the whitelist'),
 		(2001, 'COCA Verification Failed (Light)',    'Light COCA verification failed — the interaction did not pass the lightweight consistency check'),
 		(2002, 'COCA Verification Failed (Heavy)',    'Heavy COCA verification failed — the interaction did not pass the full consistency check'),
 		(2003, 'COCA Verification Failed (Boundary)','Boundary COCA verification failed — the interaction violated a policy boundary constraint'),
@@ -446,7 +447,8 @@ func New(dsn string) *DB {
 		(3406, 'Tier 3: LLM Allow',             'Tier 3 LLM explicitly allowed the action'),
 		(3407, 'Tier 3: LLM Deny',              'Tier 3 LLM explicitly denied the action'),
 		(3408, 'Tier 3: LLM Advise',            'Tier 3 LLM returned an advisory — human review recommended'),
-		(3409, 'Tier 3: LLM Malformed',         'Tier 3 LLM response was malformed and could not be parsed')
+		(3409, 'Tier 3: LLM Malformed',         'Tier 3 LLM response was malformed and could not be parsed'),
+		(4001, 'MCP Tool Exec Error',           'The MCP tool call failed to execute')
 		ON CONFLICT (code) DO NOTHING`)
 
 	return &DB{conn: conn}
