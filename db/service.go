@@ -1321,6 +1321,21 @@ func (d *DB) SetProvenanceRecord(reqID, transactionID, childNFTId string) (int64
 		return 0, err
 	}
 
+	// Mirror the rename in threats (uuid-N → transactionID-N) so
+	// threats.intent_id keeps joining against new_intents.intent_id, and
+	// threats.interaction_id keeps pointing at the renamed intent_block_data
+	// row (block IDs use the same "<intentID>-block-N" pattern).
+	if _, err := tx.Exec(
+		`UPDATE threats
+		 SET id            = $1 || '-' || SUBSTR(id, $3),
+		     interaction_id = $1 || '-' || SUBSTR(interaction_id, $3),
+		     intent_id      = $1
+		 WHERE intent_id = $2`,
+		transactionID, oldIntentID, suffixStart,
+	); err != nil {
+		return 0, err
+	}
+
 	rows, err := res.RowsAffected()
 	if err != nil {
 		return 0, err
@@ -2406,13 +2421,11 @@ func (d *DB) GetTopThreats(orgID string, topN int) ([]*TopThreatRecord, error) {
 	rows, err := d.conn.Query(`
 		SELECT t.threat_code, COALESCE(tc.title, ''), COUNT(*) AS cnt
 		FROM threats t
-		JOIN new_intents ni ON t.intent_id = ni.intent_id
 		LEFT JOIN threat_codes tc ON t.threat_code = tc.code
-		WHERE ni.organization_id = $1
 		GROUP BY t.threat_code, tc.title
 		ORDER BY cnt DESC
-		LIMIT $2`,
-		orgID, topN,
+		LIMIT $1`,
+		topN,
 	)
 	if err != nil {
 		return nil, err
