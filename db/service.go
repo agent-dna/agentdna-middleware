@@ -451,7 +451,7 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		SELECT ni.intent_id, ni.initiator_did,
 		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
-		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
+		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Ongoing'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COUNT(i.interaction_id)                                                  AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
@@ -484,7 +484,7 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		var threatInt int
 		if err := rows.Scan(
 			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
-			&r.StartedAt, &endedAt, &r.Status, &threatInt,
+			&r.StartedAt, &endedAt, &r.Status, &r.ReviewStatus, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
 			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
 			&firstAt, &lastAt, &r.Title,
@@ -1430,7 +1430,7 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 		SELECT ni.intent_id, ni.initiator_did,
 		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
-		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
+		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Ongoing'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COUNT(i.interaction_id)                                                AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
@@ -1463,7 +1463,7 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 		var threatInt int
 		if err := rows.Scan(
 			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
-			&r.StartedAt, &endedAt, &r.Status, &threatInt,
+			&r.StartedAt, &endedAt, &r.Status, &r.ReviewStatus, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
 			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
 			&firstAt, &lastAt, &r.Title,
@@ -1643,7 +1643,7 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 		SELECT ni.intent_id, ni.initiator_did,
 		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
-		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
+		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Ongoing'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COUNT(i.interaction_id)                                                AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
@@ -1660,7 +1660,7 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 		GROUP BY ni.intent_id, u.name, ag_init.name`, intentID,
 	).Scan(
 		&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &orgID,
-		&r.StartedAt, &endedAt, &r.Status, &threatInt,
+		&r.StartedAt, &endedAt, &r.Status, &r.ReviewStatus, &threatInt,
 		&r.FlowType, &r.Executor, &r.ChainDepth,
 		&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount,
 		&firstAt, &lastAt,
@@ -1683,6 +1683,28 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 		}
 	}
 	return r, nil
+}
+
+// UpdateIntentReviewStatus sets the human-triage review_status (Ongoing /
+// Acknowledged / Flagged) for an intent, scoped to the caller's org so one
+// org can't touch another's intents. Returns sql.ErrNoRows if no row matched
+// (bad intentID or org mismatch).
+func (d *DB) UpdateIntentReviewStatus(intentID, orgID, status string) error {
+	res, err := d.conn.Exec(
+		`UPDATE new_intents SET review_status = $1 WHERE intent_id = $2 AND organization_id = $3`,
+		status, intentID, orgID,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, error) {

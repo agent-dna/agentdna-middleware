@@ -106,6 +106,7 @@ type IntentRecord struct {
 	StartedAt            time.Time
 	EndedAt              *time.Time
 	Status               string
+	ReviewStatus         string
 	ThreatDetected       bool
 	FlowType             string
 	Executor             string
@@ -338,6 +339,9 @@ func New(dsn string) *DB {
 		);
 		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS provenance_req_id TEXT;
 		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS provenance_record_id TEXT;
+		-- Review status: distinct from the workflow "status" column above.
+		-- Tracks human triage of the intent: Ongoing -> Acknowledged | Flagged.
+		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'Ongoing';
 		CREATE TABLE IF NOT EXISTS new_tools (
 			did             TEXT PRIMARY KEY,
 			name            TEXT,

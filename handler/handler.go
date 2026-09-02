@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -2110,6 +2112,7 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 			"initiatorName":      i.InitiatorName,
 			"startedAt":          i.StartedAt,
 			"status":             i.Status,
+			"reviewStatus":       i.ReviewStatus,
 			"threatDetected":     i.ThreatDetected,
 			"flowType":           i.FlowType,
 			"executor":           i.Executor,
@@ -2450,6 +2453,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"initiatorName":      intent.InitiatorName,
 		"startedAt":          intent.StartedAt,
 		"status":             intent.Status,
+		"reviewStatus":       intent.ReviewStatus,
 		"threatDetected":     intent.ThreatDetected,
 		"flowType":           intent.FlowType,
 		"executor":           intent.Executor,
@@ -2468,6 +2472,56 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: data})
+}
+
+var validIntentReviewStatuses = map[string]bool{
+	"Ongoing":      true,
+	"Acknowledged": true,
+	"Flagged":      true,
+}
+
+// POST /dashboard/v1/update-intent-status
+// Body: {"intentID": "...", "status": "Acknowledged" | "Flagged" | "Ongoing"}
+func (h *Handler) UpdateIntentStatus(c *gin.Context) {
+	w := http.ResponseWriter(c.Writer)
+	enableCors(&w)
+
+	orgID := c.GetString(CtxOrgID)
+	if orgID == "" {
+		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
+		return
+	}
+
+	var req struct {
+		IntentID string `json:"intentID"`
+		Status   string `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid request body"})
+		return
+	}
+	if req.IntentID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intentID is required"})
+		return
+	}
+	if !validIntentReviewStatuses[req.Status] {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "status must be one of Ongoing, Acknowledged, Flagged"})
+		return
+	}
+
+	if err := h.db.UpdateIntentReviewStatus(req.IntentID, orgID, req.Status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, Response{Status: false, Message: "intent not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to update status: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
+		"intentID":     req.IntentID,
+		"reviewStatus": req.Status,
+	}})
 }
 
 func (h *Handler) ToolsList(c *gin.Context) {
