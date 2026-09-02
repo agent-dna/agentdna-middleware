@@ -551,14 +551,17 @@ func (d *DB) CountThreatsByUser(userDID, orgID string) (int, error) {
 
 func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*InteractionRecord, error) {
 	rows, err := d.conn.Query(userScopeIntentsCTE+`
-		SELECT interaction_id,
-		       initiator_did, COALESCE(initiator_name, ''),
-		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
-		FROM new_interactions
-		WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents)
-		ORDER BY time DESC
+		SELECT ni.interaction_id,
+		       ni.initiator_did, COALESCE(ni.initiator_name, ''),
+		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
+		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(ni.message, ''),
+		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
+		       COALESCE(tc.title, '')
+		FROM new_interactions ni
+		LEFT JOIN threats t ON t.id = ni.threat_id
+		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
+		WHERE ni.organization_id = $2 AND ni.threat = 1 AND ni.intent_id IN (SELECT intent_id FROM user_intents)
+		ORDER BY ni.time DESC
 		LIMIT $3 OFFSET $4`,
 		userDID, orgID, limit, offset,
 	)
@@ -566,7 +569,7 @@ func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		return nil, err
 	}
 	defer rows.Close()
-	return scanInteractionNewRows(rows)
+	return scanInteractionNewRowsWithTitle(rows)
 }
 
 func (d *DB) CountUsersByOrg(orgID string) (int, error) {
@@ -675,14 +678,17 @@ func (d *DB) CountThreatsByOrg(orgID string) (int, error) {
 
 func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT interaction_id,
-		       initiator_did, COALESCE(initiator_name, ''),
-		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
-		FROM new_interactions
-		WHERE organization_id = $1 AND threat = 1
-		ORDER BY time DESC
+		SELECT ni.interaction_id,
+		       ni.initiator_did, COALESCE(ni.initiator_name, ''),
+		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
+		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(ni.message, ''),
+		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
+		       COALESCE(tc.title, '')
+		FROM new_interactions ni
+		LEFT JOIN threats t ON t.id = ni.threat_id
+		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
+		WHERE ni.organization_id = $1 AND ni.threat = 1
+		ORDER BY ni.time DESC
 		LIMIT $2 OFFSET $3`,
 		orgID, limit, offset,
 	)
@@ -690,7 +696,7 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		return nil, err
 	}
 	defer rows.Close()
-	return scanInteractionNewRows(rows)
+	return scanInteractionNewRowsWithTitle(rows)
 }
 
 func (d *DB) CountTopThreatAgentsByOrg(orgID string) (int, error) {
@@ -1344,6 +1350,29 @@ func scanInteractionNewRows(rows *sql.Rows) ([]*InteractionRecord, error) {
 			&r.To, &r.ToName,
 			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
 			&r.Signature, &r.ProvenanceReqID, &r.ProvenanceRecordID, &r.ThreatID,
+		); err != nil {
+			return nil, err
+		}
+		r.Threat = threatInt == 1
+		result = append(result, r)
+	}
+	return result, nil
+}
+
+// scanInteractionNewRowsWithTitle is scanInteractionNewRows plus a trailing
+// joined threat_codes.title column, for callers that list threats.
+func scanInteractionNewRowsWithTitle(rows *sql.Rows) ([]*InteractionRecord, error) {
+	var result []*InteractionRecord
+	for rows.Next() {
+		r := &InteractionRecord{}
+		var threatInt int
+		if err := rows.Scan(
+			&r.InteractionID,
+			&r.From, &r.FromName,
+			&r.To, &r.ToName,
+			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
+			&r.Signature, &r.ProvenanceReqID, &r.ProvenanceRecordID, &r.ThreatID,
+			&r.ThreatTitle,
 		); err != nil {
 			return nil, err
 		}
