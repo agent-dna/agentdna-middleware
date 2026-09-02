@@ -2345,7 +2345,7 @@ func (d *DB) GetThreats(orgID string, limit, offset int) ([]*ThreatRecord, int, 
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
-		WHERE ni.org_id = $1`, orgID).Scan(&total)
+		WHERE ni.organization_id = $1`, orgID).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2353,7 +2353,7 @@ func (d *DB) GetThreats(orgID string, limit, offset int) ([]*ThreatRecord, int, 
 		SELECT t.id, t.intent_id, t.interaction_id, t.time, t.threat_code, t.message
 		FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
-		WHERE ni.org_id = $1
+		WHERE ni.organization_id = $1
 		ORDER BY t.time DESC
 		LIMIT $2 OFFSET $3`,
 		orgID, limit, offset,
@@ -2379,7 +2379,7 @@ func (d *DB) GetTopThreats(orgID string, topN int) ([]*TopThreatRecord, error) {
 		FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
 		LEFT JOIN threat_codes tc ON t.threat_code = tc.code
-		WHERE ni.org_id = $1
+		WHERE ni.organization_id = $1
 		GROUP BY t.threat_code, tc.title
 		ORDER BY cnt DESC
 		LIMIT $2`,
@@ -2416,7 +2416,7 @@ func (d *DB) GetThreatsByCode(orgID string, code int) ([]*ThreatRecord, int, err
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
-		WHERE ni.org_id = $1 AND t.threat_code = $2`, orgID, code).Scan(&total)
+		WHERE ni.organization_id = $1 AND t.threat_code = $2`, orgID, code).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2424,7 +2424,7 @@ func (d *DB) GetThreatsByCode(orgID string, code int) ([]*ThreatRecord, int, err
 		SELECT t.id, t.intent_id, t.interaction_id, t.time, t.threat_code, t.message
 		FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
-		WHERE ni.org_id = $1 AND t.threat_code = $2
+		WHERE ni.organization_id = $1 AND t.threat_code = $2
 		ORDER BY t.time DESC`,
 		orgID, code,
 	)
