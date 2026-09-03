@@ -140,42 +140,6 @@ type workflowEnvelope struct {
 	ParentEnvelope []*workflowEnvelope `json:"parent_envelope"`
 }
 
-// chainNFTData is the top-level structure of an intent NFT using the chain spec.
-type chainNFTData struct {
-	Type         string            `json:"type"`
-	Comment      string            `json:"comment"`
-	Executor     string            `json:"executor"`
-	DID          string            `json:"did"`
-	Verification chainVerification `json:"verification"`
-	Chain        *chainBlock       `json:"chain"`
-}
-
-type chainVerification struct {
-	Status      string   `json:"status"`
-	ChainDepth  int      `json:"chain_depth"`
-	TrustIssues []string `json:"trust_issues"`
-}
-
-type chainBlock struct {
-	Agent        string               `json:"agent"`
-	Name         string               `json:"name"`
-	Direction    string               `json:"direction"`
-	Type         string               `json:"type"`
-	Envelope     chainEnvelope        `json:"envelope"`
-	Signature    string               `json:"signature"`
-	Verification chainBlockVerification `json:"verification"`
-}
-
-type chainEnvelope struct {
-	Payload     map[string]any `json:"payload"`
-	ParentBlock *chainBlock    `json:"parent_block,omitempty"`
-}
-
-type chainBlockVerification struct {
-	SignatureValid bool     `json:"signature_valid"`
-	TrustIssues   []string `json:"trust_issues"`
-}
-
 // interactionExtract holds one extracted hop from the chain.
 type interactionExtract struct {
 	FromDID   string
