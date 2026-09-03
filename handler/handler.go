@@ -628,14 +628,18 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		// If this envelope signals a threat, resolve the message and store it.
 		if threat {
 			var threatMsg string
-			if rec, err := h.db.GetThreatCodeDetail(env.Code); err == nil {
-				// Known code (1001 whitelist, 2xxx COCA, 4001 MCP tool exec, etc.)
-				// — use the seeded title, no external call needed.
-				threatMsg = rec.Title
-			} else if env.Code >= 3000 && env.Hash != "" {
-				// CBAC/guard codes not in our local map — fetch the detailed reason
-				// from the cbac-decisions service.
+			if cbacGuardCodes[env.Code] && env.Hash != "" {
+				// Guard/CBAC codes — the seeded threat_codes title is only a
+				// generic fallback description; the cbac-decisions service has
+				// the specific reason for this decision, so prefer that.
 				threatMsg = h.fetchCbacDecisionReason(env.Hash)
+			}
+			if threatMsg == "" {
+				if rec, err := h.db.GetThreatCodeDetail(env.Code); err == nil {
+					// Known code (1001 whitelist, 2xxx COCA, 4001 MCP tool exec, etc.)
+					// or the cbac lookup above came back empty — use the seeded title.
+					threatMsg = rec.Title
+				}
 			}
 			threatID := fmt.Sprintf("%s-threat-%d", intentID, idx)
 			if err := h.db.StoreThreat(threatID, intentID, blockID, env.Code, threatMsg, time.Unix(env.Epoch, 0).UTC()); err != nil {
@@ -3656,16 +3660,44 @@ func (h *Handler) ThreatByID(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{Status: true, Data: data})
 }
 
+// cbacGuardCodes are the guard/CBAC pipeline codes whose seeded threat_codes
+// title is only a generic fallback — the cbac-decisions service holds the
+// specific reason for these, so fetchCbacDecisionReason is preferred for them.
+var cbacGuardCodes = map[int]bool{
+	3001: true, // Guard: Intended Action Empty
+	3002: true, // Guard: Policy Lookup Failed
+	3003: true, // Guard: No Policy Available
+	3004: true, // Guard: Policy Index Failed
+	3005: true, // Guard: Policy No Content
+	3101: true, // Check 1: Drift Deny
+	3201: true, // Tier 1: Gap Allow
+	3202: true, // Tier 1: Gap Deny
+	3301: true, // Tier 2: No Allowed Chunks
+	3302: true, // Tier 2: Entailment Allow
+	3303: true, // Tier 2: Contradiction Deny
+	3401: true, // Tier 3: No Backend
+	3402: true, // Tier 3: LLM Error
+	3403: true, // Tier 3: LLM Keyword Deny
+	3404: true, // Tier 3: LLM Keyword Allow
+	3405: true, // Tier 3: LLM Inconclusive
+	3406: true, // Tier 3: LLM Allow
+	3407: true, // Tier 3: LLM Deny
+	3408: true, // Tier 3: LLM Advise
+	3409: true, // Tier 3: LLM Malformed
+}
+
 // fetchCbacDecisionReason calls the cbac-decisions service for the given envelope hash
 // and returns the "reason" field from the response. Returns empty string on any error.
 func (h *Handler) fetchCbacDecisionReason(hash string) string {
 	if h.cbacServiceURL == "" || hash == "" {
+		log.Printf("[cbac] skipping lookup — cbacServiceURL=%q hash=%q", h.cbacServiceURL, hash)
 		return ""
 	}
 	url := h.cbacServiceURL + "cbac-decisions/by-hash/" + hash
+	log.Printf("[cbac] GET %s", url)
 	resp, err := http.Get(url)
 	if err != nil {
-		log.Printf("[cbac] GET %s: %v", url, err)
+		log.Printf("[cbac] GET %s: request error: %v", url, err)
 		return ""
 	}
 	defer resp.Body.Close()
@@ -3677,9 +3709,10 @@ func (h *Handler) fetchCbacDecisionReason(hash string) string {
 		Reason string `json:"reason"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		log.Printf("[cbac] decode response for hash=%s: %v", hash, err)
+		log.Printf("[cbac] GET %s: decode response for hash=%s: %v", url, hash, err)
 		return ""
 	}
+	log.Printf("[cbac] GET %s: status %d reason=%q", url, resp.StatusCode, body.Reason)
 	return body.Reason
 }
 
