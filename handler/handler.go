@@ -3693,7 +3693,7 @@ func (h *Handler) fetchCbacDecisionReason(hash string) string {
 		log.Printf("[cbac] skipping lookup — cbacServiceURL=%q hash=%q", h.cbacServiceURL, hash)
 		return ""
 	}
-	url := h.cbacServiceURL + "cbac-decisions/by-hash/" + hash
+	url := strings.TrimRight(h.cbacServiceURL, "/") + "/cbac-decisions/by-hash/" + hash
 	log.Printf("[cbac] GET %s", url)
 	resp, err := http.Get(url)
 	if err != nil {
