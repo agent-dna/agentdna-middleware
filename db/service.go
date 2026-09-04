@@ -1140,9 +1140,33 @@ func (d *DB) CountAgentsWithNamePrefix(prefix string) (int, error) {
 	return count, err
 }
 
+// StoreNewAgent inserts a placeholder agent row the first time an unknown DID
+// is seen mid-workflow (no real NFT registration event for it yet). It never
+// overwrites an existing row — if the DID is later registered properly via
+// UpsertAgentFromNFT, that call must win, not this one.
 func (d *DB) StoreNewAgent(nftID, did, deployerDID, orgID, policy, agentName string) error {
 	_, err := d.conn.Exec(
 		`INSERT INTO new_agents (nft_id, did, deployer_did, organization_id, policy, name) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
+		nftID, did, deployerDID, orgID, policy, agentName,
+	)
+	return err
+}
+
+// UpsertAgentFromNFT records an agent from an authoritative source — the
+// on-chain agent-NFT registration event (handleAgentNFT) or an admin-approved
+// agent-creation request. Unlike StoreNewAgent, this always overwrites
+// nft_id/deployer_did/organization_id/policy/name — it must win over any
+// placeholder row StoreNewAgent created earlier for the same DID.
+func (d *DB) UpsertAgentFromNFT(nftID, did, deployerDID, orgID, policy, agentName string) error {
+	_, err := d.conn.Exec(
+		`INSERT INTO new_agents (nft_id, did, deployer_did, organization_id, policy, name)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (did) DO UPDATE SET
+		   nft_id          = EXCLUDED.nft_id,
+		   deployer_did    = EXCLUDED.deployer_did,
+		   organization_id = EXCLUDED.organization_id,
+		   policy          = EXCLUDED.policy,
+		   name            = EXCLUDED.name`,
 		nftID, did, deployerDID, orgID, policy, agentName,
 	)
 	return err

@@ -536,7 +536,7 @@ func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 		return fmt.Errorf("handleAgentNFT: missing agent_name in nft_id=%s", nftInfo.NFTId)
 	}
 
-	return h.db.StoreNewAgent(nftInfo.NFTId, data.AgentDID, deployer, orgID, data.Policy, agentName)
+	return h.db.UpsertAgentFromNFT(nftInfo.NFTId, data.AgentDID, deployer, orgID, data.Policy, agentName)
 }
 
 // handleIntentWorkflow stores the intent-workflow interactions and returns the
@@ -3401,7 +3401,7 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 			nftID = uuid.New().String()
 		}
 		dbStart := time.Now()
-		if err := h.db.StoreNewAgent(nftID, existing.AgentDID, existing.CreatorDID, existing.OrgID, policy, existing.AgentName); err != nil {
+		if err := h.db.UpsertAgentFromNFT(nftID, existing.AgentDID, existing.CreatorDID, existing.OrgID, policy, existing.AgentName); err != nil {
 			log.Printf("[AgentCreationRequestSubmit] StoreNewAgent error: %v", err)
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to store agent: %v", err)})
 			return
@@ -3693,7 +3693,7 @@ func (h *Handler) fetchCbacDecisionReason(hash string) string {
 		log.Printf("[cbac] skipping lookup — cbacServiceURL=%q hash=%q", h.cbacServiceURL, hash)
 		return ""
 	}
-	url := strings.TrimRight(h.cbacServiceURL, "/") + "/cbac-decisions/by-hash/" + hash
+	url := strings.TrimRight(h.cbacServiceURL, "/") + "/decisions/by-hash/" + hash
 	log.Printf("[cbac] GET %s", url)
 	resp, err := http.Get(url)
 	if err != nil {
@@ -3705,15 +3705,23 @@ func (h *Handler) fetchCbacDecisionReason(hash string) string {
 		log.Printf("[cbac] GET %s: status %d", url, resp.StatusCode)
 		return ""
 	}
+	// Responses are wrapped: {"success": bool, "message": string, "data": {...}}.
 	var body struct {
-		Reason string `json:"reason"`
+		Success bool `json:"success"`
+		Data    struct {
+			Reason string `json:"reason"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		log.Printf("[cbac] GET %s: decode response for hash=%s: %v", url, hash, err)
 		return ""
 	}
-	log.Printf("[cbac] GET %s: status %d reason=%q", url, resp.StatusCode, body.Reason)
-	return body.Reason
+	if !body.Success {
+		log.Printf("[cbac] GET %s: success=false", url)
+		return ""
+	}
+	log.Printf("[cbac] GET %s: status %d reason=%q", url, resp.StatusCode, body.Data.Reason)
+	return body.Data.Reason
 }
 
 // GET /dashboard/v1/threat-events?page=1&limit=10
