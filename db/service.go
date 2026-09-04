@@ -554,7 +554,7 @@ func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		SELECT ni.interaction_id,
 		       ni.initiator_did, COALESCE(ni.initiator_name, ''),
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
-		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(ni.message, ''),
+		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
 		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
 		       COALESCE(tc.title, '')
 		FROM new_interactions ni
@@ -681,7 +681,7 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		SELECT ni.interaction_id,
 		       ni.initiator_did, COALESCE(ni.initiator_name, ''),
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
-		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(ni.message, ''),
+		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
 		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
 		       COALESCE(tc.title, '')
 		FROM new_interactions ni
