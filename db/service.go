@@ -1321,12 +1321,17 @@ func (d *DB) SetProvenanceRecord(reqID, transactionID, childNFTId string) (int64
 	}
 
 	// Rewrite interaction PKs (uuid-N → transactionID-N) and set provenance fields.
+	// threat_id is rewritten the same way (uuid-threat-N → transactionID-threat-N)
+	// so it keeps pointing at the threats row renamed below — left alone, only
+	// rows with a threat (threat_id <> '') are touched, so non-threat rows are
+	// unaffected.
 	suffixStart := len(oldIntentID) + 2
 	res, err := tx.Exec(
 		`UPDATE new_interactions
 		 SET interaction_id       = $1 || '-' || SUBSTR(interaction_id, $3),
 		     provenance_record_id = $1,
-		     intent_id            = $1
+		     intent_id            = $1,
+		     threat_id            = CASE WHEN threat_id <> '' THEN $1 || '-' || SUBSTR(threat_id, $3) ELSE threat_id END
 		 WHERE provenance_req_id = $2`,
 		transactionID, reqID, suffixStart,
 	)

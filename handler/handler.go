@@ -629,15 +629,22 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		if threat {
 			var threatMsg string
 			if cbacGuardCodes[env.Code] && env.Hash != "" {
-				// Guard/CBAC codes — the seeded threat_codes title is only a
-				// generic fallback description; the cbac-decisions service has
-				// the specific reason for this decision, so prefer that.
+				// Guard/CBAC codes — the cbac-decisions service has the specific
+				// reason for this decision, so prefer that.
 				threatMsg = h.fetchCbacDecisionReason(env.Hash)
 			}
 			if threatMsg == "" {
+				// Non-guard codes (1001 whitelist, 2xxx COCA, 4001 MCP tool exec,
+				// etc.) or the cbac lookup above came back empty — the envelope's
+				// own payload already carries the specific message for these
+				// (e.g. "Agent ... not whitelisted in Admin server"), same text
+				// as what's stored as the interaction's message, so reuse it.
+				threatMsg = msg
+			}
+			if threatMsg == "" {
+				// Last resort — payload had no usable text either, fall back to
+				// the generic seeded title so the field isn't blank.
 				if rec, err := h.db.GetThreatCodeDetail(env.Code); err == nil {
-					// Known code (1001 whitelist, 2xxx COCA, 4001 MCP tool exec, etc.)
-					// or the cbac lookup above came back empty — use the seeded title.
 					threatMsg = rec.Title
 				}
 			}
