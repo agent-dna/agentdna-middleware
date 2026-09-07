@@ -556,7 +556,7 @@ func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
 		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
 		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
-		       COALESCE(tc.title, '')
+		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat')
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
@@ -683,7 +683,7 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
 		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
 		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
-		       COALESCE(tc.title, '')
+		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat')
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
@@ -1416,7 +1416,7 @@ func scanInteractionNewRowsWithTitle(rows *sql.Rows) ([]*InteractionRecord, erro
 			&r.To, &r.ToName,
 			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
 			&r.Signature, &r.ProvenanceReqID, &r.ProvenanceRecordID, &r.ThreatID,
-			&r.ThreatTitle,
+			&r.ThreatCode, &r.ThreatTitle,
 		); err != nil {
 			return nil, err
 		}

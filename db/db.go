@@ -68,6 +68,7 @@ type InteractionRecord struct {
 	Direction           string
 	Threat              bool
 	ThreatID            string
+	ThreatCode          int
 	ThreatTitle         string
 	IntentID            string
 	Message             string
