@@ -3737,6 +3737,95 @@ func (h *Handler) fetchCbacDecisionReason(hash string) string {
 	return body.Data.Reason
 }
 
+// LHIScoreEntry is one trust-edge record returned by the cbac-service
+// lhi-scores endpoint — an agent's observed trust score against one callee
+// (tool/agent) it has interacted with.
+type LHIScoreEntry struct {
+	CalleeName         string  `json:"callee_name"`
+	CalleeType         string  `json:"callee_type"`
+	IntentScore        float64 `json:"intent_score"`
+	PolicyScore        float64 `json:"policy_score"`
+	HallucinationScore float64 `json:"hallucination_score"`
+	Trust              float64 `json:"trust"`
+	CreatedAt          string  `json:"created_at"`
+}
+
+// fetchAgentLHIScores calls the cbac-service lhi-scores endpoint for the given
+// batch of agent DIDs and returns the per-agent score lists it reports.
+func (h *Handler) fetchAgentLHIScores(agentIDs []string) (map[string][]LHIScoreEntry, error) {
+	if h.cbacServiceURL == "" {
+		return nil, fmt.Errorf("cbac service url not configured")
+	}
+	if len(agentIDs) == 0 {
+		return map[string][]LHIScoreEntry{}, nil
+	}
+
+	reqBody, err := json.Marshal(struct {
+		AgentIDs []string `json:"agent_ids"`
+	}{AgentIDs: agentIDs})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %v", err)
+	}
+
+	url := strings.TrimRight(h.cbacServiceURL, "/") + "/lhi-scores"
+	log.Printf("[cbac] POST %s agent_ids=%v", url, agentIDs)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	// Wrapped the same way as /decisions/by-hash: {success, message, data}.
+	var body struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+		Data    struct {
+			Agents map[string][]LHIScoreEntry `json:"agents"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode response: %v", err)
+	}
+	if !body.Success {
+		return nil, fmt.Errorf("cbac service reported failure: %s", body.Message)
+	}
+	log.Printf("[cbac] POST %s: %s", url, body.Message)
+	return body.Data.Agents, nil
+}
+
+// GET /dashboard/v1/agent-lhi-scores?agentDID=...
+// Calls the cbac-service lhi-scores endpoint for a single agent (scoped to
+// the caller's org) and returns its trust-edge scores as-is.
+func (h *Handler) AgentLHIScores(c *gin.Context) {
+	agentDID := c.Query("agentDID")
+	orgID := c.GetString(CtxOrgID)
+	if agentDID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
+		return
+	}
+
+	agentOrgID, err := h.db.GetAgentOrgID(agentDID)
+	if err != nil || agentOrgID != orgID {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+		return
+	}
+
+	agents, err := h.fetchAgentLHIScores([]string{agentDID})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch lhi scores: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
+		"agentDID": agentDID,
+		"scores":   agents[agentDID],
+	}})
+}
+
 // GET /dashboard/v1/threat-events?page=1&limit=10
 func (h *Handler) ThreatEvents(c *gin.Context) {
 	orgID := c.GetString(CtxOrgID)

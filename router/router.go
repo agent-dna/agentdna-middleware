@@ -44,6 +44,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/agent-intents", h.AgentIntents)
 	dashboard.GET("/user-intents", h.UserIntents)
 	dashboard.GET("/agent-info", h.AgentInfo)
+	dashboard.GET("/agent-lhi-scores", h.AgentLHIScores)
 	dashboard.POST("/revoke-agent", h.RevokeAgent)
 	dashboard.GET("/intent-info", h.IntentInfo)
 	dashboard.POST("/update-intent-status", h.UpdateIntentStatus)
