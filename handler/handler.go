@@ -628,17 +628,22 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		// If this envelope signals a threat, resolve the message and store it.
 		if threat {
 			var threatMsg string
-			if cbacGuardCodes[env.Code] && env.Hash != "" {
-				// Guard/CBAC codes — the cbac-decisions service has the specific
-				// reason for this decision, so prefer that.
-				threatMsg = h.fetchCbacDecisionReason(env.Hash)
-			}
-			if threatMsg == "" {
+			if cbacGuardCodes[env.Code] {
+				// Guard/CBAC codes — the envelope's payload (msg, above) carries the
+				// interaction hash for this decision, not env.Hash (that's the
+				// envelope's own signature hash and doesn't match
+				// cbac-decisions.interaction_hash). Fetch the specific reason. If
+				// this comes back empty, fall straight through to the generic
+				// seeded title below — msg here is a hash, not text, so it must
+				// never be used as the displayed message.
+				if msg != "" {
+					threatMsg = h.fetchCbacDecisionReason(msg)
+				}
+			} else {
 				// Non-guard codes (1001 whitelist, 2xxx COCA, 4001 MCP tool exec,
-				// etc.) or the cbac lookup above came back empty — the envelope's
-				// own payload already carries the specific message for these
-				// (e.g. "Agent ... not whitelisted in Admin server"), same text
-				// as what's stored as the interaction's message, so reuse it.
+				// etc.) — the envelope's own payload already carries the specific
+				// message for these (e.g. "Agent ... not whitelisted in Admin
+				// server"), same text as what's stored as the interaction's message.
 				threatMsg = msg
 			}
 			if threatMsg == "" {
