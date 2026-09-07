@@ -1873,6 +1873,41 @@ func (d *DB) StoreNewTool(did, name, orgID string) error {
 	return err
 }
 
+// AddAgentToToolList records that agentDID has contacted tool toolDID, adding
+// it to the tool's agents_list if not already present. Done as a single
+// atomic UPDATE (cast the TEXT column to jsonb, append, de-dupe, cast back)
+// rather than read-modify-write in Go, since multiple intents touching the
+// same tool concurrently would otherwise race and drop updates.
+func (d *DB) AddAgentToToolList(toolDID, agentDID string) error {
+	_, err := d.conn.Exec(`
+		UPDATE new_tools
+		SET agents_list = (
+			SELECT COALESCE(jsonb_agg(DISTINCT elem), '[]'::jsonb)::text
+			FROM jsonb_array_elements_text(
+				COALESCE(NULLIF(agents_list, '')::jsonb, '[]'::jsonb) || to_jsonb($2::text)
+			) AS elem
+		)
+		WHERE did = $1`,
+		toolDID, agentDID,
+	)
+	return err
+}
+
+// GetToolAgentsList returns the tool's name and its de-duplicated list of
+// contacted agent DIDs (agents_list), scoped to orgID.
+func (d *DB) GetToolAgentsList(toolDID, orgID string) (name string, agents []string, err error) {
+	var agentsJSON string
+	err = d.conn.QueryRow(
+		`SELECT name, COALESCE(agents_list, '[]') FROM new_tools WHERE did = $1 AND organization_id = $2`,
+		toolDID, orgID,
+	).Scan(&name, &agentsJSON)
+	if err != nil {
+		return "", nil, err
+	}
+	_ = json.Unmarshal([]byte(agentsJSON), &agents)
+	return name, agents, nil
+}
+
 func (d *DB) CountToolsByOrg(orgID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(`

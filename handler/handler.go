@@ -743,6 +743,14 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 			return "", fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
 		}
 		log.Printf("[intentWorkflow] interaction[%d] from=%s to=%s type=%s threat=%v", idx, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
+
+		// If this interaction's target is a registered tool, record that the
+		// initiating agent has contacted it.
+		if h.db.IsNewTool(ix.ToDID) {
+			if err := h.db.AddAgentToToolList(ix.ToDID, ix.FromDID); err != nil {
+				log.Printf("[intentWorkflow] AddAgentToToolList tool=%s agent=%s: %v", ix.ToDID, ix.FromDID, err)
+			}
+		}
 	}
 
 	// ── Store intent ─────────────────────────────────────────────────────────
@@ -3823,6 +3831,69 @@ func (h *Handler) AgentLHIScores(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
 		"agentDID": agentDID,
 		"scores":   agents[agentDID],
+	}})
+}
+
+// GET /dashboard/v1/tool-agent-scores?toolDID=...
+// Returns, for every agent that has ever contacted this tool (new_tools.agents_list,
+// populated in handleIntentWorkflow), that agent's name plus its intent/policy/
+// hallucination/trust scores against this specific tool — sourced from the
+// cbac-service lhi-scores endpoint and filtered down to the entry matching
+// this tool's name.
+func (h *Handler) ToolAgentScores(c *gin.Context) {
+	toolDID := c.Query("toolDID")
+	orgID := c.GetString(CtxOrgID)
+	if toolDID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "toolDID is required"})
+		return
+	}
+
+	toolName, agentDIDs, err := h.db.GetToolAgentsList(toolDID, orgID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "tool not found"})
+		return
+	}
+
+	type toolAgentScore struct {
+		AgentDID           string  `json:"agentDID"`
+		AgentName          string  `json:"agentName"`
+		IntentScore        float64 `json:"intentScore"`
+		PolicyScore        float64 `json:"policyScore"`
+		HallucinationScore float64 `json:"hallucinationScore"`
+		Trust              float64 `json:"trust"`
+	}
+	result := make([]toolAgentScore, 0, len(agentDIDs))
+
+	if len(agentDIDs) > 0 {
+		agentScores, err := h.fetchAgentLHIScores(agentDIDs)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch lhi scores: %v", err)})
+			return
+		}
+		for _, agentDID := range agentDIDs {
+			item := toolAgentScore{
+				AgentDID:  agentDID,
+				AgentName: h.resolveActorName(agentDID, ""),
+			}
+			// Each agent's score list covers every callee it has talked to —
+			// pick the entry for this tool specifically.
+			for _, s := range agentScores[agentDID] {
+				if s.CalleeType == "tool" && s.CalleeName == toolName {
+					item.IntentScore = s.IntentScore
+					item.PolicyScore = s.PolicyScore
+					item.HallucinationScore = s.HallucinationScore
+					item.Trust = s.Trust
+					break
+				}
+			}
+			result = append(result, item)
+		}
+	}
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
+		"toolDID":  toolDID,
+		"toolName": toolName,
+		"agents":   result,
 	}})
 }
 

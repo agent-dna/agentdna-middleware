@@ -131,6 +131,7 @@ type ToolRecord struct {
 	TotalAgents       int
 	Score             float64
 	LastInteractedAt  *time.Time
+	AgentsList        []string
 }
 
 type UserInfoRecord struct {
@@ -406,6 +407,10 @@ func New(dsn string) *DB {
 	conn.Exec(`ALTER TABLE new_tools DROP CONSTRAINT IF EXISTS new_tools_pkey`)
 	conn.Exec(`ALTER TABLE new_tools ADD PRIMARY KEY (did) `)
 	conn.Exec(`ALTER TABLE new_tools ALTER COLUMN organization_id DROP NOT NULL`)
+	// agents_list: JSON array of agent DIDs that have contacted this tool so
+	// far. Same convention as new_intents.interaction_ids — a plain TEXT
+	// column holding a JSON-encoded []string, marshaled/unmarshaled in Go.
+	conn.Exec(`ALTER TABLE new_tools ADD COLUMN IF NOT EXISTS agents_list TEXT DEFAULT '[]'`)
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS threat_id TEXT NOT NULL DEFAULT ''`)
 	conn.Exec(`CREATE TABLE IF NOT EXISTS apps (
 		did        TEXT PRIMARY KEY,
