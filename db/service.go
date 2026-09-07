@@ -1763,7 +1763,7 @@ func (d *DB) GetToolByNameOrDID(query, orgID string) (*ToolRecord, error) {
 			COUNT(i.interaction_id)                                                     AS total_interactions,
 			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                              AS total_threats,
 			COUNT(DISTINCT i.intent_id)                                                 AS total_intents,
-			COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.initiator_did END)        AS total_agents,
+			COUNT(DISTINCT a.did)                                                       AS total_agents,
 			CASE
 				WHEN COUNT(i.interaction_id) = 0 THEN 100.0
 				ELSE ROUND(CAST(
@@ -1772,8 +1772,15 @@ func (d *DB) GetToolByNameOrDID(query, orgID string) (*ToolRecord, error) {
 			END AS score,
 			MAX(i.time) AS last_interacted_at
 		FROM new_tools t
-		LEFT JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1
-		LEFT JOIN new_agents a ON a.did = i.initiator_did
+		-- Count the tool's traffic whichever side of the interaction it's on
+		-- (interacted_to_did for tool-called-by-agent, initiator_did for the
+		-- rarer tool-initiates-a-response direction).
+		LEFT JOIN new_interactions i
+		       ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		      AND i.organization_id = $1
+		-- The "other party" on that interaction — whichever side isn't this tool.
+		LEFT JOIN new_agents a
+		       ON a.did = CASE WHEN i.interacted_to_did = t.did THEN i.initiator_did ELSE i.interacted_to_did END
 		WHERE t.organization_id = $1
 		  AND (t.did = $2 OR t.name = $2)
 		GROUP BY t.did, t.name
@@ -1912,7 +1919,9 @@ func (d *DB) CountToolsByOrg(orgID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(`
 		SELECT COUNT(DISTINCT t.did) FROM new_tools t
-		INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1`,
+		INNER JOIN new_interactions i
+		        ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		       AND i.organization_id = $1`,
 		orgID,
 	).Scan(&total)
 	return total, err
@@ -1926,7 +1935,7 @@ func (d *DB) GetToolsByOrg(orgID string, limit, offset int) ([]*ToolRecord, erro
 			COUNT(i.interaction_id)                                                     AS total_interactions,
 			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                              AS total_threats,
 			COUNT(DISTINCT i.intent_id)                                                 AS total_intents,
-			COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.initiator_did END)        AS total_agents,
+			COUNT(DISTINCT a.did)                                                       AS total_agents,
 			CASE
 				WHEN COUNT(i.interaction_id) = 0 THEN 100.0
 				ELSE ROUND(CAST(
@@ -1934,8 +1943,11 @@ func (d *DB) GetToolsByOrg(orgID string, limit, offset int) ([]*ToolRecord, erro
 					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
 			END                                                                         AS score
 		FROM new_tools t
-		INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1
-		LEFT JOIN new_agents a ON a.did = i.initiator_did
+		INNER JOIN new_interactions i
+		        ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		       AND i.organization_id = $1
+		LEFT JOIN new_agents a
+		       ON a.did = CASE WHEN i.interacted_to_did = t.did THEN i.initiator_did ELSE i.interacted_to_did END
 		GROUP BY t.did, t.name
 		ORDER BY total_interactions DESC
 		LIMIT $2 OFFSET $3`,
@@ -2263,7 +2275,9 @@ func (d *DB) GetAgentsAppsMetrics(orgID string) (*AgentsAppsMetrics, error) {
 	}
 	if err := d.conn.QueryRow(
 		`SELECT COUNT(DISTINCT t.did) FROM new_tools t
-		 INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1`,
+		 INNER JOIN new_interactions i
+		         ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		        AND i.organization_id = $1`,
 		orgID,
 	).Scan(&out.TotalApps); err != nil {
 		return nil, err
