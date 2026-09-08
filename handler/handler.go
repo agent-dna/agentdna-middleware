@@ -3751,6 +3751,7 @@ func (h *Handler) fetchCbacDecisionReason(hash string) string {
 type LHIScoreEntry struct {
 	CalleeName         string  `json:"callee_name"`
 	CalleeType         string  `json:"callee_type"`
+	MCPDID             string  `json:"mcp_did"`
 	IntentScore        float64 `json:"intent_score"`
 	PolicyScore        float64 `json:"policy_score"`
 	HallucinationScore float64 `json:"hallucination_score"`
@@ -3876,9 +3877,14 @@ func (h *Handler) ToolAgentScores(c *gin.Context) {
 				AgentName: h.resolveActorName(agentDID, ""),
 			}
 			// Each agent's score list covers every callee it has talked to —
-			// pick the entry for this tool specifically.
+			// pick the entry for this tool specifically. Match on the tool's
+			// DID (mcp_did) rather than its display name: the cbac-service's
+			// callee_name isn't guaranteed to line up with new_tools.name.
+			// Note: DID-tagged entries come back with callee_type "mcp_tool"
+			// (not "tool"), so key off mcp_did alone rather than also
+			// requiring callee_type == "tool".
 			for _, s := range agentScores[agentDID] {
-				if s.CalleeType == "tool" && s.CalleeName == toolName {
+				if s.MCPDID != "" && s.MCPDID == toolDID {
 					item.IntentScore = s.IntentScore
 					item.PolicyScore = s.PolicyScore
 					item.HallucinationScore = s.HallucinationScore
