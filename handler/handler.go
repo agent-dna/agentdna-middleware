@@ -444,13 +444,15 @@ func (h *Handler) captureTxResponse(resp *http.Response) {
 		return
 	}
 
-	// status=false → the transaction failed to initiate; remove the rows we inserted
-	// during request handling. (The new_intents row is left as-is by design.)
+	// status=false → the transaction failed to initiate; remove the intent and
+	// interaction rows we inserted during request handling.
 	if !txResp.Status {
-		if err := h.db.DeleteInteractionsByIntent(intentID); err != nil {
+		interactionsDeleted, intentsDeleted, err := h.db.DeleteInteractionsByIntent(intentID)
+		if err != nil {
 			log.Printf("[provenance] tx: delete failed intent_id=%s: %v", intentID, err)
 		} else {
-			log.Printf("[provenance] tx: status=false, removed interaction rows intent_id=%s", intentID)
+			log.Printf("[provenance] tx: status=false, rolled back intent_id=%s interactions_deleted=%d intents_deleted=%d",
+				intentID, interactionsDeleted, intentsDeleted)
 		}
 		return
 	}

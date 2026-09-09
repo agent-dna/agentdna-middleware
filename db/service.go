@@ -1274,11 +1274,34 @@ func (d *DB) SetProvenanceReqID(intentID, reqID string) error {
 	return err
 }
 
-// DeleteInteractionsByIntent removes the interaction rows for an intent — used when
-// the /rubix/v1/tx transaction fails to initiate (response status=false).
-func (d *DB) DeleteInteractionsByIntent(intentID string) error {
-	_, err := d.conn.Exec(`DELETE FROM new_interactions WHERE intent_id = $1`, intentID)
-	return err
+// DeleteInteractionsByIntent removes both the interaction rows and the new_intents
+// row itself for an intent — used when the /rubix/v1/tx transaction fails to
+// initiate (response status=false). Previously this only deleted new_interactions
+// and left new_intents behind "by design", but that orphaned intent row keeps its
+// stale aggregate fields (threat_detected, chain_depth, ...) computed before the
+// rows they depended on were removed, so it shows up in intent-list looking like a
+// real intent with 0 interactions. Deleting both keeps that from happening — same
+// fix as DeleteInteractionsByProvenanceReqID for the /signature failure path.
+func (d *DB) DeleteInteractionsByIntent(intentID string) (int64, int64, error) {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+
+	res, err := tx.Exec(`DELETE FROM new_interactions WHERE intent_id = $1`, intentID)
+	if err != nil {
+		return 0, 0, err
+	}
+	interactionsDeleted, _ := res.RowsAffected()
+
+	res2, err := tx.Exec(`DELETE FROM new_intents WHERE intent_id = $1`, intentID)
+	if err != nil {
+		return 0, 0, err
+	}
+	intentsDeleted, _ := res2.RowsAffected()
+
+	return interactionsDeleted, intentsDeleted, tx.Commit()
 }
 
 // DeleteInteractionsByProvenanceReqID removes both the interaction rows and their
