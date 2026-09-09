@@ -459,7 +459,11 @@ func New(dsn string) *DB {
 		(3407, 'Tier 3: LLM Deny',              'Tier 3 LLM explicitly denied the action'),
 		(3408, 'Tier 3: LLM Advise',            'Tier 3 LLM returned an advisory — human review recommended'),
 		(3409, 'Tier 3: LLM Malformed',         'Tier 3 LLM response was malformed and could not be parsed'),
-		(4001, 'MCP Tool Exec Error',           'The MCP tool call failed to execute')
+		(4001, 'MCP Tool Exec Error',           'The MCP tool call failed to execute'),
+		(9101, 'CBAC Client: No Service Configured', 'No cbac_url was passed and CBAC_URL is not set in the environment'),
+		(9102, 'CBAC Client: Unrecognized Response', 'The cbac-service returned a 200 response whose body carried no decision at all'),
+		(9103, 'CBAC Client: Transport Failed', 'The POST to the cbac-service raised a transport error — connection refused, timed out, or bad TLS'),
+		(9104, 'CBAC Client: Verdict Without Code', 'A decision came back from the cbac-service, but with no code to key off of')
 		ON CONFLICT (code) DO NOTHING`)
 
 	return &DB{conn: conn}
