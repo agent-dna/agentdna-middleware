@@ -590,10 +590,26 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 
 	// All envelope nodes sorted oldest→newest.
 	allEnvelopes := collectAllEnvelopes(data.Envelope)
-	// Initiator is always the root (oldest/base, no-parent) envelope's From —
-	// the entity that actually kicked off the chain — not the NFT payload's
-	// initiator field.
-	initiatorDID := allEnvelopes[0].From
+	// Initiator is always the root (base, no-parent) envelope's From — the entity
+	// that actually kicked off the chain — not the NFT payload's initiator field.
+	// Found by walking to the envelope with no ParentEnvelope, not by assuming
+	// allEnvelopes[0] is it: envelopes minted back-to-back can share the same
+	// second-resolution epoch, and sort.Slice is unstable, so an epoch tie can put
+	// a different envelope at index 0 (seen in practice: a delegate envelope tied
+	// with the actual root and won the sort).
+	var rootEnvelope *workflowEnvelope
+	for _, e := range allEnvelopes {
+		if len(e.ParentEnvelope) == 0 {
+			rootEnvelope = e
+			break
+		}
+	}
+	if rootEnvelope == nil {
+		// Defensive fallback — shouldn't happen since collectAllEnvelopes always
+		// terminates at nodes with no parents.
+		rootEnvelope = allEnvelopes[0]
+	}
+	initiatorDID := rootEnvelope.From
 	initiatorName := h.resolveActorName(initiatorDID, "")
 	// Executor is the NFT payload's initiator (the entity that submitted the
 	// transaction) — distinct from initiatorDID. Used to close the provenance
