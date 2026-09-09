@@ -1281,6 +1281,20 @@ func (d *DB) DeleteInteractionsByIntent(intentID string) error {
 	return err
 }
 
+// DeleteInteractionsByProvenanceReqID removes the interaction rows tagged with the
+// given /tx provenance id — used when /rubix/v1/signature makes it clear this txn
+// will never get a provenance_record_id (status=false, no minted child, missing
+// ids). Without this, those rows stay in the DB looking identical to a normally
+// provenanced interaction even though the chain write never completed.
+func (d *DB) DeleteInteractionsByProvenanceReqID(reqID string) (int64, error) {
+	res, err := d.conn.Exec(`DELETE FROM new_interactions WHERE provenance_req_id = $1`, reqID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // SetProvenanceRecord attaches the /rubix/v1/signature response data to the rows
 // matched by the /tx provenance id and returns the number of interaction rows updated
 // (0 means the /tx write has not landed yet, so the caller skips).

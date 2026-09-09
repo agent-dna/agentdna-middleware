@@ -481,11 +481,13 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 		return
 	}
 	if !sigResp.Status {
-		log.Printf("[provenance] signature: status=false id=%s, skipping", reqID)
+		log.Printf("[provenance] signature: status=false id=%s, rolling back", reqID)
+		h.rollbackFailedProvenance(reqID, "status=false")
 		return
 	}
 	if len(sigResp.Result.MintedNFTChildren) == 0 {
-		log.Printf("[provenance] signature: no mintedNFTChildren req_id=%s", reqID)
+		log.Printf("[provenance] signature: no mintedNFTChildren req_id=%s, rolling back", reqID)
+		h.rollbackFailedProvenance(reqID, "no mintedNFTChildren")
 		return
 	}
 
@@ -493,11 +495,13 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 	transactionID := sigResp.Result.TransactionID
 
 	if childNFTId == "" {
-		log.Printf("[provenance] signature: empty childNFTId req_id=%s, skipping", reqID)
+		log.Printf("[provenance] signature: empty childNFTId req_id=%s, rolling back", reqID)
+		h.rollbackFailedProvenance(reqID, "empty childNFTId")
 		return
 	}
 	if transactionID == "" {
-		log.Printf("[provenance] signature: empty transactionID req_id=%s, skipping", reqID)
+		log.Printf("[provenance] signature: empty transactionID req_id=%s, rolling back", reqID)
+		h.rollbackFailedProvenance(reqID, "empty transactionID")
 		return
 	}
 
@@ -514,6 +518,19 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 	}
 	log.Printf("[provenance] signature: provenance_record updated ok rows=%d req_id=%s transactionID=%s childNFTId=%s",
 		rows, reqID, transactionID, childNFTId)
+}
+
+// rollbackFailedProvenance deletes the interaction rows tagged with reqID — called
+// wherever /rubix/v1/signature makes it clear this txn will never get a
+// provenance_record_id, so those rows don't linger looking like a normal,
+// successfully-provenanced interaction.
+func (h *Handler) rollbackFailedProvenance(reqID, reason string) {
+	n, err := h.db.DeleteInteractionsByProvenanceReqID(reqID)
+	if err != nil {
+		log.Printf("[provenance] signature: rollback failed req_id=%s reason=%q: %v", reqID, reason, err)
+		return
+	}
+	log.Printf("[provenance] signature: rolled back %d interaction row(s) req_id=%s reason=%q", n, reqID, reason)
 }
 
 
