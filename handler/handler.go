@@ -369,8 +369,12 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 					// Stash the generated intentID so the /tx response hook can attach
 					// provenance_req_id to the interaction rows we just inserted. Harmless
 					// on non-/tx paths — only captureTxResponse (path-gated) reads it.
-					if intentID, wfErr := h.handleIntentWorkflow(nftInfo); wfErr == nil && intentID != "" {
+					intentID, wfErr := h.handleIntentWorkflow(nftInfo)
+					if wfErr == nil && intentID != "" {
+						log.Printf("[provenance] tx: captured intent_id=%s, stashing in context", intentID)
 						r = r.WithContext(context.WithValue(r.Context(), ctxIntentIDKey, intentID))
+					} else {
+						log.Printf("[provenance] tx: FAILED to capture intent_id wfErr=%v intentID=%q", wfErr, intentID)
 					}
 				}
 			}
@@ -381,8 +385,10 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 		if r.URL.Path == rubixSignaturePath {
 			var sigReq signatureRequest
 			if jsonErr := json.Unmarshal(bodyBytes, &sigReq); jsonErr == nil && sigReq.ID != "" {
-				fmt.Printf("test-0102 sigReq.ID=%s\n", sigReq.ID)
+				log.Printf("[provenance] signature: captured request id=%s, stashing in context", sigReq.ID)
 				r = r.WithContext(context.WithValue(r.Context(), ctxSignatureIDKey, sigReq.ID))
+			} else {
+				log.Printf("[provenance] signature: FAILED to capture request id jsonErr=%v sigReq.ID=%q body=%s", jsonErr, sigReq.ID, string(bodyBytes))
 			}
 		}
 	}
@@ -422,7 +428,8 @@ func readAndRestoreBody(resp *http.Response) ([]byte, error) {
 func (h *Handler) captureTxResponse(resp *http.Response) {
 	intentID, _ := resp.Request.Context().Value(ctxIntentIDKey).(string)
 	if intentID == "" {
-		return // not an intent-workflow tx we're tracking
+		log.Printf("[provenance] tx: no intent_id in context, skipping (not an intent-workflow tx we're tracking)")
+		return
 	}
 
 	body, err := readAndRestoreBody(resp)
@@ -465,6 +472,7 @@ func (h *Handler) captureTxResponse(resp *http.Response) {
 func (h *Handler) captureSignatureResponse(resp *http.Response) {
 	reqID, _ := resp.Request.Context().Value(ctxSignatureIDKey).(string)
 	if reqID == "" {
+		log.Printf("[provenance] signature: no request id in context, skipping (request body id capture failed above?)")
 		return
 	}
 	log.Printf("[provenance] signature: received hook req_id=%s", reqID)
@@ -525,12 +533,18 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 // will never get a provenance_record_id, so nothing lingers looking like a normal,
 // successfully-provenanced intent/interaction.
 func (h *Handler) rollbackFailedProvenance(reqID, reason string) {
-	n, err := h.db.DeleteInteractionsByProvenanceReqID(reqID)
+	interactionsDeleted, intentsDeleted, err := h.db.DeleteInteractionsByProvenanceReqID(reqID)
 	if err != nil {
 		log.Printf("[provenance] signature: rollback failed req_id=%s reason=%q: %v", reqID, reason, err)
 		return
 	}
-	log.Printf("[provenance] signature: rolled back %d interaction row(s) req_id=%s reason=%q", n, reqID, reason)
+	log.Printf("[provenance] signature: rollback complete req_id=%s reason=%q interactions_deleted=%d intents_deleted=%d",
+		reqID, reason, interactionsDeleted, intentsDeleted)
+	if interactionsDeleted == 0 && intentsDeleted == 0 {
+		// Nothing matched provenance_req_id at all — either SetProvenanceReqID never ran
+		// for this reqID (the /tx hook missed it), or this rollback fired twice.
+		log.Printf("[provenance] signature: WARNING rollback req_id=%s matched 0 rows in both tables — nothing was tagged with this provenance_req_id, so the intent/interactions (if any) are still sitting there untouched", reqID)
+	}
 }
 
 

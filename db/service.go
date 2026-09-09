@@ -1288,24 +1288,29 @@ func (d *DB) DeleteInteractionsByIntent(intentID string) error {
 // the interactions and leaving new_intents behind produces an orphaned intent row
 // whose stale aggregate fields (threat_detected, chain_depth, ...) were computed
 // before the rollback and no longer reflect anything real, so both go together.
-func (d *DB) DeleteInteractionsByProvenanceReqID(reqID string) (int64, error) {
+// Returns (interactionsDeleted, intentsDeleted, err) — both counts are surfaced
+// (rather than just the interactions count) so a caller-side log can tell a "nothing
+// was ever tagged with this reqID" no-op apart from a real delete.
+func (d *DB) DeleteInteractionsByProvenanceReqID(reqID string) (int64, int64, error) {
 	tx, err := d.conn.Begin()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer tx.Rollback() // no-op after a successful Commit
 
 	res, err := tx.Exec(`DELETE FROM new_interactions WHERE provenance_req_id = $1`, reqID)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	n, _ := res.RowsAffected()
+	interactionsDeleted, _ := res.RowsAffected()
 
-	if _, err := tx.Exec(`DELETE FROM new_intents WHERE provenance_req_id = $1`, reqID); err != nil {
-		return 0, err
+	res2, err := tx.Exec(`DELETE FROM new_intents WHERE provenance_req_id = $1`, reqID)
+	if err != nil {
+		return 0, 0, err
 	}
+	intentsDeleted, _ := res2.RowsAffected()
 
-	return n, tx.Commit()
+	return interactionsDeleted, intentsDeleted, tx.Commit()
 }
 
 // SetProvenanceRecord attaches the /rubix/v1/signature response data to the rows
