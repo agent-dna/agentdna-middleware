@@ -1281,18 +1281,31 @@ func (d *DB) DeleteInteractionsByIntent(intentID string) error {
 	return err
 }
 
-// DeleteInteractionsByProvenanceReqID removes the interaction rows tagged with the
-// given /tx provenance id — used when /rubix/v1/signature makes it clear this txn
-// will never get a provenance_record_id (status=false, no minted child, missing
-// ids). Without this, those rows stay in the DB looking identical to a normally
-// provenanced interaction even though the chain write never completed.
+// DeleteInteractionsByProvenanceReqID removes both the interaction rows and their
+// parent new_intents row, tagged with the given /tx provenance id — used when
+// /rubix/v1/signature makes it clear this txn will never get a
+// provenance_record_id (status=false, no minted child, missing ids). Deleting only
+// the interactions and leaving new_intents behind produces an orphaned intent row
+// whose stale aggregate fields (threat_detected, chain_depth, ...) were computed
+// before the rollback and no longer reflect anything real, so both go together.
 func (d *DB) DeleteInteractionsByProvenanceReqID(reqID string) (int64, error) {
-	res, err := d.conn.Exec(`DELETE FROM new_interactions WHERE provenance_req_id = $1`, reqID)
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+
+	res, err := tx.Exec(`DELETE FROM new_interactions WHERE provenance_req_id = $1`, reqID)
 	if err != nil {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
-	return n, nil
+
+	if _, err := tx.Exec(`DELETE FROM new_intents WHERE provenance_req_id = $1`, reqID); err != nil {
+		return 0, err
+	}
+
+	return n, tx.Commit()
 }
 
 // SetProvenanceRecord attaches the /rubix/v1/signature response data to the rows

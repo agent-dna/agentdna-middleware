@@ -520,10 +520,10 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 		rows, reqID, transactionID, childNFTId)
 }
 
-// rollbackFailedProvenance deletes the interaction rows tagged with reqID — called
-// wherever /rubix/v1/signature makes it clear this txn will never get a
-// provenance_record_id, so those rows don't linger looking like a normal,
-// successfully-provenanced interaction.
+// rollbackFailedProvenance deletes the interaction rows and their parent intent
+// tagged with reqID — called wherever /rubix/v1/signature makes it clear this txn
+// will never get a provenance_record_id, so nothing lingers looking like a normal,
+// successfully-provenanced intent/interaction.
 func (h *Handler) rollbackFailedProvenance(reqID, reason string) {
 	n, err := h.db.DeleteInteractionsByProvenanceReqID(reqID)
 	if err != nil {
