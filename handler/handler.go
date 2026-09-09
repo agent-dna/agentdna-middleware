@@ -1340,6 +1340,7 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 			"threatCode":    t.ThreatCode,
 			"threatTitle":   t.ThreatTitle,
 			"intentID":      t.IntentID,
+			"reviewStatus":  t.ReviewStatus,
 			"time":          t.Time,
 			"message":       t.Message,
 		})

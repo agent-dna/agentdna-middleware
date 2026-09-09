@@ -75,6 +75,7 @@ type InteractionRecord struct {
 	Signature           string
 	ProvenanceReqID     string
 	ProvenanceRecordID  string
+	ReviewStatus        string
 	Time                time.Time
 }
 

@@ -556,10 +556,11 @@ func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
 		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
 		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
-		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat')
+		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Ongoing')
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
+		LEFT JOIN new_intents nint ON nint.intent_id = ni.intent_id
 		WHERE ni.organization_id = $2 AND ni.threat = 1 AND ni.intent_id IN (SELECT intent_id FROM user_intents)
 		ORDER BY ni.time DESC
 		LIMIT $3 OFFSET $4`,
@@ -683,10 +684,11 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
 		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
 		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
-		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat')
+		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Ongoing')
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
+		LEFT JOIN new_intents nint ON nint.intent_id = ni.intent_id
 		WHERE ni.organization_id = $1 AND ni.threat = 1
 		ORDER BY ni.time DESC
 		LIMIT $2 OFFSET $3`,
@@ -1416,7 +1418,7 @@ func scanInteractionNewRowsWithTitle(rows *sql.Rows) ([]*InteractionRecord, erro
 			&r.To, &r.ToName,
 			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
 			&r.Signature, &r.ProvenanceReqID, &r.ProvenanceRecordID, &r.ThreatID,
-			&r.ThreatCode, &r.ThreatTitle,
+			&r.ThreatCode, &r.ThreatTitle, &r.ReviewStatus,
 		); err != nil {
 			return nil, err
 		}
