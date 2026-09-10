@@ -1,0 +1,32 @@
+[
+  { "code": 1000, "title": "OK",                           "description": "No threat — interaction completed successfully" },
+
+  { "code": 2001, "title": "COCA Verification Failed (Light)",    "description": "Light COCA verification failed — the interaction did not pass the lightweight consistency check" },
+  { "code": 2002, "title": "COCA Verification Failed (Heavy)",    "description": "Heavy COCA verification failed — the interaction did not pass the full consistency check" },
+  { "code": 2003, "title": "COCA Verification Failed (Boundary)", "description": "Boundary COCA verification failed — the interaction violated a policy boundary constraint" },
+
+  { "code": 3001, "title": "Guard: Intended Action Empty", "description": "Pre-model guard failed — the intended action field is empty" },
+  { "code": 3002, "title": "Guard: Policy Lookup Failed",  "description": "Pre-model guard failed — could not look up the policy for this agent" },
+  { "code": 3003, "title": "Guard: No Policy Available",   "description": "Pre-model guard failed — no policy is available for this agent" },
+  { "code": 3004, "title": "Guard: Policy Index Failed",   "description": "Pre-model guard failed — policy index could not be built or loaded" },
+  { "code": 3005, "title": "Guard: Policy No Content",     "description": "Pre-model guard failed — the policy document has no usable content" },
+
+  { "code": 3101, "title": "Check 1: Drift Deny",          "description": "Drift check denied — the request deviates from the established baseline" },
+
+  { "code": 3201, "title": "Tier 1: Gap Allow",            "description": "Tier 1 cosine-gap check passed — action allowed" },
+  { "code": 3202, "title": "Tier 1: Gap Deny",             "description": "Tier 1 cosine-gap check failed — semantic distance exceeds threshold" },
+
+  { "code": 3301, "title": "Tier 2: No Allowed Chunks",    "description": "Tier 2 NLI check failed — no policy chunks were marked as allowed" },
+  { "code": 3302, "title": "Tier 2: Entailment Allow",     "description": "Tier 2 NLI entailment check passed — action allowed" },
+  { "code": 3303, "title": "Tier 2: Contradiction Deny",   "description": "Tier 2 NLI contradiction check failed — action contradicts policy" },
+
+  { "code": 3401, "title": "Tier 3: No Backend",           "description": "Tier 3 LLM backend is not configured — decision deferred" },
+  { "code": 3402, "title": "Tier 3: LLM Error",            "description": "Tier 3 LLM backend returned an error — decision deferred" },
+  { "code": 3403, "title": "Tier 3: LLM Keyword Deny",     "description": "Tier 3 LLM detected a deny keyword in the response" },
+  { "code": 3404, "title": "Tier 3: LLM Keyword Allow",    "description": "Tier 3 LLM detected an allow keyword in the response" },
+  { "code": 3405, "title": "Tier 3: LLM Inconclusive",     "description": "Tier 3 LLM response was inconclusive — decision deferred" },
+  { "code": 3406, "title": "Tier 3: LLM Allow",            "description": "Tier 3 LLM explicitly allowed the action" },
+  { "code": 3407, "title": "Tier 3: LLM Deny",             "description": "Tier 3 LLM explicitly denied the action" },
+  { "code": 3408, "title": "Tier 3: LLM Advise",           "description": "Tier 3 LLM returned an advisory — human review recommended" },
+  { "code": 3409, "title": "Tier 3: LLM Malformed",        "description": "Tier 3 LLM response was malformed and could not be parsed" }
+]

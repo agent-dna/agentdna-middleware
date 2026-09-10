@@ -119,7 +119,7 @@ func relayHeaders(c *gin.Context, header http.Header) {
 // callAuthorizeAction POSTs {agent_id, action_intent} to the admin server's
 // authorize-action endpoint and returns its (authorized, message) decision.
 func (h *Handler) callAuthorizeAction(agentID, actionIntent string, agentEnvelope *gin.H) (bool, string, error) {
-	endpoint := h.adminServiceURL + "agent-admin/v1/authorize-action"
+	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/authorize-action"
 
 	b, err := json.Marshal(map[string]any{
 		"agent_id": agentID,

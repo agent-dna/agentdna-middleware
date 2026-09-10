@@ -14,13 +14,14 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 )
 
-func initConfig() (string, *url.URL, string, string, string, string, string, string) {
+func initConfig() (string, *url.URL, string, string, string, string, string, string, string) {
 	dsn := os.Getenv("DATABASE_URL")
 	backendURLStr := os.Getenv("RUBIX_NODE_URL")
 	serverPort := os.Getenv("SERVER_PORT")
 	jwtSecret := os.Getenv("JWT_SECRET")
 	orgID := os.Getenv("ORG_ID")
 	adminServiceURL := os.Getenv("ADMIN_SERVICE_URL")
+	cbacServiceURL := os.Getenv("CBAC_SERVICE_URL")
 	createAgentEndpoint := os.Getenv("CREATE_AGENT_ENDPOINT")
 	updateAgentEndpoint := os.Getenv("UPDATE_AGENT_ENDPOINT")
 
@@ -45,16 +46,16 @@ func initConfig() (string, *url.URL, string, string, string, string, string, str
 		log.Fatalf("RUBIX_NODE_URL invalid format: %s", backendURLStr)
 	}
 
-	return dsn, parsedURL, serverPort, jwtSecret, orgID, adminServiceURL, createAgentEndpoint, updateAgentEndpoint
+	return dsn, parsedURL, serverPort, jwtSecret, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint
 }
 
 func main() {
-	dsn, backendURL, serverPort, jwtSecret, orgID, adminServiceURL, createAgentEndpoint, updateAgentEndpoint := initConfig()
+	dsn, backendURL, serverPort, jwtSecret, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint := initConfig()
 
 	database := db.New(dsn)
 	defer database.Close()
 
-	h := handler.New(database, backendURL, jwtSecret, orgID, adminServiceURL, createAgentEndpoint, updateAgentEndpoint)
+	h := handler.New(database, backendURL, jwtSecret, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint)
 
 	r := gin.New()
 	r.Use(gin.Recovery())

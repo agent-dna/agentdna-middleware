@@ -21,8 +21,8 @@ func (d *DB) GetAdminByEmail(email string) (*AdminRecord, error) {
 	var a AdminRecord
 	var orgID, apiKey sql.NullString
 	err := d.conn.QueryRow(
-		`SELECT did, organization_id, api_key, email, password FROM new_admins WHERE email = $1`, email,
-	).Scan(&a.DID, &orgID, &apiKey, &a.Email, &a.PasswordHash)
+		`SELECT did, organization_id, api_key, email, COALESCE(name,''), password FROM new_admins WHERE email = $1`, email,
+	).Scan(&a.DID, &orgID, &apiKey, &a.Email, &a.Name, &a.PasswordHash)
 	if err != nil {
 		return nil, err
 	}
@@ -131,6 +131,15 @@ func (d *DB) GetRequestByID(id string) (*RequestRecord, error) {
 	}
 	r.AgentDID, r.AgentName, r.RequestInfo, r.OrgID = agentDID.String, agentName.String, requestInfo.String, orgID.String
 	return r, nil
+}
+
+func (d *DB) GetAgentNameByRequestDID(agentDID string) (string, error) {
+	var name string
+	err := d.conn.QueryRow(
+		`SELECT COALESCE(agent_name, '') FROM new_requests WHERE agent_did = $1 AND agent_name <> '' LIMIT 1`,
+		agentDID,
+	).Scan(&name)
+	return name, err
 }
 
 func (d *DB) UpdateRequestStatus(id, status string) error {
@@ -442,14 +451,16 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		SELECT ni.intent_id, ni.initiator_did,
 		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
-		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
+		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Ongoing'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COUNT(i.interaction_id)                                                  AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
 		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN i.interacted_to_did END) AS tools_count,
 		       SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                           AS threat_count,
 		       MIN(i.time)                                                               AS first_interaction_at,
-		       MAX(i.time)                                                               AS last_interaction_at
+		       MAX(i.time)                                                               AS last_interaction_at,
+		       COALESCE((SELECT message FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
@@ -473,10 +484,10 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		var threatInt int
 		if err := rows.Scan(
 			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
-			&r.StartedAt, &endedAt, &r.Status, &threatInt,
+			&r.StartedAt, &endedAt, &r.Status, &r.ReviewStatus, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
 			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
-			&firstAt, &lastAt,
+			&firstAt, &lastAt, &r.Title,
 		); err != nil {
 			return nil, err
 		}
@@ -514,7 +525,7 @@ func (d *DB) GetInteractionsByUser(userDID, orgID string, limit, offset int) ([]
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents)
 		ORDER BY time DESC
@@ -540,14 +551,18 @@ func (d *DB) CountThreatsByUser(userDID, orgID string) (int, error) {
 
 func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*InteractionRecord, error) {
 	rows, err := d.conn.Query(userScopeIntentsCTE+`
-		SELECT interaction_id,
-		       initiator_did, COALESCE(initiator_name, ''),
-		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
-		FROM new_interactions
-		WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents)
-		ORDER BY time DESC
+		SELECT ni.interaction_id,
+		       ni.initiator_did, COALESCE(ni.initiator_name, ''),
+		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
+		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
+		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
+		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Ongoing')
+		FROM new_interactions ni
+		LEFT JOIN threats t ON t.id = ni.threat_id
+		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
+		LEFT JOIN new_intents nint ON nint.intent_id = ni.intent_id
+		WHERE ni.organization_id = $2 AND ni.threat = 1 AND ni.intent_id IN (SELECT intent_id FROM user_intents)
+		ORDER BY ni.time DESC
 		LIMIT $3 OFFSET $4`,
 		userDID, orgID, limit, offset,
 	)
@@ -555,7 +570,7 @@ func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		return nil, err
 	}
 	defer rows.Close()
-	return scanInteractionNewRows(rows)
+	return scanInteractionNewRowsWithTitle(rows)
 }
 
 func (d *DB) CountUsersByOrg(orgID string) (int, error) {
@@ -605,7 +620,7 @@ func (d *DB) GetInteractionsByOrg(orgID string, limit, offset int) ([]*Interacti
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE organization_id = $1
 		ORDER BY time DESC
@@ -640,7 +655,7 @@ func (d *DB) GetInteractionsByOrgAndIntent(orgID, intentID string, limit, offset
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE organization_id = $1 AND intent_id = $2
 		ORDER BY time DESC
@@ -664,14 +679,18 @@ func (d *DB) CountThreatsByOrg(orgID string) (int, error) {
 
 func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT interaction_id,
-		       initiator_did, COALESCE(initiator_name, ''),
-		       interacted_to_did, COALESCE(interacted_to_name, ''),
-		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
-		FROM new_interactions
-		WHERE organization_id = $1 AND threat = 1
-		ORDER BY time DESC
+		SELECT ni.interaction_id,
+		       ni.initiator_did, COALESCE(ni.initiator_name, ''),
+		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
+		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
+		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
+		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Ongoing')
+		FROM new_interactions ni
+		LEFT JOIN threats t ON t.id = ni.threat_id
+		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
+		LEFT JOIN new_intents nint ON nint.intent_id = ni.intent_id
+		WHERE ni.organization_id = $1 AND ni.threat = 1
+		ORDER BY ni.time DESC
 		LIMIT $2 OFFSET $3`,
 		orgID, limit, offset,
 	)
@@ -679,7 +698,7 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		return nil, err
 	}
 	defer rows.Close()
-	return scanInteractionNewRows(rows)
+	return scanInteractionNewRowsWithTitle(rows)
 }
 
 func (d *DB) CountTopThreatAgentsByOrg(orgID string) (int, error) {
@@ -966,6 +985,35 @@ func (d *DB) GetOrgUserByAPIKey(apiKey string) (*OrgUserRecord, error) {
 	return u, nil
 }
 
+func (d *DB) UpdateUserName(email, name string) error {
+	res, err := d.conn.Exec(`UPDATE new_org_users SET name = $1 WHERE email = $2`, name, email)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("user not found")
+	}
+	return nil
+}
+
+func (d *DB) UpdateUserEmail(currentEmail, newEmail string) error {
+	var exists bool
+	d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM new_org_users WHERE email = $1)`, newEmail).Scan(&exists)
+	if exists {
+		return fmt.Errorf("email already in use")
+	}
+	res, err := d.conn.Exec(`UPDATE new_org_users SET email = $1 WHERE email = $2`, newEmail, currentEmail)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("user not found")
+	}
+	return nil
+}
+
 func (d *DB) UpdateUserDIDByAPIKey(apiKey, did string) error {
 	_, err := d.conn.Exec(
 		`UPDATE new_org_users SET did = $1 WHERE api_key = $2`,
@@ -1094,6 +1142,10 @@ func (d *DB) CountAgentsWithNamePrefix(prefix string) (int, error) {
 	return count, err
 }
 
+// StoreNewAgent inserts a placeholder agent row the first time an unknown DID
+// is seen mid-workflow (no real NFT registration event for it yet). It never
+// overwrites an existing row — if the DID is later registered properly via
+// UpsertAgentFromNFT, that call must win, not this one.
 func (d *DB) StoreNewAgent(nftID, did, deployerDID, orgID, policy, agentName string) error {
 	_, err := d.conn.Exec(
 		`INSERT INTO new_agents (nft_id, did, deployer_did, organization_id, policy, name) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
@@ -1102,9 +1154,67 @@ func (d *DB) StoreNewAgent(nftID, did, deployerDID, orgID, policy, agentName str
 	return err
 }
 
+// UpsertAgentFromNFT records an agent from an authoritative source — the
+// on-chain agent-NFT registration event (handleAgentNFT) or an admin-approved
+// agent-creation request. Unlike StoreNewAgent, this always overwrites
+// nft_id/deployer_did/organization_id/policy/name — it must win over any
+// placeholder row StoreNewAgent created earlier for the same DID.
+func (d *DB) UpsertAgentFromNFT(nftID, did, deployerDID, orgID, policy, agentName string) error {
+	_, err := d.conn.Exec(
+		`INSERT INTO new_agents (nft_id, did, deployer_did, organization_id, policy, name)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (did) DO UPDATE SET
+		   nft_id          = EXCLUDED.nft_id,
+		   deployer_did    = EXCLUDED.deployer_did,
+		   organization_id = EXCLUDED.organization_id,
+		   policy          = EXCLUDED.policy,
+		   name            = EXCLUDED.name`,
+		nftID, did, deployerDID, orgID, policy, agentName,
+	)
+	return err
+}
+
+func (d *DB) IsNewTool(did string) bool {
+	var exists bool
+	d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM new_tools WHERE did = $1)`, did).Scan(&exists)
+	return exists
+}
+
+func (d *DB) RevokeAgent(agentDID string) error {
+	res, err := d.conn.Exec(`UPDATE new_agents SET revoked = TRUE WHERE did = $1`, agentDID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", agentDID)
+	}
+	return nil
+}
+
+// UnrevokeAgent mirrors RevokeAgent — flips the agent's local revoked flag back
+// to FALSE. Called from the unrevoke-agent endpoint.
+func (d *DB) UnrevokeAgent(agentDID string) error {
+	res, err := d.conn.Exec(`UPDATE new_agents SET revoked = FALSE WHERE did = $1`, agentDID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", agentDID)
+	}
+	return nil
+}
+
 func (d *DB) GetAgentOrgID(agentDID string) (string, error) {
 	var orgID sql.NullString
-	err := d.conn.QueryRow(`SELECT organization_id FROM new_agents WHERE did = $1`, agentDID).Scan(&orgID)
+	err := d.conn.QueryRow(`
+		SELECT organization_id FROM new_agents WHERE did = $1
+		UNION ALL
+		SELECT organization_id FROM new_org_users WHERE did = $1
+		UNION ALL
+		SELECT organization_id FROM new_admins WHERE did = $1
+		LIMIT 1`, agentDID).Scan(&orgID)
 	return orgID.String, err
 }
 
@@ -1128,7 +1238,7 @@ func (d *DB) GetAgentNFTID(agentDID string) (string, error) {
 	return nftID.String, err
 }
 
-func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message, signature string, eventTime time.Time) error {
+func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message, signature, threatID string, eventTime time.Time) error {
 	threatInt := 0
 	if threat {
 		threatInt = 1
@@ -1138,9 +1248,9 @@ func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDI
 	}
 	_, err := d.conn.Exec(
 		`INSERT INTO new_interactions
-		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id, message, signature, time)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT DO NOTHING`,
-		id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction, threatInt, intentID, orgID, message, signature, eventTime,
+		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id, message, signature, threat_id, time)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT DO NOTHING`,
+		id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction, threatInt, intentID, orgID, message, signature, threatID, eventTime,
 	)
 	return err
 }
@@ -1178,11 +1288,66 @@ func (d *DB) SetProvenanceReqID(intentID, reqID string) error {
 	return err
 }
 
-// DeleteInteractionsByIntent removes the interaction rows for an intent — used when
-// the /rubix/v1/tx transaction fails to initiate (response status=false).
-func (d *DB) DeleteInteractionsByIntent(intentID string) error {
-	_, err := d.conn.Exec(`DELETE FROM new_interactions WHERE intent_id = $1`, intentID)
-	return err
+// DeleteInteractionsByIntent removes both the interaction rows and the new_intents
+// row itself for an intent — used when the /rubix/v1/tx transaction fails to
+// initiate (response status=false). Previously this only deleted new_interactions
+// and left new_intents behind "by design", but that orphaned intent row keeps its
+// stale aggregate fields (threat_detected, chain_depth, ...) computed before the
+// rows they depended on were removed, so it shows up in intent-list looking like a
+// real intent with 0 interactions. Deleting both keeps that from happening — same
+// fix as DeleteInteractionsByProvenanceReqID for the /signature failure path.
+func (d *DB) DeleteInteractionsByIntent(intentID string) (int64, int64, error) {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+
+	res, err := tx.Exec(`DELETE FROM new_interactions WHERE intent_id = $1`, intentID)
+	if err != nil {
+		return 0, 0, err
+	}
+	interactionsDeleted, _ := res.RowsAffected()
+
+	res2, err := tx.Exec(`DELETE FROM new_intents WHERE intent_id = $1`, intentID)
+	if err != nil {
+		return 0, 0, err
+	}
+	intentsDeleted, _ := res2.RowsAffected()
+
+	return interactionsDeleted, intentsDeleted, tx.Commit()
+}
+
+// DeleteInteractionsByProvenanceReqID removes both the interaction rows and their
+// parent new_intents row, tagged with the given /tx provenance id — used when
+// /rubix/v1/signature makes it clear this txn will never get a
+// provenance_record_id (status=false, no minted child, missing ids). Deleting only
+// the interactions and leaving new_intents behind produces an orphaned intent row
+// whose stale aggregate fields (threat_detected, chain_depth, ...) were computed
+// before the rollback and no longer reflect anything real, so both go together.
+// Returns (interactionsDeleted, intentsDeleted, err) — both counts are surfaced
+// (rather than just the interactions count) so a caller-side log can tell a "nothing
+// was ever tagged with this reqID" no-op apart from a real delete.
+func (d *DB) DeleteInteractionsByProvenanceReqID(reqID string) (int64, int64, error) {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+
+	res, err := tx.Exec(`DELETE FROM new_interactions WHERE provenance_req_id = $1`, reqID)
+	if err != nil {
+		return 0, 0, err
+	}
+	interactionsDeleted, _ := res.RowsAffected()
+
+	res2, err := tx.Exec(`DELETE FROM new_intents WHERE provenance_req_id = $1`, reqID)
+	if err != nil {
+		return 0, 0, err
+	}
+	intentsDeleted, _ := res2.RowsAffected()
+
+	return interactionsDeleted, intentsDeleted, tx.Commit()
 }
 
 // SetProvenanceRecord attaches the /rubix/v1/signature response data to the rows
@@ -1227,12 +1392,17 @@ func (d *DB) SetProvenanceRecord(reqID, transactionID, childNFTId string) (int64
 	}
 
 	// Rewrite interaction PKs (uuid-N → transactionID-N) and set provenance fields.
+	// threat_id is rewritten the same way (uuid-threat-N → transactionID-threat-N)
+	// so it keeps pointing at the threats row renamed below — left alone, only
+	// rows with a threat (threat_id <> '') are touched, so non-threat rows are
+	// unaffected.
 	suffixStart := len(oldIntentID) + 2
 	res, err := tx.Exec(
 		`UPDATE new_interactions
 		 SET interaction_id       = $1 || '-' || SUBSTR(interaction_id, $3),
 		     provenance_record_id = $1,
-		     intent_id            = $1
+		     intent_id            = $1,
+		     threat_id            = CASE WHEN threat_id <> '' THEN $1 || '-' || SUBSTR(threat_id, $3) ELSE threat_id END
 		 WHERE provenance_req_id = $2`,
 		transactionID, reqID, suffixStart,
 	)
@@ -1245,6 +1415,21 @@ func (d *DB) SetProvenanceRecord(reqID, transactionID, childNFTId string) (int64
 		`UPDATE intent_block_data
 		 SET id        = $1 || '-' || SUBSTR(id, $3),
 		     intent_id = $1
+		 WHERE intent_id = $2`,
+		transactionID, oldIntentID, suffixStart,
+	); err != nil {
+		return 0, err
+	}
+
+	// Mirror the rename in threats (uuid-N → transactionID-N) so
+	// threats.intent_id keeps joining against new_intents.intent_id, and
+	// threats.interaction_id keeps pointing at the renamed intent_block_data
+	// row (block IDs use the same "<intentID>-block-N" pattern).
+	if _, err := tx.Exec(
+		`UPDATE threats
+		 SET id            = $1 || '-' || SUBSTR(id, $3),
+		     interaction_id = $1 || '-' || SUBSTR(interaction_id, $3),
+		     intent_id      = $1
 		 WHERE intent_id = $2`,
 		transactionID, oldIntentID, suffixStart,
 	); err != nil {
@@ -1279,7 +1464,30 @@ func scanInteractionNewRows(rows *sql.Rows) ([]*InteractionRecord, error) {
 			&r.From, &r.FromName,
 			&r.To, &r.ToName,
 			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
-			&r.Signature, &r.ProvenanceReqID, &r.ProvenanceRecordID,
+			&r.Signature, &r.ProvenanceReqID, &r.ProvenanceRecordID, &r.ThreatID,
+		); err != nil {
+			return nil, err
+		}
+		r.Threat = threatInt == 1
+		result = append(result, r)
+	}
+	return result, nil
+}
+
+// scanInteractionNewRowsWithTitle is scanInteractionNewRows plus a trailing
+// joined threat_codes.title column, for callers that list threats.
+func scanInteractionNewRowsWithTitle(rows *sql.Rows) ([]*InteractionRecord, error) {
+	var result []*InteractionRecord
+	for rows.Next() {
+		r := &InteractionRecord{}
+		var threatInt int
+		if err := rows.Scan(
+			&r.InteractionID,
+			&r.From, &r.FromName,
+			&r.To, &r.ToName,
+			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
+			&r.Signature, &r.ProvenanceReqID, &r.ProvenanceRecordID, &r.ThreatID,
+			&r.ThreatCode, &r.ThreatTitle, &r.ReviewStatus,
 		); err != nil {
 			return nil, err
 		}
@@ -1295,7 +1503,7 @@ func (d *DB) GetInteractionsByAgent(agentDID string, limit, offset int) ([]*Inte
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE initiator_did = $1
 		ORDER BY time DESC
@@ -1322,14 +1530,16 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 		SELECT ni.intent_id, ni.initiator_did,
 		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
-		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
+		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Ongoing'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COUNT(i.interaction_id)                                                AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
 		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN i.interacted_to_did END) AS tools_count,
 		       SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                          AS threat_count,
 		       MIN(i.time)                                                             AS first_interaction_at,
-		       MAX(i.time)                                                             AS last_interaction_at
+		       MAX(i.time)                                                             AS last_interaction_at,
+		       COALESCE((SELECT message FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
@@ -1353,10 +1563,10 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 		var threatInt int
 		if err := rows.Scan(
 			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
-			&r.StartedAt, &endedAt, &r.Status, &threatInt,
+			&r.StartedAt, &endedAt, &r.Status, &r.ReviewStatus, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
 			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
-			&firstAt, &lastAt,
+			&firstAt, &lastAt, &r.Title,
 		); err != nil {
 			return nil, err
 		}
@@ -1392,13 +1602,16 @@ func (d *DB) CountAgentIntents(agentDID, orgID string) (int, error) {
 
 func (d *DB) GetAgentIntents(agentDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT DISTINCT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at,
+		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at,
 		       ni.ended_at, ni.status, ni.threat_detected,
-		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0)
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
+		       COALESCE((SELECT message FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		JOIN new_interactions i ON i.intent_id = ni.intent_id
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		WHERE i.initiator_did = $1 AND ni.organization_id = $2
+		GROUP BY ni.intent_id, u.name
 		ORDER BY ni.started_at DESC
 		LIMIT $3 OFFSET $4`,
 		agentDID, orgID, limit, offset,
@@ -1423,7 +1636,9 @@ func (d *DB) GetUserIntents(userDID, orgID string, limit, offset int) ([]*Intent
 	rows, err := d.conn.Query(`
 		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at, ni.ended_at,
 		       ni.status, ni.threat_detected,
-		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0)
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
+		       COALESCE((SELECT message FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
 		WHERE ni.initiator_did = $1 AND ni.organization_id = $2
@@ -1447,7 +1662,7 @@ func scanIntentRows(rows *sql.Rows) ([]*IntentRecord, error) {
 		if err := rows.Scan(
 			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.StartedAt, &endedAt,
 			&r.Status, &threatInt,
-			&r.FlowType, &r.Executor, &r.ChainDepth,
+			&r.FlowType, &r.Executor, &r.ChainDepth, &r.Title,
 		); err != nil {
 			return nil, err
 		}
@@ -1458,6 +1673,35 @@ func scanIntentRows(rows *sql.Rows) ([]*IntentRecord, error) {
 		result = append(result, r)
 	}
 	return result, nil
+}
+
+// GetAgentInteractedApps returns the distinct tools (from the new_tools table) that the
+// agent has interacted with — either as initiator or recipient in new_interactions.
+func (d *DB) GetAgentInteractedApps(agentDID string) ([]string, error) {
+	rows, err := d.conn.Query(`
+		SELECT DISTINCT a.name
+		FROM new_tools a
+		WHERE a.did IN (
+			SELECT interacted_to_did FROM new_interactions WHERE initiator_did = $1
+			UNION
+			SELECT initiator_did FROM new_interactions WHERE interacted_to_did = $1
+		)
+		ORDER BY a.name ASC`,
+		agentDID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, nil
 }
 
 func (d *DB) GetAgentInfo(agentDID string) (*AgentDetailRecord, error) {
@@ -1476,14 +1720,15 @@ func (d *DB) GetAgentInfo(agentDID string) (*AgentDetailRecord, error) {
 				ELSE ROUND(CAST(
 					(1.0 - SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) * 1.0
 					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
-			END                                                                  AS score
+			END                                                                  AS score,
+			a.revoked
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.did = $1
-		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy`,
+		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy, a.revoked`,
 		agentDID,
 	).Scan(&r.AgentDID, &r.AgentName, &r.CreatedAt, &r.DeployerDID, &r.Policy,
-		&r.TotalInteractions, &r.TotalThreats, &r.Score)
+		&r.TotalInteractions, &r.TotalThreats, &r.Score, &r.Revoked)
 	if err != nil {
 		return nil, err
 	}
@@ -1499,7 +1744,7 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 		SELECT ni.intent_id, ni.initiator_did,
 		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
-		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
+		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Ongoing'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COUNT(i.interaction_id)                                                AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
@@ -1516,7 +1761,7 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 		GROUP BY ni.intent_id, u.name, ag_init.name`, intentID,
 	).Scan(
 		&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &orgID,
-		&r.StartedAt, &endedAt, &r.Status, &threatInt,
+		&r.StartedAt, &endedAt, &r.Status, &r.ReviewStatus, &threatInt,
 		&r.FlowType, &r.Executor, &r.ChainDepth,
 		&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount,
 		&firstAt, &lastAt,
@@ -1541,13 +1786,35 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 	return r, nil
 }
 
+// UpdateIntentReviewStatus sets the human-triage review_status (Ongoing /
+// Acknowledged / Flagged) for an intent, scoped to the caller's org so one
+// org can't touch another's intents. Returns sql.ErrNoRows if no row matched
+// (bad intentID or org mismatch).
+func (d *DB) UpdateIntentReviewStatus(intentID, orgID, status string) error {
+	res, err := d.conn.Exec(
+		`UPDATE new_intents SET review_status = $1 WHERE intent_id = $2 AND organization_id = $3`,
+		status, intentID, orgID,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, error) {
 	rows, err := d.conn.Query(`
 		SELECT interaction_id,
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
 		FROM new_interactions WHERE intent_id = $1 ORDER BY time ASC`,
 		intentID,
 	)
@@ -1558,6 +1825,125 @@ func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, err
 	return scanInteractionNewRows(rows)
 }
 
+func (d *DB) GetToolByNameOrDID(query, orgID string) (*ToolRecord, error) {
+	r := &ToolRecord{}
+	var lastAt sql.NullTime
+	err := d.conn.QueryRow(`
+		SELECT
+			t.did,
+			t.name,
+			COUNT(i.interaction_id)                                                     AS total_interactions,
+			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                              AS total_threats,
+			COUNT(DISTINCT i.intent_id)                                                 AS total_intents,
+			COUNT(DISTINCT a.did)                                                       AS total_agents,
+			CASE
+				WHEN COUNT(i.interaction_id) = 0 THEN 100.0
+				ELSE ROUND(CAST(
+					(1.0 - SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) * 1.0
+					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
+			END AS score,
+			MAX(i.time) AS last_interacted_at
+		FROM new_tools t
+		-- Count the tool's traffic whichever side of the interaction it's on
+		-- (interacted_to_did for tool-called-by-agent, initiator_did for the
+		-- rarer tool-initiates-a-response direction).
+		LEFT JOIN new_interactions i
+		       ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		      AND i.organization_id = $1
+		-- The "other party" on that interaction — whichever side isn't this tool.
+		LEFT JOIN new_agents a
+		       ON a.did = CASE WHEN i.interacted_to_did = t.did THEN i.initiator_did ELSE i.interacted_to_did END
+		WHERE t.organization_id = $1
+		  AND (t.did = $2 OR t.name = $2)
+		GROUP BY t.did, t.name
+		LIMIT 1`,
+		orgID, query,
+	).Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.TotalAgents, &r.Score, &lastAt)
+	if err != nil {
+		return nil, err
+	}
+	if lastAt.Valid {
+		r.LastInteractedAt = &lastAt.Time
+	}
+	return r, nil
+}
+
+func (d *DB) CountIntentsByTool(toolDID, orgID string) (int, error) {
+	var total int
+	err := d.conn.QueryRow(`
+		SELECT COUNT(DISTINCT ni.intent_id)
+		FROM new_intents ni
+		JOIN new_interactions i ON i.intent_id = ni.intent_id
+		WHERE i.interacted_to_did = $1 AND ni.organization_id = $2`,
+		toolDID, orgID,
+	).Scan(&total)
+	return total, err
+}
+
+func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
+	rows, err := d.conn.Query(`
+		SELECT ni.intent_id, ni.initiator_did,
+		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
+		       COALESCE(ni.organization_id, ''),
+		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
+		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
+		       COUNT(ix.interaction_id)                                                 AS interactions_count,
+		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN ix.interacted_to_did END) AS agents_count,
+		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN ix.interacted_to_did END) AS tools_count,
+		       SUM(CASE WHEN ix.threat = 1 THEN 1 ELSE 0 END)                           AS threat_count,
+		       MIN(ix.time)                                                              AS first_interaction_at,
+		       MAX(ix.time)                                                              AS last_interaction_at,
+		       COALESCE((SELECT message FROM new_interactions
+		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
+		FROM new_intents ni
+		JOIN new_interactions tool_ix ON tool_ix.intent_id = ni.intent_id AND tool_ix.interacted_to_did = $1
+		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
+		LEFT JOIN new_interactions ix ON ix.intent_id = ni.intent_id
+		LEFT JOIN new_agents a ON a.did = ix.interacted_to_did
+		LEFT JOIN new_tools t ON t.did = ix.interacted_to_did
+		WHERE ni.organization_id = $2
+		GROUP BY ni.intent_id, u.name, ag_init.name
+		ORDER BY ni.started_at DESC
+		LIMIT $3 OFFSET $4`,
+		toolDID, orgID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*IntentRecord
+	for rows.Next() {
+		r := &IntentRecord{}
+		var endedAt, firstAt, lastAt sql.NullTime
+		var threatInt int
+		if err := rows.Scan(
+			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
+			&r.StartedAt, &endedAt, &r.Status, &threatInt,
+			&r.FlowType, &r.Executor, &r.ChainDepth,
+			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
+			&firstAt, &lastAt, &r.Title,
+		); err != nil {
+			return nil, err
+		}
+		r.ThreatDetected = threatInt == 1
+		if endedAt.Valid {
+			r.EndedAt = &endedAt.Time
+		}
+		if firstAt.Valid {
+			r.FirstInteractionAt = &firstAt.Time
+		}
+		if lastAt.Valid {
+			r.LastInteractionAt = &lastAt.Time
+			if firstAt.Valid {
+				r.RuntimeSeconds = lastAt.Time.Sub(firstAt.Time).Seconds()
+			}
+		}
+		result = append(result, r)
+	}
+	return result, nil
+}
+
 func (d *DB) StoreNewTool(did, name, orgID string) error {
 	_, err := d.conn.Exec(
 		`INSERT INTO new_tools (did, name, organization_id) VALUES ($1, $2, $3) ON CONFLICT (did) DO NOTHING`,
@@ -1566,11 +1952,48 @@ func (d *DB) StoreNewTool(did, name, orgID string) error {
 	return err
 }
 
+// AddAgentToToolList records that agentDID has contacted tool toolDID, adding
+// it to the tool's agents_list if not already present. Done as a single
+// atomic UPDATE (cast the TEXT column to jsonb, append, de-dupe, cast back)
+// rather than read-modify-write in Go, since multiple intents touching the
+// same tool concurrently would otherwise race and drop updates.
+func (d *DB) AddAgentToToolList(toolDID, agentDID string) error {
+	_, err := d.conn.Exec(`
+		UPDATE new_tools
+		SET agents_list = (
+			SELECT COALESCE(jsonb_agg(DISTINCT elem), '[]'::jsonb)::text
+			FROM jsonb_array_elements_text(
+				COALESCE(NULLIF(agents_list, '')::jsonb, '[]'::jsonb) || to_jsonb($2::text)
+			) AS elem
+		)
+		WHERE did = $1`,
+		toolDID, agentDID,
+	)
+	return err
+}
+
+// GetToolAgentsList returns the tool's name and its de-duplicated list of
+// contacted agent DIDs (agents_list), scoped to orgID.
+func (d *DB) GetToolAgentsList(toolDID, orgID string) (name string, agents []string, err error) {
+	var agentsJSON string
+	err = d.conn.QueryRow(
+		`SELECT name, COALESCE(agents_list, '[]') FROM new_tools WHERE did = $1 AND organization_id = $2`,
+		toolDID, orgID,
+	).Scan(&name, &agentsJSON)
+	if err != nil {
+		return "", nil, err
+	}
+	_ = json.Unmarshal([]byte(agentsJSON), &agents)
+	return name, agents, nil
+}
+
 func (d *DB) CountToolsByOrg(orgID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(`
 		SELECT COUNT(DISTINCT t.did) FROM new_tools t
-		INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1`,
+		INNER JOIN new_interactions i
+		        ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		       AND i.organization_id = $1`,
 		orgID,
 	).Scan(&total)
 	return total, err
@@ -1581,17 +2004,22 @@ func (d *DB) GetToolsByOrg(orgID string, limit, offset int) ([]*ToolRecord, erro
 		SELECT
 			t.did,
 			t.name,
-			COUNT(i.interaction_id)                          AS total_interactions,
-			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)   AS total_threats,
-			COUNT(DISTINCT i.intent_id)                      AS total_intents,
+			COUNT(i.interaction_id)                                                     AS total_interactions,
+			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                              AS total_threats,
+			COUNT(DISTINCT i.intent_id)                                                 AS total_intents,
+			COUNT(DISTINCT a.did)                                                       AS total_agents,
 			CASE
 				WHEN COUNT(i.interaction_id) = 0 THEN 100.0
 				ELSE ROUND(CAST(
 					(1.0 - SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) * 1.0
 					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
-			END                                              AS score
+			END                                                                         AS score
 		FROM new_tools t
-		INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1
+		INNER JOIN new_interactions i
+		        ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		       AND i.organization_id = $1
+		LEFT JOIN new_agents a
+		       ON a.did = CASE WHEN i.interacted_to_did = t.did THEN i.initiator_did ELSE i.interacted_to_did END
 		GROUP BY t.did, t.name
 		ORDER BY total_interactions DESC
 		LIMIT $2 OFFSET $3`,
@@ -1610,21 +2038,23 @@ func (d *DB) GetToolInfo(toolDID, orgID string) (*ToolRecord, error) {
 		SELECT
 			t.did,
 			t.name,
-			COUNT(i.interaction_id)                          AS total_interactions,
-			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)   AS total_threats,
-			COUNT(DISTINCT i.intent_id)                      AS total_intents,
+			COUNT(i.interaction_id)                                                     AS total_interactions,
+			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                              AS total_threats,
+			COUNT(DISTINCT i.intent_id)                                                 AS total_intents,
+			COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.initiator_did END)        AS total_agents,
 			CASE
 				WHEN COUNT(i.interaction_id) = 0 THEN 100.0
 				ELSE ROUND(CAST(
 					(1.0 - SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) * 1.0
 					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
-			END                                              AS score
+			END                                                                         AS score
 		FROM new_tools t
 		LEFT JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1
+		LEFT JOIN new_agents a ON a.did = i.initiator_did
 		WHERE t.did = $2
 		GROUP BY t.did, t.name`,
 		orgID, toolDID,
-	).Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.Score)
+	).Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.TotalAgents, &r.Score)
 	if err != nil {
 		return nil, err
 	}
@@ -1646,7 +2076,7 @@ func (d *DB) GetInteractionsByTool(toolDID, orgID string, limit, offset int) ([]
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, '')
+		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE interacted_to_did = $1 AND organization_id = $2
 		ORDER BY time DESC
@@ -1664,7 +2094,7 @@ func scanToolRows(rows *sql.Rows) ([]*ToolRecord, error) {
 	var result []*ToolRecord
 	for rows.Next() {
 		r := &ToolRecord{}
-		if err := rows.Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.Score); err != nil {
+		if err := rows.Scan(&r.DID, &r.Name, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents, &r.TotalAgents, &r.Score); err != nil {
 			return nil, err
 		}
 		result = append(result, r)
@@ -1682,18 +2112,22 @@ func (d *DB) StoreIntentBlockData(r *IntentBlockRecord) error {
 	if createdAt.IsZero() {
 		createdAt = time.Now()
 	}
+	rawData := r.RawData
+	if len(rawData) == 0 {
+		rawData = json.RawMessage("{}")
+	}
 	_, err := d.conn.Exec(`
 		INSERT INTO intent_block_data
 		  (id, intent_id, block_index, agent_did, agent_name, direction, block_type,
 		   message, response, delegate_to, received_from, cbac_app, cbac_decision,
 		   threat_detected, trust_issues, created_at,
-		   from_did, from_name, from_type, to_did, to_name, to_type)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+		   from_did, from_name, from_type, to_did, to_name, to_type, raw_data)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
 		ON CONFLICT (id) DO NOTHING`,
 		r.ID, r.IntentID, r.BlockIndex, r.AgentDID, r.AgentName, r.Direction, r.BlockType,
 		r.Message, r.Response, r.DelegateTo, r.ReceivedFrom, r.CbacApp, r.CbacDecision,
 		threatInt, string(trustJSON), createdAt,
-		r.FromDID, r.FromName, r.FromType, r.ToDID, r.ToName, r.ToType,
+		r.FromDID, r.FromName, r.FromType, r.ToDID, r.ToName, r.ToType, []byte(rawData),
 	)
 	return err
 }
@@ -1705,7 +2139,8 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 		       b.threat_detected, b.trust_issues, b.created_at,
 		       COALESCE(i.signature, ''),
 		       COALESCE(b.from_did, ''), COALESCE(b.from_name, ''), COALESCE(b.from_type, ''),
-		       COALESCE(b.to_did, ''),   COALESCE(b.to_name, ''),   COALESCE(b.to_type, '')
+		       COALESCE(b.to_did, ''),   COALESCE(b.to_name, ''),   COALESCE(b.to_type, ''),
+		       COALESCE(b.raw_data, '{}')
 		FROM intent_block_data b
 		LEFT JOIN new_interactions i
 		       ON i.intent_id      = b.intent_id
@@ -1724,18 +2159,20 @@ func (d *DB) GetIntentBlocksByIntent(intentID string) ([]*IntentBlockRecord, err
 		r := &IntentBlockRecord{}
 		var threatInt int
 		var trustJSON string
+		var rawData []byte
 		if err := rows.Scan(
 			&r.ID, &r.IntentID, &r.BlockIndex, &r.AgentDID, &r.AgentName,
 			&r.Direction, &r.BlockType, &r.Message, &r.Response,
 			&r.DelegateTo, &r.ReceivedFrom, &r.CbacApp, &r.CbacDecision,
 			&threatInt, &trustJSON, &r.CreatedAt, &r.Signature,
 			&r.FromDID, &r.FromName, &r.FromType,
-			&r.ToDID, &r.ToName, &r.ToType,
+			&r.ToDID, &r.ToName, &r.ToType, &rawData,
 		); err != nil {
 			return nil, err
 		}
 		r.ThreatDetected = threatInt == 1
 		_ = json.Unmarshal([]byte(trustJSON), &r.TrustIssues)
+		r.RawData = json.RawMessage(rawData)
 		result = append(result, r)
 	}
 	return result, nil
@@ -1751,6 +2188,35 @@ func (d *DB) UpdateUserPassword(email, passwordHash string) error {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return fmt.Errorf("no user found with email %s", email)
+	}
+	return nil
+}
+
+func (d *DB) UpdateAdminName(email, name string) error {
+	res, err := d.conn.Exec(`UPDATE new_admins SET name = $1 WHERE email = $2`, name, email)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("user not found")
+	}
+	return nil
+}
+
+func (d *DB) UpdateAdminEmail(currentEmail, newEmail string) error {
+	var exists bool
+	d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM new_admins WHERE email = $1)`, newEmail).Scan(&exists)
+	if exists {
+		return fmt.Errorf("email already in use")
+	}
+	res, err := d.conn.Exec(`UPDATE new_admins SET email = $1 WHERE email = $2`, newEmail, currentEmail)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("user not found")
 	}
 	return nil
 }
@@ -1881,7 +2347,9 @@ func (d *DB) GetAgentsAppsMetrics(orgID string) (*AgentsAppsMetrics, error) {
 	}
 	if err := d.conn.QueryRow(
 		`SELECT COUNT(DISTINCT t.did) FROM new_tools t
-		 INNER JOIN new_interactions i ON i.interacted_to_did = t.did AND i.organization_id = $1`,
+		 INNER JOIN new_interactions i
+		         ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		        AND i.organization_id = $1`,
 		orgID,
 	).Scan(&out.TotalApps); err != nil {
 		return nil, err
@@ -1990,4 +2458,246 @@ func (d *DB) Search(q, orgID string) (*SearchResults, error) {
 	}
 
 	return out, nil
+}
+
+// ownerAgentFilter is the SQL fragment that resolves which agents a user "owns".
+// Bind: $1 = userDID, $2 = orgID.
+const ownerAgentFilter = `
+    a.organization_id = $2
+    AND (
+        a.deployer_did = $1
+        OR a.did IN (
+            SELECT agent_did FROM new_requests
+            WHERE creator_did = $1 AND request_type = 'deploy_agent' AND status = 'approved'
+        )
+    )`
+
+func (d *DB) GetUserDetail(userDID, orgID string) (*UserInfoRecord, error) {
+	r := &UserInfoRecord{}
+	var lastAt sql.NullTime
+	err := d.conn.QueryRow(`
+		SELECT
+			COALESCE(u.did, ''),
+			COALESCE(u.email, ''),
+			COALESCE(u.name, ''),
+			COALESCE(u.created_at, NOW()),
+			(SELECT COUNT(*) FROM json_array_elements_text(COALESCE(u.agent_access_list,'[]')::json)) AS access_agent_count,
+			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND initiator_did = $1) AS total_interactions,
+			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND initiator_did = $1 AND threat = 1) AS total_threats,
+			(SELECT COUNT(*) FROM new_intents WHERE organization_id = $2 AND initiator_did = $1) AS total_intents,
+			(SELECT COUNT(DISTINCT a.did) FROM new_agents a
+			 WHERE a.organization_id = $2
+			   AND (a.deployer_did = $1
+			        OR a.did IN (SELECT agent_did FROM new_requests
+			                     WHERE creator_did = $1 AND request_type = 'deploy_agent' AND status = 'approved'))
+			) AS total_agents_owned,
+			(SELECT MAX(i.time) FROM new_interactions i WHERE i.organization_id = $2 AND i.initiator_did = $1) AS last_active
+		FROM new_org_users u
+		WHERE u.did = $1`,
+		userDID, orgID,
+	).Scan(
+		&r.UserDID, &r.UserName, &r.DisplayName, &r.CreatedAt,
+		&r.AccessAgentCount, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents,
+		&r.TotalAgentsOwned, &lastAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if lastAt.Valid {
+		r.LastActive = &lastAt.Time
+		r.IsActive = true
+	}
+	return r, nil
+}
+
+func (d *DB) CountAgentsByOwner(userDID, orgID string) (int, error) {
+	var total int
+	err := d.conn.QueryRow(`
+		SELECT COUNT(DISTINCT a.did) FROM new_agents a
+		WHERE `+ownerAgentFilter,
+		userDID, orgID,
+	).Scan(&total)
+	return total, err
+}
+
+func (d *DB) GetAgentsByOwner(userDID, orgID string, limit, offset int) ([]*UserAgentRecord, error) {
+	rows, err := d.conn.Query(`
+		SELECT
+			a.did,
+			COALESCE(NULLIF(a.name,''), ''),
+			COALESCE(a.created_at, NOW()),
+			COUNT(i.interaction_id) AS total_interactions,
+			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) AS total_threats,
+			CASE WHEN COUNT(i.interaction_id) = 0 THEN 100.0
+			     ELSE ROUND(CAST((1.0 - SUM(CASE WHEN i.threat=1 THEN 1 ELSE 0 END)*1.0
+			          / COUNT(i.interaction_id))*100 AS NUMERIC), 2)
+			END AS score
+		FROM new_agents a
+		LEFT JOIN new_interactions i ON i.initiator_did = a.did
+		WHERE `+ownerAgentFilter+`
+		GROUP BY a.did, a.name, a.created_at
+		ORDER BY total_interactions DESC
+		LIMIT $3 OFFSET $4`,
+		userDID, orgID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*UserAgentRecord
+	for rows.Next() {
+		r := &UserAgentRecord{}
+		if err := rows.Scan(&r.AgentDID, &r.AgentName, &r.CreatedAt,
+			&r.TotalInteractions, &r.TotalThreats, &r.Score); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, nil
+}
+
+func (d *DB) GetThreats(orgID string, limit, offset int) ([]*ThreatRecord, int, error) {
+	var total int
+	err := d.conn.QueryRow(`
+		SELECT COUNT(*) FROM threats t
+		JOIN new_intents ni ON t.intent_id = ni.intent_id
+		WHERE ni.organization_id = $1`, orgID).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+	rows, err := d.conn.Query(`
+		SELECT t.id, t.intent_id, t.interaction_id, t.time, t.threat_code, t.message
+		FROM threats t
+		JOIN new_intents ni ON t.intent_id = ni.intent_id
+		WHERE ni.organization_id = $1
+		ORDER BY t.time DESC
+		LIMIT $2 OFFSET $3`,
+		orgID, limit, offset,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var result []*ThreatRecord
+	for rows.Next() {
+		r := &ThreatRecord{}
+		if err := rows.Scan(&r.ID, &r.IntentID, &r.InteractionID, &r.Time, &r.ThreatCode, &r.Message); err != nil {
+			return nil, 0, err
+		}
+		result = append(result, r)
+	}
+	return result, total, nil
+}
+
+func (d *DB) GetTopThreats(orgID string, topN int) ([]*TopThreatRecord, error) {
+	rows, err := d.conn.Query(`
+		SELECT t.threat_code, COALESCE(tc.title, ''), COUNT(*) AS cnt
+		FROM threats t
+		LEFT JOIN threat_codes tc ON t.threat_code = tc.code
+		GROUP BY t.threat_code, tc.title
+		ORDER BY cnt DESC
+		LIMIT $1`,
+		topN,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*TopThreatRecord
+	for rows.Next() {
+		r := &TopThreatRecord{}
+		if err := rows.Scan(&r.ThreatCode, &r.Title, &r.Count); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, nil
+}
+
+func (d *DB) GetThreatCodeDetail(code int) (*ThreatCodeRecord, error) {
+	r := &ThreatCodeRecord{}
+	err := d.conn.QueryRow(`
+		SELECT code, title, description FROM threat_codes WHERE code = $1`, code).
+		Scan(&r.Code, &r.Title, &r.Description)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (d *DB) GetThreatsByCode(orgID string, code int) ([]*ThreatRecord, int, error) {
+	var total int
+	err := d.conn.QueryRow(`
+		SELECT COUNT(*) FROM threats t
+		JOIN new_intents ni ON t.intent_id = ni.intent_id
+		WHERE ni.organization_id = $1 AND t.threat_code = $2`, orgID, code).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+	rows, err := d.conn.Query(`
+		SELECT t.id, t.intent_id, t.interaction_id, t.time, t.threat_code, t.message
+		FROM threats t
+		JOIN new_intents ni ON t.intent_id = ni.intent_id
+		WHERE ni.organization_id = $1 AND t.threat_code = $2
+		ORDER BY t.time DESC`,
+		orgID, code,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var result []*ThreatRecord
+	for rows.Next() {
+		r := &ThreatRecord{}
+		if err := rows.Scan(&r.ID, &r.IntentID, &r.InteractionID, &r.Time, &r.ThreatCode, &r.Message); err != nil {
+			return nil, 0, err
+		}
+		result = append(result, r)
+	}
+	return result, total, nil
+}
+
+func (d *DB) GetThreatByID(id string) (*ThreatRecord, error) {
+	r := &ThreatRecord{}
+	err := d.conn.QueryRow(`
+		SELECT id, intent_id, interaction_id, time, threat_code, message
+		FROM threats WHERE id = $1`, id).
+		Scan(&r.ID, &r.IntentID, &r.InteractionID, &r.Time, &r.ThreatCode, &r.Message)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (d *DB) StoreThreat(id, intentID, interactionID string, threatCode int, message string, t time.Time) error {
+	_, err := d.conn.Exec(`
+		INSERT INTO threats (id, intent_id, interaction_id, time, threat_code, message)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (id) DO NOTHING`,
+		id, intentID, interactionID, t, threatCode, message,
+	)
+	return err
+}
+
+func (d *DB) GetThreatsByIntent(intentID string) ([]*ThreatRecord, error) {
+	rows, err := d.conn.Query(`
+		SELECT id, intent_id, interaction_id, time, threat_code, message
+		FROM threats
+		WHERE intent_id = $1
+		ORDER BY time ASC`,
+		intentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*ThreatRecord
+	for rows.Next() {
+		r := &ThreatRecord{}
+		if err := rows.Scan(&r.ID, &r.IntentID, &r.InteractionID, &r.Time, &r.ThreatCode, &r.Message); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, nil
 }

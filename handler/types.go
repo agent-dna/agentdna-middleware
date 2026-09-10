@@ -1,10 +1,14 @@
 package handler
 
-import "github.com/golang-jwt/jwt/v5"
+import (
+	"encoding/json"
+
+	"github.com/golang-jwt/jwt/v5"
+)
 
 type Response struct {
 	Status  bool   `json:"status"`
-	Data    any    `json:"data"`
+	Data    any    `json:"data,omitempty"`
 	Message string `json:"message"`
 }
 
@@ -30,9 +34,11 @@ type FTInfo struct {
 }
 
 type NFTInfo struct {
-	NFTId string  `json:"nftId"`
-	Value float64 `json:"value"`
-	Data  string  `json:"data"`
+	NFTId       string  `json:"nftId"`
+	Value       float64 `json:"value"`
+	Data        string  `json:"data"`
+	ParentNFTId string  `json:"parentNFTId,omitempty"`
+	Initiator   string  `json:"initiator,omitempty"`
 }
 
 type SmartContractInfo struct {
@@ -121,63 +127,17 @@ type intentWorkflowData struct {
 	Envelope *workflowEnvelope `json:"envelope"`
 }
 
-type workflowActor struct {
-	ID       string         `json:"id"`
-	Name     string         `json:"name"`
-	Type     string         `json:"type"` // "human", "agent", "app"
-	Metadata map[string]any `json:"metadata"`
-}
-
-type workflowIssue struct {
-	Depth  int    `json:"depth"`
-	Reason string `json:"reason"`
-}
-
 type workflowEnvelope struct {
-	From           workflowActor     `json:"from_"`
-	To             workflowActor     `json:"to"`
-	Payload        string            `json:"payload"`
-	Epoch          int64             `json:"epoch"`
-	Metadata       map[string]any    `json:"metadata"`
-	Signature      string            `json:"signature"`
-	Issues         []workflowIssue   `json:"issues"`
-	ParentEnvelope *workflowEnvelope `json:"parent_envelope"`
-}
-
-// chainNFTData is the top-level structure of an intent NFT using the chain spec.
-type chainNFTData struct {
-	Type         string            `json:"type"`
-	Comment      string            `json:"comment"`
-	Executor     string            `json:"executor"`
-	DID          string            `json:"did"`
-	Verification chainVerification `json:"verification"`
-	Chain        *chainBlock       `json:"chain"`
-}
-
-type chainVerification struct {
-	Status      string   `json:"status"`
-	ChainDepth  int      `json:"chain_depth"`
-	TrustIssues []string `json:"trust_issues"`
-}
-
-type chainBlock struct {
-	Agent        string               `json:"agent"`
-	Name         string               `json:"name"`
-	Direction    string               `json:"direction"`
-	Type         string               `json:"type"`
-	Envelope     chainEnvelope        `json:"envelope"`
-	Signature    string               `json:"signature"`
-	Verification chainBlockVerification `json:"verification"`
-}
-
-type chainEnvelope struct {
-	Payload     map[string]any `json:"payload"`
-	ParentBlock *chainBlock    `json:"parent_block,omitempty"`
-}
-
-type chainBlockVerification struct {
-	SignatureValid bool     `json:"signature_valid"`
-	TrustIssues   []string `json:"trust_issues"`
+	From           string              `json:"from"`
+	To             string              `json:"to,omitempty"`
+	Payload        json.RawMessage     `json:"payload"`
+	Epoch          int64               `json:"epoch"`
+	Code           int                 `json:"status_code"`
+	RunID          string              `json:"run_id"`
+	Hash           string              `json:"hash"`
+	Signature      string              `json:"signature"`
+	RawData        json.RawMessage     `json:"raw_data,omitempty"`
+	ParentEnvelope []*workflowEnvelope `json:"parent_envelope"`
 }
 
 // interactionExtract holds one extracted hop from the chain.
@@ -191,4 +151,6 @@ type interactionExtract struct {
 	Threat    bool
 	Message   string
 	Signature string
+	Hash      string
+	Epoch     int64
 }
