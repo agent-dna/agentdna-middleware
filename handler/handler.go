@@ -2239,14 +2239,9 @@ func (h *Handler) RevokeAgent(c *gin.Context) {
 		return
 	}
 
-	// Mark revoked in DB.
-	if err := h.db.RevokeAgent(req.AgentDID); err != nil {
-		log.Printf("[RevokeAgent] db error agent_did=%s err=%v", req.AgentDID, err)
-		c.JSON(http.StatusNotFound, Response{Status: false, Message: err.Error()})
-		return
-	}
-
-	// Call admin server to flip is_active = false on the agent.
+	// Call admin server first to flip is_active = false on the agent — the local DB
+	// is only written once we know the admin server (the real enforcement point)
+	// actually accepted the revocation, so the two never disagree.
 	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/revoke-agent"
 	b, _ := json.Marshal(map[string]string{"agent_id": req.AgentDID})
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
@@ -2273,7 +2268,70 @@ func (h *Handler) RevokeAgent(c *gin.Context) {
 		return
 	}
 
+	// Admin server confirmed — now mark revoked locally.
+	if err := h.db.RevokeAgent(req.AgentDID); err != nil {
+		log.Printf("[RevokeAgent] db error agent_did=%s err=%v (admin server already revoked it — states now out of sync)", req.AgentDID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("admin server revoked the agent but local update failed: %v", err)})
+		return
+	}
+
 	log.Printf("[RevokeAgent] agent revoked agent_did=%s", req.AgentDID)
+	c.JSON(http.StatusOK, Response{Status: true, Message: adminResp.Message})
+}
+
+// UnrevokeAgent mirrors RevokeAgent exactly — same request/response shape — except
+// it flips the local revoked flag back to FALSE and calls the admin server's.
+func (h *Handler) UnrevokeAgent(c *gin.Context) {
+	if !c.GetBool(CtxIsAdmin) {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
+		return
+	}
+
+	var req struct {
+		AgentDID string `json:"agent_did" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.AgentDID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agent_did is required"})
+		return
+	}
+
+	// Call admin server first to flip is_active = true on the agent — the local DB
+	// is only written once we know the admin server (the real enforcement point)
+	// actually accepted the whitelist, so the two never disagree.
+	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/whitelist"
+	b, _ := json.Marshal(map[string]string{"agent_id": req.AgentDID})
+	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
+	if err != nil {
+		log.Printf("[UnrevokeAgent] admin server http error agent_did=%s err=%v", req.AgentDID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to reach admin server: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	var adminResp struct {
+		Status  bool   `json:"status"`
+		Message string `json:"message"`
+	}
+	rawBody, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(rawBody, &adminResp); err != nil {
+		log.Printf("[UnrevokeAgent] failed to parse admin server response agent_did=%s body=%s", req.AgentDID, string(rawBody))
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "invalid response from admin server"})
+		return
+	}
+	if !adminResp.Status {
+		log.Printf("[UnrevokeAgent] admin server rejected whitelist agent_did=%s message=%s", req.AgentDID, adminResp.Message)
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: adminResp.Message})
+		return
+	}
+
+	// Admin server confirmed — now mark unrevoked locally.
+	if err := h.db.UnrevokeAgent(req.AgentDID); err != nil {
+		log.Printf("[UnrevokeAgent] db error agent_did=%s err=%v (admin server already whitelisted it — states now out of sync)", req.AgentDID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("admin server whitelisted the agent but local update failed: %v", err)})
+		return
+	}
+
+	log.Printf("[UnrevokeAgent] agent unrevoked agent_did=%s", req.AgentDID)
 	c.JSON(http.StatusOK, Response{Status: true, Message: adminResp.Message})
 }
 
@@ -2324,6 +2382,7 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 			"totalInteractions": agent.TotalInteractions,
 			"totalThreats":      agent.TotalThreats,
 			"score":             agent.Score,
+			"revoked":           agent.Revoked,
 			"appsInteracted":    len(interactedApps),
 			"appsList":          interactedApps,
 		},

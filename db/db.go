@@ -47,6 +47,7 @@ type AgentDetailRecord struct {
 	TotalInteractions int
 	TotalThreats      int
 	Score             float64
+	Revoked           bool
 }
 
 type UserDetailRecord struct {

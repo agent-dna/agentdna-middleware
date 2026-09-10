@@ -1192,6 +1192,20 @@ func (d *DB) RevokeAgent(agentDID string) error {
 	return nil
 }
 
+// UnrevokeAgent mirrors RevokeAgent — flips the agent's local revoked flag back
+// to FALSE. Called from the unrevoke-agent endpoint.
+func (d *DB) UnrevokeAgent(agentDID string) error {
+	res, err := d.conn.Exec(`UPDATE new_agents SET revoked = FALSE WHERE did = $1`, agentDID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent not found: %s", agentDID)
+	}
+	return nil
+}
+
 func (d *DB) GetAgentOrgID(agentDID string) (string, error) {
 	var orgID sql.NullString
 	err := d.conn.QueryRow(`
@@ -1706,14 +1720,15 @@ func (d *DB) GetAgentInfo(agentDID string) (*AgentDetailRecord, error) {
 				ELSE ROUND(CAST(
 					(1.0 - SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) * 1.0
 					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
-			END                                                                  AS score
+			END                                                                  AS score,
+			a.revoked
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.did = $1
-		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy`,
+		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy, a.revoked`,
 		agentDID,
 	).Scan(&r.AgentDID, &r.AgentName, &r.CreatedAt, &r.DeployerDID, &r.Policy,
-		&r.TotalInteractions, &r.TotalThreats, &r.Score)
+		&r.TotalInteractions, &r.TotalThreats, &r.Score, &r.Revoked)
 	if err != nil {
 		return nil, err
 	}
