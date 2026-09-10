@@ -265,7 +265,7 @@ func (h *Handler) UpdatePassword(c *gin.Context) {
 		}
 
 		// Call admin server to update password there.
-		endpoint := h.adminServiceURL + "agent-admin/v1/update-password"
+		endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/update-password"
 		b, _ := json.Marshal(map[string]string{"username": admin.Name, "new_password": req.NewPassword})
 		resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
 		if err != nil {
@@ -2247,7 +2247,7 @@ func (h *Handler) RevokeAgent(c *gin.Context) {
 	}
 
 	// Call admin server to flip is_active = false on the agent.
-	endpoint := h.adminServiceURL + "agent-admin/v1/revoke-agent"
+	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/revoke-agent"
 	b, _ := json.Marshal(map[string]string{"agent_id": req.AgentDID})
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
