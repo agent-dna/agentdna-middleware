@@ -543,7 +543,7 @@ func (d *DB) CountThreatsByUser(userDID, orgID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(userScopeIntentsCTE+`
 		SELECT COUNT(*) FROM new_interactions
-		WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents)`,
+		WHERE threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents)`,
 		userDID, orgID,
 	).Scan(&total)
 	return total, err
@@ -561,7 +561,7 @@ func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		LEFT JOIN threats t ON t.id = ni.threat_id
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
 		LEFT JOIN new_intents nint ON nint.intent_id = ni.intent_id
-		WHERE ni.organization_id = $2 AND ni.threat = 1 AND ni.intent_id IN (SELECT intent_id FROM user_intents)
+		WHERE ni.threat = 1 AND ni.intent_id IN (SELECT intent_id FROM user_intents)
 		ORDER BY ni.time DESC
 		LIMIT $3 OFFSET $4`,
 		userDID, orgID, limit, offset,
@@ -658,7 +658,7 @@ func (d *DB) GetInteractionsByOrgAndIntent(orgID, intentID string, limit, offset
 		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE organization_id = $1 AND intent_id = $2
-		ORDER BY time DESC
+		ORDER BY time ASC
 		LIMIT $3 OFFSET $4`,
 		orgID, intentID, limit, offset,
 	)
@@ -672,7 +672,7 @@ func (d *DB) GetInteractionsByOrgAndIntent(orgID, intentID string, limit, offset
 func (d *DB) CountThreatsByOrg(orgID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(
-		`SELECT COUNT(*) FROM new_interactions WHERE organization_id = $1 AND threat = 1`, orgID,
+		`SELECT COUNT(*) FROM new_interactions WHERE threat = 1`,
 	).Scan(&total)
 	return total, err
 }
@@ -689,10 +689,10 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		LEFT JOIN threats t ON t.id = ni.threat_id
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
 		LEFT JOIN new_intents nint ON nint.intent_id = ni.intent_id
-		WHERE ni.organization_id = $1 AND ni.threat = 1
+		WHERE ni.threat = 1
 		ORDER BY ni.time DESC
-		LIMIT $2 OFFSET $3`,
-		orgID, limit, offset,
+		LIMIT $1 OFFSET $2`,
+		limit, offset,
 	)
 	if err != nil {
 		return nil, err
