@@ -395,15 +395,22 @@ user_intents AS (
 
 func (d *DB) GetUserMetrics(userDID, orgID string) (*OrgMetrics, error) {
 	m := &OrgMetrics{}
+	twentyFourHoursAgo := time.Now().Add(-24 * time.Hour)
+
 	err := d.conn.QueryRow(userScopeIntentsCTE+`
 		SELECT
 			(SELECT COUNT(*) FROM new_agents WHERE deployer_did = $1),
 			(SELECT COUNT(*) FROM user_intents),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents)),
-			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents))
+			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents)),
+			(SELECT COUNT(*) FROM new_agents WHERE deployer_did = $1 AND created_at >= $3),
+			(SELECT COUNT(*) FROM user_intents WHERE started_at >= $3),
+			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents) AND time >= $3),
+			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents) AND time >= $3)
 		`,
-		userDID, orgID,
-	).Scan(&m.AgentCount, &m.IntentCount, &m.InteractionsCount, &m.ThreatCount)
+		userDID, orgID, twentyFourHoursAgo,
+	).Scan(&m.AgentCount, &m.IntentCount, &m.InteractionsCount, &m.ThreatCount,
+		&m.AgentCount24hChange, &m.IntentCount24hChange, &m.InteractionsCount24hChange, &m.ThreatCount24hChange)
 	return m, err
 }
 
@@ -804,6 +811,41 @@ func (d *DB) GetOrgMetrics(orgID string) (*OrgMetrics, error) {
 	if err := d.conn.QueryRow(
 		`SELECT COUNT(*) FROM new_interactions WHERE organization_id = $1 AND threat = 1`, orgID,
 	).Scan(&m.ThreatCount); err != nil {
+		return nil, err
+	}
+
+	// Calculate 24-hour changes
+	twentyFourHoursAgo := time.Now().Add(-24 * time.Hour)
+
+	// Agent count 24h change
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_agents WHERE organization_id = $1 AND created_at >= $2`,
+		orgID, twentyFourHoursAgo,
+	).Scan(&m.AgentCount24hChange); err != nil {
+		return nil, err
+	}
+
+	// Intent count 24h change
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_intents WHERE organization_id = $1 AND started_at >= $2`,
+		orgID, twentyFourHoursAgo,
+	).Scan(&m.IntentCount24hChange); err != nil {
+		return nil, err
+	}
+
+	// Interactions count 24h change
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_interactions WHERE organization_id = $1 AND time >= $2`,
+		orgID, twentyFourHoursAgo,
+	).Scan(&m.InteractionsCount24hChange); err != nil {
+		return nil, err
+	}
+
+	// Threat count 24h change
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_interactions WHERE organization_id = $1 AND threat = 1 AND time >= $2`,
+		orgID, twentyFourHoursAgo,
+	).Scan(&m.ThreatCount24hChange); err != nil {
 		return nil, err
 	}
 

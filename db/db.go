@@ -10,10 +10,14 @@ import (
 )
 
 type OrgMetrics struct {
-	AgentCount        int
-	IntentCount       int
-	InteractionsCount int
-	ThreatCount       int
+	AgentCount                int
+	IntentCount               int
+	InteractionsCount         int
+	ThreatCount               int
+	AgentCount24hChange       int
+	IntentCount24hChange      int
+	InteractionsCount24hChange int
+	ThreatCount24hChange      int
 }
 
 type AdminRecord struct {

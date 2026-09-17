@@ -1236,12 +1236,16 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"agentCount":        metrics.AgentCount,
-			"intentCount":       metrics.IntentCount,
-			"interactionsCount": metrics.InteractionsCount,
-			"threatCount":       metrics.ThreatCount,
-			"agentList":         agentList,
-			"flowEnabled":       metrics.AgentCount > 0,
+			"agentCount":                metrics.AgentCount,
+			"intentCount":               metrics.IntentCount,
+			"interactionsCount":         metrics.InteractionsCount,
+			"threatCount":               metrics.ThreatCount,
+			"agentCount24hChange":       metrics.AgentCount24hChange,
+			"intentCount24hChange":      metrics.IntentCount24hChange,
+			"interactionsCount24hChange": metrics.InteractionsCount24hChange,
+			"threatCount24hChange":      metrics.ThreatCount24hChange,
+			"agentList":                 agentList,
+			"flowEnabled":               metrics.AgentCount > 0,
 		},
 	})
 }
