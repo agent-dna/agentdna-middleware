@@ -658,7 +658,7 @@ func (d *DB) GetInteractionsByOrgAndIntent(orgID, intentID string, limit, offset
 		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE organization_id = $1 AND intent_id = $2
-		ORDER BY time DESC
+		ORDER BY time ASC
 		LIMIT $3 OFFSET $4`,
 		orgID, intentID, limit, offset,
 	)
