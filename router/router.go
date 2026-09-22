@@ -10,6 +10,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	r.POST("/core/v1/register-user", h.CoreRegisterUser)
 	r.POST("/core/v1/register-agent", h.CoreRegisterAgent)
 	r.POST("/core/v1/register-tool", h.AppRegistration)
+	r.GET("/core/v1/did-by-email", h.CoreDIDByEmail)
 
 
 	// Dashboard — public
