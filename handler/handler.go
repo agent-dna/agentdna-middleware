@@ -4097,14 +4097,18 @@ func (h *Handler) TopThreats(c *gin.Context) {
 	}
 
 	type topItem struct {
-		ThreatCode int    `json:"threat_code"`
+		ThreatCode string `json:"threat_code"`
 		Title      string `json:"title"`
 		Count      int    `json:"count"`
 	}
 	items := make([]topItem, 0, len(top))
 	for _, t := range top {
+		code := "0000"
+		if t.ThreatCode != 0 {
+			code = strconv.Itoa(t.ThreatCode)
+		}
 		items = append(items, topItem{
-			ThreatCode: t.ThreatCode,
+			ThreatCode: code,
 			Title:      t.Title,
 			Count:      t.Count,
 		})
