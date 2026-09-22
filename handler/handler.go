@@ -702,13 +702,27 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 					threatMsg = rec.Title
 				}
 			}
-			threatID := fmt.Sprintf("%s-threat-%d", intentID, idx)
-			if err := h.db.StoreThreat(threatID, intentID, blockID, env.Code, threatMsg, time.Unix(env.Epoch, 0).UTC()); err != nil {
-				log.Printf("[intentWorkflow] StoreThreat idx=%d code=%d: %v", idx, env.Code, err)
+			// The DAG can legitimately contain two distinct envelope objects that
+			// carry the same hash (e.g. the same signed message reachable via two
+			// converging branches) — collectAllEnvelopes only dedupes by pointer
+			// identity, not content. Downstream, extractInteractionsFromEnvelopes'
+			// hash-based dedup collapses those into a single interaction, which
+			// then links to only one threatID. Without this guard, the earlier
+			// duplicate's threat row is stored too but never referenced by any
+			// interaction — an orphaned row that inflates threat-count queries
+			// that scan the threats table directly instead of joining through
+			// new_interactions (e.g. GetTopThreats).
+			if env.Hash != "" && hashToThreatID[env.Hash] != "" {
+				log.Printf("[intentWorkflow] skipping duplicate threat idx=%d code=%d hash=%s (already recorded)", idx, env.Code, env.Hash)
 			} else {
-				log.Printf("[intentWorkflow] threat stored idx=%d code=%d msg=%q", idx, env.Code, threatMsg)
-				if env.Hash != "" {
-					hashToThreatID[env.Hash] = threatID
+				threatID := fmt.Sprintf("%s-threat-%d", intentID, idx)
+				if err := h.db.StoreThreat(threatID, intentID, blockID, env.Code, threatMsg, time.Unix(env.Epoch, 0).UTC()); err != nil {
+					log.Printf("[intentWorkflow] StoreThreat idx=%d code=%d: %v", idx, env.Code, err)
+				} else {
+					log.Printf("[intentWorkflow] threat stored idx=%d code=%d msg=%q", idx, env.Code, threatMsg)
+					if env.Hash != "" {
+						hashToThreatID[env.Hash] = threatID
+					}
 				}
 			}
 		}
