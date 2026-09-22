@@ -2632,10 +2632,16 @@ func (d *DB) GetThreats(orgID string, limit, offset int) ([]*ThreatRecord, int, 
 }
 
 func (d *DB) GetTopThreats(orgID string, topN int) ([]*TopThreatRecord, error) {
+	// Counted off new_interactions (one row per deduplicated interaction) rather
+	// than raw COUNT(*) on threats — the threats table can carry duplicate rows
+	// per interaction (see StoreThreat/idx-drift), which previously inflated
+	// this total past what home-metrics/threats-list report.
 	rows, err := d.conn.Query(`
 		SELECT t.threat_code, COALESCE(tc.title, ''), COUNT(*) AS cnt
-		FROM threats t
-		LEFT JOIN threat_codes tc ON t.threat_code = tc.code
+		FROM new_interactions ni
+		JOIN threats t ON t.id = ni.threat_id
+		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
+		WHERE ni.threat = 1
 		GROUP BY t.threat_code, tc.title
 		ORDER BY cnt DESC
 		LIMIT $1`,
