@@ -2631,11 +2631,15 @@ func (d *DB) GetThreats(orgID string, limit, offset int) ([]*ThreatRecord, int, 
 	return result, total, nil
 }
 
-func (d *DB) GetTopThreats(orgID string, topN int) ([]*TopThreatRecord, error) {
+func (d *DB) GetTopThreats(orgID string) ([]*TopThreatRecord, error) {
 	// Counted off new_interactions (one row per deduplicated interaction) rather
 	// than raw COUNT(*) on threats — the threats table can carry duplicate rows
 	// per interaction (see StoreThreat/idx-drift), which previously inflated
 	// this total past what home-metrics/threats-list report.
+	//
+	// Every threat_code with a nonzero count is returned (no LIMIT) — the INNER
+	// JOINs already drop any code with zero occurrences, so there's nothing to
+	// filter after the fact.
 	rows, err := d.conn.Query(`
 		SELECT t.threat_code, COALESCE(tc.title, ''), COUNT(*) AS cnt
 		FROM new_interactions ni
@@ -2643,9 +2647,7 @@ func (d *DB) GetTopThreats(orgID string, topN int) ([]*TopThreatRecord, error) {
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
 		WHERE ni.threat = 1
 		GROUP BY t.threat_code, tc.title
-		ORDER BY cnt DESC
-		LIMIT $1`,
-		topN,
+		ORDER BY cnt DESC`,
 	)
 	if err != nil {
 		return nil, err

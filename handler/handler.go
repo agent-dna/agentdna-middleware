@@ -4090,7 +4090,7 @@ func (h *Handler) TopThreats(c *gin.Context) {
 		return
 	}
 
-	top, err := h.db.GetTopThreats(orgID, 5)
+	top, err := h.db.GetTopThreats(orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch top threats: %v", err)})
 		return
