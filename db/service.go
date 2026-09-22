@@ -2637,16 +2637,19 @@ func (d *DB) GetTopThreats(orgID string) ([]*TopThreatRecord, error) {
 	// per interaction (see StoreThreat/idx-drift), which previously inflated
 	// this total past what home-metrics/threats-list report.
 	//
-	// Every threat_code with a nonzero count is returned (no LIMIT) — the INNER
-	// JOINs already drop any code with zero occurrences, so there's nothing to
-	// filter after the fact.
+	// Every threat_code with a nonzero count is returned (no LIMIT) — the JOINs
+	// already drop any code with zero occurrences, so there's nothing to filter
+	// after the fact. threats is LEFT JOINed (not INNER) so a threat-flagged
+	// interaction with no matching/resolved threat_code (missing threat_id, or
+	// a threats row whose threat_code was never set) still gets counted, bucketed
+	// under code 0 — the handler renders that bucket as "0000".
 	rows, err := d.conn.Query(`
-		SELECT t.threat_code, COALESCE(tc.title, ''), COUNT(*) AS cnt
+		SELECT COALESCE(t.threat_code, 0), COALESCE(tc.title, ''), COUNT(*) AS cnt
 		FROM new_interactions ni
-		JOIN threats t ON t.id = ni.threat_id
+		LEFT JOIN threats t ON t.id = ni.threat_id
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
 		WHERE ni.threat = 1
-		GROUP BY t.threat_code, tc.title
+		GROUP BY COALESCE(t.threat_code, 0), COALESCE(tc.title, '')
 		ORDER BY cnt DESC`,
 	)
 	if err != nil {
