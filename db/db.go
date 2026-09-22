@@ -351,6 +351,32 @@ func New(dsn string) *DB {
 			name            TEXT,
 			organization_id TEXT
 		);
+		-- How each request authenticated, as seen at one observation point.
+		-- No credential value is ever stored here, only keyed fingerprints.
+		--
+		-- identity_id is deliberately NULLable. NULL means the credential was
+		-- opaque and we cannot tell whose it is, which is not the same as
+		-- nothing having been observed. Collapsing the two makes the analysis
+		-- claim an identity change it never saw.
+		--
+		-- The key is (request_id, source): one request is seen by more than one
+		-- point - a server records what arrived and what it then sent onward -
+		-- and without the source in the key those would overwrite each other.
+		CREATE TABLE IF NOT EXISTS auth_evidence (
+			request_id      TEXT NOT NULL,
+			source          TEXT NOT NULL,
+			run_id          TEXT DEFAULT '',
+			auth_method     TEXT DEFAULT '',
+			credential_id   TEXT DEFAULT '',
+			identity_id     TEXT,
+			auth_status     TEXT DEFAULT 'unknown',
+			key_version     TEXT DEFAULT '',
+			destination     TEXT DEFAULT '',
+			organization_id TEXT DEFAULT '',
+			observed_at     TIMESTAMPTZ DEFAULT NOW(),
+			PRIMARY KEY (request_id, source)
+		);
+		CREATE INDEX IF NOT EXISTS auth_evidence_run_idx ON auth_evidence (run_id);
 	`)
 	if err != nil {
 		log.Fatal(err)

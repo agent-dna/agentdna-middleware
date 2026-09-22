@@ -2416,6 +2416,10 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		return
 	}
 
+	// How each request authenticated, and what the run shows as a whole.
+	// Derived on every read from the stored evidence, never cached as a verdict.
+	hopEvidence, continuity := h.authEvidenceForIntent(intentID, interactions)
+
 	provenanceRecordID := ""
 	txns := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
@@ -2423,6 +2427,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 			provenanceRecordID = i.ProvenanceRecordID
 		}
 		txns = append(txns, gin.H{
+			"authEvidence":       hopEvidence[i.InteractionID],
 			"interactionID":      i.InteractionID,
 			"from":               i.From,
 			"fromName":           i.FromName,
@@ -2458,6 +2463,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"lastInteractionAt":  intent.LastInteractionAt,
 		"runtimeSeconds":     intent.RuntimeSeconds,
 		"provenanceRecordID": provenanceRecordID,
+		"continuity":         continuity,
 		"interactions":       txns,
 	}
 	if intent.EndedAt != nil {

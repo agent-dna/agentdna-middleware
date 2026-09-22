@@ -2701,3 +2701,80 @@ func (d *DB) GetThreatsByIntent(intentID string) ([]*ThreatRecord, error) {
 	}
 	return result, nil
 }
+
+// --- Authentication evidence ---------------------------------------------
+
+// AuthEvidenceRecord is one observation of how a request authenticated.
+//
+// IdentityID is a pointer because NULL carries meaning: the credential was
+// opaque, so we cannot tell whose it is. That is not a change of identity, and
+// the analysis must never read it as one.
+type AuthEvidenceRecord struct {
+	RequestID    string
+	Source       string
+	RunID        string
+	AuthMethod   string
+	CredentialID string
+	IdentityID   *string
+	AuthStatus   string
+	KeyVersion   string
+	Destination  string
+}
+
+// StoreAuthEvidence saves one record.
+//
+// Records arrive while a run is still in flight, long before its signed chain
+// lands, so nothing is attached to an interaction here. That happens at read
+// time in GetAuthEvidenceByIntent. Re-sending the same (request_id, source) is
+// a no-op rather than an error.
+func (d *DB) StoreAuthEvidence(r *AuthEvidenceRecord, orgID string) error {
+	_, err := d.conn.Exec(`
+		INSERT INTO auth_evidence
+		  (request_id, source, run_id, auth_method, credential_id, identity_id,
+		   auth_status, key_version, destination, organization_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (request_id, source) DO NOTHING`,
+		r.RequestID, r.Source, r.RunID, r.AuthMethod, r.CredentialID, r.IdentityID,
+		r.AuthStatus, r.KeyVersion, r.Destination, orgID,
+	)
+	return err
+}
+
+// GetAuthEvidenceByIntent returns one intent's evidence, keyed by request id.
+//
+// The join to new_interactions is the quarantine. Nothing verifies the ids an
+// agent puts in an MCP message, so one could name another run's request. Any
+// record whose request_id does not appear in a signed chain we already hold
+// simply never comes back from this query.
+//
+// DISTINCT matters: one request can produce several interaction rows when it
+// fans out to concurrent children, and the join would otherwise repeat the
+// same evidence once per row.
+func (d *DB) GetAuthEvidenceByIntent(intentID string) (map[string][]*AuthEvidenceRecord, error) {
+	rows, err := d.conn.Query(`
+		SELECT DISTINCT e.request_id, e.source, COALESCE(e.run_id, ''),
+		       COALESCE(e.auth_method, ''), COALESCE(e.credential_id, ''), e.identity_id,
+		       COALESCE(e.auth_status, ''), COALESCE(e.key_version, ''), COALESCE(e.destination, '')
+		FROM auth_evidence e
+		JOIN new_interactions i
+		  ON i.signature = e.request_id
+		 AND i.organization_id = e.organization_id
+		WHERE i.intent_id = $1`,
+		intentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string][]*AuthEvidenceRecord{}
+	for rows.Next() {
+		r := &AuthEvidenceRecord{}
+		if err := rows.Scan(&r.RequestID, &r.Source, &r.RunID, &r.AuthMethod,
+			&r.CredentialID, &r.IdentityID, &r.AuthStatus, &r.KeyVersion, &r.Destination); err != nil {
+			return nil, err
+		}
+		out[r.RequestID] = append(out[r.RequestID], r)
+	}
+	return out, rows.Err()
+}

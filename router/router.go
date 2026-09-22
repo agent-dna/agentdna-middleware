@@ -11,6 +11,8 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	r.POST("/core/v1/register-agent", h.CoreRegisterAgent)
 	r.POST("/core/v1/register-tool", h.AppRegistration)
 	r.GET("/core/v1/did-by-email", h.CoreDIDByEmail)
+	// Authentication evidence from an observation point (MCP server, gateway).
+	r.POST("/core/v1/auth-evidence", h.StoreAuthEvidence)
 
 
 	// Dashboard — public
