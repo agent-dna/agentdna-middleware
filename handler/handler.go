@@ -3339,17 +3339,27 @@ func (h *Handler) AgentsCreationRequestsListUser(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
+	log.Printf("[AgentsCreationRequestsListUser] querying creator_did=%q request_type=deploy_agent page=%d pageSize=%d offset=%d", creatorDID, page, pageSize, offset)
+
 	total, err := h.db.CountRequestsByUser(creatorDID, "deploy_agent")
 	if err != nil {
+		log.Printf("[AgentsCreationRequestsListUser] count failed creator_did=%q err=%v", creatorDID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count requests: %v", err)})
 		return
 	}
+	log.Printf("[AgentsCreationRequestsListUser] total matching rows=%d creator_did=%q", total, creatorDID)
 
 	requests, err := h.db.GetRequestsByUser(creatorDID, "deploy_agent", pageSize, offset)
 	if err != nil {
+		log.Printf("[AgentsCreationRequestsListUser] fetch failed creator_did=%q err=%v", creatorDID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch requests: %v", err)})
 		return
 	}
+	ids := make([]string, 0, len(requests))
+	for _, r := range requests {
+		ids = append(ids, r.RequestID)
+	}
+	log.Printf("[AgentsCreationRequestsListUser] returning %d row(s) creator_did=%q request_ids=%v", len(requests), creatorDID, ids)
 
 	c.JSON(http.StatusOK, Response{
 		Status: true,

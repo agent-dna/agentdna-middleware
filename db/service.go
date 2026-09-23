@@ -912,6 +912,7 @@ func (d *DB) GetTopAgentsByOrg(orgID string, limit, offset int) ([]*AgentVolumeR
 type UserProfile struct {
 	Name           string `json:"name"`
 	Email          string `json:"email"`
+	DID            string `json:"did"`
 	APIKey         string `json:"apiKey"`
 	OrganizationID string `json:"organizationID"`
 	CreatedAt      string `json:"createdAt"`
@@ -924,6 +925,7 @@ func (d *DB) GetUserProfile(email string) (*UserProfile, error) {
 		SELECT
 			COALESCE(u.name, ''),
 			u.email,
+			COALESCE(u.did, ''),
 			COALESCE(u.api_key, ''),
 			COALESCE(u.organization_id, ''),
 			COALESCE(u.created_at::TEXT, ''),
@@ -932,7 +934,7 @@ func (d *DB) GetUserProfile(email string) (*UserProfile, error) {
 		LEFT JOIN new_admins a ON a.organization_id = u.organization_id
 		WHERE u.email = $1`,
 		email,
-	).Scan(&p.Name, &p.Email, &p.APIKey, &p.OrganizationID, &p.CreatedAt, &p.AdminEmail)
+	).Scan(&p.Name, &p.Email, &p.DID, &p.APIKey, &p.OrganizationID, &p.CreatedAt, &p.AdminEmail)
 	if err != nil {
 		return nil, err
 	}
@@ -942,6 +944,7 @@ func (d *DB) GetUserProfile(email string) (*UserProfile, error) {
 type AdminProfile struct {
 	Name           string `json:"name"`
 	Email          string `json:"email"`
+	DID            string `json:"did"`
 	OrganizationID string `json:"organizationID"`
 	APIKey         string `json:"apiKey"`
 	AgentCount     int    `json:"agentCount"`
@@ -958,6 +961,7 @@ func (d *DB) GetAdminProfile(username string) (*AdminProfile, error) {
 		SELECT
 			COALESCE(name, ''),
 			email,
+			COALESCE(did, ''),
 			COALESCE(organization_id, ''),
 			COALESCE(api_key, ''),
 			agent_count,
@@ -968,7 +972,7 @@ func (d *DB) GetAdminProfile(username string) (*AdminProfile, error) {
 		FROM new_admins
 		WHERE did = $1`,
 		username,
-	).Scan(&p.Name, &p.Email, &p.OrganizationID, &p.APIKey, &p.AgentCount, &p.IntentCount, &p.ThreatCount, &p.TotalUsers, &createdAt)
+	).Scan(&p.Name, &p.Email, &p.DID, &p.OrganizationID, &p.APIKey, &p.AgentCount, &p.IntentCount, &p.ThreatCount, &p.TotalUsers, &createdAt)
 	if err != nil {
 		return nil, err
 	}
