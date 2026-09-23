@@ -183,6 +183,66 @@ func (d *DB) CountRequestsByOrg(orgID, requestType string) (int, error) {
 	return total, err
 }
 
+// GetAllRequestsByOrg and CountAllRequestsByOrg return every request for the
+// org regardless of request_type (deploy_agent, agent_access, ...) — used by
+// endpoints that show the org's full request queue rather than one type at a
+// time.
+func (d *DB) GetAllRequestsByOrg(orgID string, limit, offset int) ([]*RequestRecord, error) {
+	rows, err := d.conn.Query(`
+		SELECT request_id, request_type, policy, creator_did,
+		       COALESCE(agent_did,''), COALESCE(agent_name,''),
+		       COALESCE(request_info,''), COALESCE(organization_id,''), status, created_at
+		FROM new_requests
+		WHERE organization_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3`,
+		orgID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRequestRows(rows)
+}
+
+func (d *DB) CountAllRequestsByOrg(orgID string) (int, error) {
+	var total int
+	err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_requests WHERE organization_id = $1`,
+		orgID,
+	).Scan(&total)
+	return total, err
+}
+
+// GetAllRequestsByUser and CountAllRequestsByUser are the creator_did-scoped
+// counterparts, used for a non-admin caller's own request queue.
+func (d *DB) GetAllRequestsByUser(creatorDID string, limit, offset int) ([]*RequestRecord, error) {
+	rows, err := d.conn.Query(`
+		SELECT request_id, request_type, policy, creator_did,
+		       COALESCE(agent_did,''), COALESCE(agent_name,''),
+		       COALESCE(request_info,''), COALESCE(organization_id,''), status, created_at
+		FROM new_requests
+		WHERE creator_did = $1
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3`,
+		creatorDID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRequestRows(rows)
+}
+
+func (d *DB) CountAllRequestsByUser(creatorDID string) (int, error) {
+	var total int
+	err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_requests WHERE creator_did = $1`,
+		creatorDID,
+	).Scan(&total)
+	return total, err
+}
+
 func (d *DB) GetRequestsByUser(creatorDID, requestType string, limit, offset int) ([]*RequestRecord, error) {
 	rows, err := d.conn.Query(`
 		SELECT request_id, request_type, policy, creator_did,

@@ -3272,6 +3272,9 @@ func readPolicyFile(c *gin.Context) (string, bool) {
 	return string(raw), true
 }
 
+// AgentsCreationRequestsList returns every request row (any request_type —
+// deploy_agent, agent_access, ...), scoped to the whole org for an admin
+// caller or to just the caller's own requests otherwise.
 func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
 	w := http.ResponseWriter(c.Writer)
 	enableCors(&w)
@@ -3282,6 +3285,19 @@ func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
 		return
 	}
 
+	isAdmin := c.GetBool(CtxIsAdmin)
+	creatorDID := c.GetString(CtxDID)
+	email := c.GetString(CtxEmail)
+	if !isAdmin && creatorDID == "" && email != "" {
+		if u, err := h.db.GetOrgUserByEmail(email); err == nil && u.DID != "" {
+			creatorDID = u.DID
+		}
+	}
+	if !isAdmin && creatorDID == "" {
+		c.JSON(http.StatusOK, Response{Status: false, Message: "no_did", Data: map[string]string{"email": email}})
+		return
+	}
+
 	const pageSize = 10
 	page := 1
 	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
@@ -3289,13 +3305,26 @@ func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountRequestsByOrg(orgID, "deploy_agent")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count requests: %v", err)})
-		return
+	var (
+		total    int
+		requests []*db.RequestRecord
+		err      error
+	)
+	if isAdmin {
+		total, err = h.db.CountAllRequestsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count requests: %v", err)})
+			return
+		}
+		requests, err = h.db.GetAllRequestsByOrg(orgID, pageSize, offset)
+	} else {
+		total, err = h.db.CountAllRequestsByUser(creatorDID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count requests: %v", err)})
+			return
+		}
+		requests, err = h.db.GetAllRequestsByUser(creatorDID, pageSize, offset)
 	}
-
-	requests, err := h.db.GetRequestsByOrg(orgID, "deploy_agent", pageSize, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch requests: %v", err)})
 		return
