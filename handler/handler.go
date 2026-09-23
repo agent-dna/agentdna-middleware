@@ -4143,7 +4143,16 @@ func (h *Handler) TopThreats(c *gin.Context) {
 		return
 	}
 
-	top, err := h.db.GetTopThreats(orgID)
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
+
+	var top []*db.TopThreatRecord
+	var err error
+	if isAdmin {
+		top, err = h.db.GetTopThreats(orgID)
+	} else {
+		top, err = h.db.GetTopThreatsByUser(userDID, orgID)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch top threats: %v", err)})
 		return
