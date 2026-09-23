@@ -463,14 +463,24 @@ func (d *DB) GetUserMetrics(userDID, orgID string) (*OrgMetrics, error) {
 			(SELECT COUNT(*) FROM user_intents),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents)),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents)),
+			(SELECT COUNT(DISTINCT t.did) FROM new_tools t
+			 INNER JOIN new_interactions i
+			         ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+			        AND i.organization_id = $2
+			 WHERE i.intent_id IN (SELECT intent_id FROM user_intents)),
 			(SELECT COUNT(*) FROM new_agents WHERE deployer_did = $1 AND created_at >= $3),
 			(SELECT COUNT(*) FROM user_intents WHERE started_at >= $3),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents) AND time >= $3),
-			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents) AND time >= $3)
+			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents) AND time >= $3),
+			(SELECT COUNT(DISTINCT t.did) FROM new_tools t
+			 INNER JOIN new_interactions i
+			         ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+			        AND i.organization_id = $2
+			 WHERE i.intent_id IN (SELECT intent_id FROM user_intents) AND i.time >= $3)
 		`,
 		userDID, orgID, twentyFourHoursAgo,
-	).Scan(&m.AgentCount, &m.IntentCount, &m.InteractionsCount, &m.ThreatCount,
-		&m.AgentCount24hChange, &m.IntentCount24hChange, &m.InteractionsCount24hChange, &m.ThreatCount24hChange)
+	).Scan(&m.AgentCount, &m.IntentCount, &m.InteractionsCount, &m.ThreatCount, &m.AppCount,
+		&m.AgentCount24hChange, &m.IntentCount24hChange, &m.InteractionsCount24hChange, &m.ThreatCount24hChange, &m.AppCount24hChange)
 	return m, err
 }
 
@@ -874,6 +884,18 @@ func (d *DB) GetOrgMetrics(orgID string) (*OrgMetrics, error) {
 		return nil, err
 	}
 
+	// Apps: distinct new_tools rows that have shown up on either side of at
+	// least one interaction in this org.
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(DISTINCT t.did) FROM new_tools t
+		 INNER JOIN new_interactions i
+		         ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		        AND i.organization_id = $1`,
+		orgID,
+	).Scan(&m.AppCount); err != nil {
+		return nil, err
+	}
+
 	// Calculate 24-hour changes
 	twentyFourHoursAgo := time.Now().Add(-24 * time.Hour)
 
@@ -906,6 +928,19 @@ func (d *DB) GetOrgMetrics(orgID string) (*OrgMetrics, error) {
 		`SELECT COUNT(*) FROM new_interactions WHERE organization_id = $1 AND threat = 1 AND time >= $2`,
 		orgID, twentyFourHoursAgo,
 	).Scan(&m.ThreatCount24hChange); err != nil {
+		return nil, err
+	}
+
+	// App count 24h change — distinct apps with at least one interaction in
+	// the last 24h (new_tools has no created_at column to key off of).
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(DISTINCT t.did) FROM new_tools t
+		 INNER JOIN new_interactions i
+		         ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		        AND i.organization_id = $1
+		 WHERE i.time >= $2`,
+		orgID, twentyFourHoursAgo,
+	).Scan(&m.AppCount24hChange); err != nil {
 		return nil, err
 	}
 

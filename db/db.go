@@ -14,10 +14,12 @@ type OrgMetrics struct {
 	IntentCount               int
 	InteractionsCount         int
 	ThreatCount               int
+	AppCount                  int
 	AgentCount24hChange       int
 	IntentCount24hChange      int
 	InteractionsCount24hChange int
 	ThreatCount24hChange      int
+	AppCount24hChange         int
 }
 
 type AdminRecord struct {
