@@ -3293,6 +3293,7 @@ func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
 			creatorDID = u.DID
 		}
 	}
+	log.Printf("[AgentsCreationRequestsList v2-all-types] isAdmin=%v creatorDID=%q orgID=%q page=%s", isAdmin, creatorDID, orgID, c.Query("page"))
 	if !isAdmin && creatorDID == "" {
 		c.JSON(http.StatusOK, Response{Status: false, Message: "no_did", Data: map[string]string{"email": email}})
 		return
@@ -3329,6 +3330,7 @@ func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch requests: %v", err)})
 		return
 	}
+	log.Printf("[AgentsCreationRequestsList v2-all-types] total=%d returned=%d isAdmin=%v", total, len(requests), isAdmin)
 
 	c.JSON(http.StatusOK, Response{
 		Status: true,
