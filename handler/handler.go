@@ -1436,7 +1436,16 @@ func (h *Handler) AgentsAppsMetrics(c *gin.Context) {
 		return
 	}
 
-	data, err := h.db.GetAgentsAppsMetrics(orgID)
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
+
+	var data *db.AgentsAppsMetrics
+	var err error
+	if isAdmin {
+		data, err = h.db.GetAgentsAppsMetrics(orgID)
+	} else {
+		data, err = h.db.GetAgentsAppsMetricsByUser(userDID, orgID)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
 		return
