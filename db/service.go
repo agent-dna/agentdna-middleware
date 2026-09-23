@@ -2898,6 +2898,36 @@ func (d *DB) GetTopThreats(orgID string) ([]*TopThreatRecord, error) {
 	return result, nil
 }
 
+// GetTopThreatsByUser is the non-admin counterpart of GetTopThreats — scoped
+// to threats on interactions belonging to one of the user's own intents
+// (intent_id IN user_intents), the same scoping GetUserMetrics already uses
+// for its interaction/threat counts, rather than every threat in the org.
+func (d *DB) GetTopThreatsByUser(userDID, orgID string) ([]*TopThreatRecord, error) {
+	rows, err := d.conn.Query(userScopeIntentsCTE+`
+		SELECT COALESCE(t.threat_code, 0), COALESCE(tc.title, ''), COUNT(*) AS cnt
+		FROM new_interactions ni
+		LEFT JOIN threats t ON t.id = ni.threat_id
+		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
+		WHERE ni.threat = 1 AND ni.intent_id IN (SELECT intent_id FROM user_intents)
+		GROUP BY COALESCE(t.threat_code, 0), COALESCE(tc.title, '')
+		ORDER BY cnt DESC`,
+		userDID, orgID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*TopThreatRecord
+	for rows.Next() {
+		r := &TopThreatRecord{}
+		if err := rows.Scan(&r.ThreatCode, &r.Title, &r.Count); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, nil
+}
+
 func (d *DB) GetThreatCodeDetail(code int) (*ThreatCodeRecord, error) {
 	r := &ThreatCodeRecord{}
 	err := d.conn.QueryRow(`
