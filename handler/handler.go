@@ -1212,6 +1212,7 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 
 	isAdmin := c.GetBool(CtxIsAdmin)
 	userDID := c.GetString(CtxDID)
+	log.Printf("[HomeMetrics v2-started-at-fix] isAdmin=%v userDID=%q orgID=%q", isAdmin, userDID, orgID)
 
 	var metrics *db.OrgMetrics
 	var agents []*db.AgentVolumeRecord
