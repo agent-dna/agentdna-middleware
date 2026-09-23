@@ -440,7 +440,7 @@ WITH user_agents AS (
       )
 ),
 user_intents AS (
-    SELECT DISTINCT ni.intent_id
+    SELECT DISTINCT ni.intent_id, ni.started_at
     FROM new_intents ni
     LEFT JOIN new_interactions ix ON ix.intent_id = ni.intent_id
     WHERE ni.organization_id = $2
