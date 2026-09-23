@@ -2488,6 +2488,138 @@ func (d *DB) GetAgentsAppsMetrics(orgID string) (*AgentsAppsMetrics, error) {
 	return out, nil
 }
 
+// GetAgentsAppsMetricsByUser is the non-admin counterpart of GetAgentsAppsMetrics
+// — every count is scoped to interactions the user (or one of the agents they
+// deployed / were granted access to, via user_agents) actually took part in,
+// instead of the whole org's totals.
+func (d *DB) GetAgentsAppsMetricsByUser(userDID, orgID string) (*AgentsAppsMetrics, error) {
+	out := &AgentsAppsMetrics{}
+
+	// Top 5 of the user's own agents by interaction volume.
+	agentRows, err := d.GetTopAgentsByUser(userDID, orgID, 5, 0)
+	if err != nil {
+		return nil, err
+	}
+	out.TopAgents = agentRows
+
+	// Top 5 apps the user (or their agents) actually interacted with.
+	appRows, err := d.getToolsByUser(userDID, orgID, 5, 0)
+	if err != nil {
+		return nil, err
+	}
+	out.TopApps = appRows
+
+	if err := d.conn.QueryRow(userScopeIntentsCTE+`
+		SELECT COUNT(*) FROM new_interactions i
+		WHERE i.organization_id = $2
+		  AND (
+		      i.initiator_did = $1
+		      OR i.initiator_did IN (SELECT did FROM user_agents)
+		      OR i.interacted_to_did IN (SELECT did FROM user_agents)
+		  )`,
+		userDID, orgID,
+	).Scan(&out.TotalInteractions); err != nil {
+		return nil, err
+	}
+	if err := d.conn.QueryRow(userScopeIntentsCTE+`
+		SELECT COUNT(*) FROM new_interactions i
+		WHERE i.organization_id = $2 AND i.threat = 1
+		  AND (
+		      i.initiator_did = $1
+		      OR i.initiator_did IN (SELECT did FROM user_agents)
+		      OR i.interacted_to_did IN (SELECT did FROM user_agents)
+		  )`,
+		userDID, orgID,
+	).Scan(&out.TotalThreats); err != nil {
+		return nil, err
+	}
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM new_agents WHERE deployer_did = $1`, userDID,
+	).Scan(&out.TotalAgents); err != nil {
+		return nil, err
+	}
+	if err := d.conn.QueryRow(userScopeIntentsCTE+`
+		SELECT COUNT(DISTINCT t.did) FROM new_tools t
+		INNER JOIN new_interactions i
+		        ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		       AND i.organization_id = $2
+		WHERE (
+		    i.initiator_did = $1
+		    OR i.initiator_did IN (SELECT did FROM user_agents)
+		    OR i.interacted_to_did IN (SELECT did FROM user_agents)
+		)`,
+		userDID, orgID,
+	).Scan(&out.TotalApps); err != nil {
+		return nil, err
+	}
+
+	// Average reliability across just the user's own agents.
+	if err := d.conn.QueryRow(`
+		SELECT COALESCE(AVG(
+			CASE
+				WHEN total_interactions = 0 THEN 100.0
+				ELSE ROUND(CAST((1.0 - total_threats * 1.0 / total_interactions) * 100 AS NUMERIC), 2)
+			END
+		), 100.0)
+		FROM (
+			SELECT
+				COUNT(i.interaction_id)                        AS total_interactions,
+				SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) AS total_threats
+			FROM new_agents a
+			LEFT JOIN new_interactions i
+			       ON i.initiator_did = a.did AND i.organization_id = $2
+			WHERE a.deployer_did = $1
+			GROUP BY a.did
+		) agent_stats`,
+		userDID, orgID,
+	).Scan(&out.AvgReliability); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+// getToolsByUser scopes GetToolsByOrg down to just the apps the user (or one
+// of their agents, via user_agents) actually interacted with. Expects
+// userScopeIntentsCTE to already be prefixed onto the query by the caller.
+func (d *DB) getToolsByUser(userDID, orgID string, limit, offset int) ([]*ToolRecord, error) {
+	rows, err := d.conn.Query(userScopeIntentsCTE+`
+		SELECT
+			t.did,
+			t.name,
+			COUNT(i.interaction_id)                                                     AS total_interactions,
+			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                              AS total_threats,
+			COUNT(DISTINCT i.intent_id)                                                 AS total_intents,
+			COUNT(DISTINCT a.did)                                                       AS total_agents,
+			CASE
+				WHEN COUNT(i.interaction_id) = 0 THEN 100.0
+				ELSE ROUND(CAST(
+					(1.0 - SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END) * 1.0
+					/ COUNT(i.interaction_id)) * 100 AS NUMERIC), 2)
+			END                                                                         AS score
+		FROM new_tools t
+		INNER JOIN new_interactions i
+		        ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		       AND i.organization_id = $2
+		LEFT JOIN new_agents a
+		       ON a.did = CASE WHEN i.interacted_to_did = t.did THEN i.initiator_did ELSE i.interacted_to_did END
+		WHERE (
+		    i.initiator_did = $1
+		    OR i.initiator_did IN (SELECT did FROM user_agents)
+		    OR i.interacted_to_did IN (SELECT did FROM user_agents)
+		)
+		GROUP BY t.did, t.name
+		ORDER BY total_interactions DESC
+		LIMIT $3 OFFSET $4`,
+		userDID, orgID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanToolRows(rows)
+}
+
 func (d *DB) Search(q, orgID string) (*SearchResults, error) {
 	out := &SearchResults{
 		Agents:  []SearchAgentResult{},
