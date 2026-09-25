@@ -474,6 +474,13 @@ func New(dsn string) *DB {
 		(9104, 'CBAC Client: Verdict Without Code', 'A decision came back from the cbac-service, but with no code to key off of')
 		ON CONFLICT (code) DO NOTHING`)
 
+	// Observability page: hop lookups filter/join on these columns on every
+	// request (org+time window, per-intent, per-DID-pair, per-initiator).
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_interactions_org_time ON new_interactions (organization_id, time)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_interactions_intent_id ON new_interactions (intent_id)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_interactions_from_to ON new_interactions (initiator_did, interacted_to_did)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_intents_initiator ON new_intents (initiator_did)`)
+
 	return &DB{conn: conn}
 }
 
