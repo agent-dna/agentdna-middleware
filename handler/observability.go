@@ -2,6 +2,7 @@ package handler
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -145,10 +146,14 @@ func obsSlicePage[T any](items []T, page, pageSize int) []T {
 func (h *Handler) obsScope(c *gin.Context) (orgID string, isAdmin bool, callerDID string, ok bool) {
 	orgID = c.GetString(CtxOrgID)
 	if orgID == "" {
+		log.Printf("[observability] path=%s rejected — missing org context", c.Request.URL.Path)
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
 		return "", false, "", false
 	}
-	return orgID, c.GetBool(CtxIsAdmin), c.GetString(CtxDID), true
+	isAdmin, callerDID = c.GetBool(CtxIsAdmin), c.GetString(CtxDID)
+	log.Printf("[observability] path=%s query=%q orgID=%q isAdmin=%v callerDID=%q",
+		c.Request.URL.Path, c.Request.URL.RawQuery, orgID, isAdmin, callerDID)
+	return orgID, isAdmin, callerDID, true
 }
 
 // obsHopPolicy returns "<code> · <title>" for a flagged/elevated hop, or nil
@@ -198,7 +203,7 @@ type obsContext struct {
 // attribute agent->app hops back to a user.
 func (h *Handler) loadObsContext(c *gin.Context, scopeInitiatorDID string) (*obsContext, error) {
 	orgID := c.GetString(CtxOrgID)
-	_, since := obsParseRange(c)
+	rangeLabel, since := obsParseRange(c)
 	status := obsParseStatus(c)
 
 	hops, err := h.db.GetObservabilityHops(orgID, since, scopeInitiatorDID)
@@ -217,12 +222,18 @@ func (h *Handler) loadObsContext(c *gin.Context, scopeInitiatorDID string) (*obs
 	if err != nil {
 		return nil, fmt.Errorf("fetch app registry: %w", err)
 	}
+	log.Printf("[observability] path=%s orgID=%q scopeInitiatorDID=%q range=%s(since=%s) status=%s rawHops=%d registrySizes(users=%d,agents=%d,apps=%d)",
+		c.Request.URL.Path, orgID, scopeInitiatorDID, rangeLabel, since.UTC().Format(time.RFC3339), status,
+		len(hops), len(users), len(agents), len(apps))
 
 	octx := &obsContext{orgID: orgID, users: users, agents: agents, apps: apps}
 	intentIDSet := map[string]bool{}
+	ignoredCount := 0
+	statusFilteredCount := 0
 	for _, hop := range hops {
 		outcome := obsHopOutcome(hop.Threat, hop.Code)
 		if !obsPassesStatus(status, outcome) {
+			statusFilteredCount++
 			continue
 		}
 		switch obsHopKind(hop.From, hop.To, users, agents, apps) {
@@ -232,6 +243,28 @@ func (h *Handler) loadObsContext(c *gin.Context, scopeInitiatorDID string) (*obs
 		case "agent_app":
 			octx.agentAppHops = append(octx.agentAppHops, hop)
 			intentIDSet[hop.IntentID] = true
+		default:
+			ignoredCount++
+		}
+	}
+	log.Printf("[observability] path=%s classified: userAgentHops=%d agentAppHops=%d ignored(unmatched from/to)=%d filteredByStatus=%d distinctIntents=%d",
+		c.Request.URL.Path, len(octx.userAgentHops), len(octx.agentAppHops), ignoredCount, statusFilteredCount, len(intentIDSet))
+	if len(hops) > 0 && len(octx.userAgentHops) == 0 && len(octx.agentAppHops) == 0 {
+		// Sample a few raw hops so a from/to DID that never matches any
+		// registry (org_id mismatch, unlinked user DID, etc.) is visible
+		// directly in the log instead of just "0 results, no error".
+		sampleN := len(hops)
+		if sampleN > 5 {
+			sampleN = 5
+		}
+		for i := 0; i < sampleN; i++ {
+			hop := hops[i]
+			_, fromIsUser := users[hop.From]
+			_, fromIsAgent := agents[hop.From]
+			_, toIsAgent := agents[hop.To]
+			_, toIsApp := apps[hop.To]
+			log.Printf("[observability] path=%s unclassified sample hop: intent=%s from=%q(user=%v,agent=%v) to=%q(agent=%v,app=%v)",
+				c.Request.URL.Path, hop.IntentID, hop.From, fromIsUser, fromIsAgent, hop.To, toIsAgent, toIsApp)
 		}
 	}
 

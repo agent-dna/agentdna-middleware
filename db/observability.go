@@ -32,10 +32,10 @@ func (d *DB) GetObservabilityHops(orgID string, since time.Time, onlyInitiatorDI
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
-		WHERE ni.organization_id = $1 AND ni.time >= $2`
-	args := []any{orgID, since}
+		WHERE ni.time >= $1`
+	args := []any{since}
 	if onlyInitiatorDID != "" {
-		query += ` AND ni.intent_id IN (SELECT intent_id FROM new_intents WHERE initiator_did = $3)`
+		query += ` AND ni.intent_id IN (SELECT intent_id FROM new_intents WHERE initiator_did = $2)`
 		args = append(args, onlyInitiatorDID)
 	}
 	query += ` ORDER BY ni.time ASC`
@@ -70,8 +70,7 @@ type ObsUser struct {
 func (d *DB) GetOrgUserRegistry(orgID string) (map[string]*ObsUser, error) {
 	rows, err := d.conn.Query(
 		`SELECT did, COALESCE(name,''), email FROM new_org_users
-		 WHERE organization_id = $1 AND did IS NOT NULL AND did <> '' AND did <> 'none'`,
-		orgID,
+		 WHERE did IS NOT NULL AND did <> '' AND did <> 'none'`,
 	)
 	if err != nil {
 		return nil, err
@@ -96,8 +95,7 @@ type ObsAgent struct {
 
 func (d *DB) GetOrgAgentRegistry(orgID string) (map[string]*ObsAgent, error) {
 	rows, err := d.conn.Query(
-		`SELECT did, COALESCE(name,''), revoked, COALESCE(deployer_did,'') FROM new_agents WHERE organization_id = $1`,
-		orgID,
+		`SELECT did, COALESCE(name,''), revoked, COALESCE(deployer_did,'') FROM new_agents`,
 	)
 	if err != nil {
 		return nil, err
@@ -121,8 +119,7 @@ type ObsApp struct {
 
 func (d *DB) GetOrgAppRegistry(orgID string) (map[string]*ObsApp, error) {
 	rows, err := d.conn.Query(
-		`SELECT did, COALESCE(name,'') FROM new_tools WHERE organization_id = $1`,
-		orgID,
+		`SELECT did, COALESCE(name,'') FROM new_tools`,
 	)
 	if err != nil {
 		return nil, err
@@ -149,8 +146,8 @@ func (d *DB) GetIntentInitiators(orgID string, intentIDs []string) (map[string]s
 		return out, nil
 	}
 	rows, err := d.conn.Query(
-		`SELECT intent_id, initiator_did FROM new_intents WHERE organization_id = $1 AND intent_id = ANY($2)`,
-		orgID, pq.Array(intentIDs),
+		`SELECT intent_id, initiator_did FROM new_intents WHERE intent_id = ANY($1)`,
+		pq.Array(intentIDs),
 	)
 	if err != nil {
 		return nil, err
@@ -186,8 +183,8 @@ func (d *DB) GetObsIntentInfo(orgID string, intentIDs []string) (map[string]*Obs
 		        COALESCE(ni.review_status, 'Ongoing'),
 		        ni.started_at
 		 FROM new_intents ni
-		 WHERE ni.organization_id = $1 AND ni.intent_id = ANY($2)`,
-		orgID, pq.Array(intentIDs),
+		 WHERE ni.intent_id = ANY($1)`,
+		pq.Array(intentIDs),
 	)
 	if err != nil {
 		return nil, err
@@ -209,8 +206,8 @@ func (d *DB) GetObsIntentInfo(orgID string, intentIDs []string) (map[string]*Obs
 func (d *DB) OrgUserExists(orgID, did string) (bool, error) {
 	var exists bool
 	err := d.conn.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM new_org_users WHERE organization_id = $1 AND did = $2)`,
-		orgID, did,
+		`SELECT EXISTS(SELECT 1 FROM new_org_users WHERE did = $1)`,
+		did,
 	).Scan(&exists)
 	return exists, err
 }
