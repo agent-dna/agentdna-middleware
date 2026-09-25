@@ -69,6 +69,13 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/search", h.Search)
 	dashboard.GET("/agents-apps-metrics", h.AgentsAppsMetrics)
 
+	dashboard.GET("/observability-summary", h.ObservabilitySummary)
+	dashboard.GET("/observability-graph", h.ObservabilityGraph)
+	dashboard.GET("/observability-users", h.ObservabilityUsers)
+	dashboard.GET("/observability-user-flow", h.ObservabilityUserFlow)
+	dashboard.GET("/observability-intents", h.ObservabilityIntents)
+	dashboard.GET("/observability-paths", h.ObservabilityPaths)
+
 	dashboard.GET("/agents-creation-requests-list", h.AgentsCreationRequestsList)
 	dashboard.GET("/agents-creation-requests-list-user", h.AgentsCreationRequestsListUser)
 	dashboard.POST("/agents-creation-requests-create", h.AgentsCreationRequestsCreate)
