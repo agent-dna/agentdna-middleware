@@ -82,6 +82,11 @@ func obsHopKind(from, to string, users map[string]*db.ObsUser, agents map[string
 // unrecognized value) and its cutoff time.
 func obsParseRange(c *gin.Context) (string, time.Time) {
 	r := c.DefaultQuery("range", "24h")
+	if r == "all" {
+		// No lower bound — every interaction ever recorded. time.Time{} (year 1)
+		// sorts before any real interaction timestamp.
+		return "all", time.Time{}
+	}
 	var d time.Duration
 	switch r {
 	case "7d":
