@@ -2072,6 +2072,7 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 		entry := gin.H{
 			"intentID":           i.IntentID,
 			"title":              firstNWords(i.Title, 5),
+			"titleFull":          i.Title,
 			"initiatorDID":       i.InitiatorDID,
 			"initiatorName":      i.InitiatorName,
 			"startedAt":          i.StartedAt,
