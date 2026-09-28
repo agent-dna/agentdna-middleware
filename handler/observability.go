@@ -717,6 +717,8 @@ func (h *Handler) ObservabilityIntents(c *gin.Context) {
 		return a
 	}
 
+	// Pass 1: intents where userDID actually reached agentDID — these are the
+	// only intents this endpoint reports on.
 	for _, hop := range octx.userAgentHops {
 		if hop.From != userDID || hop.To != agentDID {
 			continue
@@ -727,14 +729,21 @@ func (h *Handler) ObservabilityIntents(c *gin.Context) {
 			a.lastAt = hop.Time
 		}
 	}
+	// Pass 2: any agent->app hop inside one of those qualifying intents,
+	// regardless of which agent actually made the call — agentDID may have
+	// delegated to another agent before an app was ever reached, and that
+	// app linkage should still surface here instead of dead-ending at
+	// agentDID. Only intents already added in pass 1 are considered (an
+	// agent-app hop alone, with no matching user->agentDID hop in the same
+	// intent, does not qualify).
 	for _, hop := range octx.agentAppHops {
-		if hop.From != agentDID {
-			continue
-		}
 		if octx.intentInitiator[hop.IntentID] != userDID {
 			continue
 		}
-		a := get(hop.IntentID)
+		a, exists := agg[hop.IntentID]
+		if !exists {
+			continue
+		}
 		a.hops = append(a.hops, hop)
 		a.apps[hop.To] = true
 		if hop.Time.After(a.lastAt) {
@@ -836,6 +845,74 @@ type obsFineRow struct {
 	userHops, appHops                   []*db.ObsHop
 }
 
+// obsFullIntentDetail returns the same shape /dashboard/v1/intent-info does
+// (full metadata plus every interaction in the intent) — used to expand a
+// path row's "intent" field from a bare {id, title} into the complete
+// picture instead of a dead end. Returns just {id} if the intent can't be
+// loaded (should not normally happen since the id came from real hop data).
+//
+// title is passed in rather than read off GetIntentInfo's result: that query
+// (shared with /intent-info) never selects a title at all, whereas
+// GetObsIntentInfo already computes one (the first interaction's message)
+// for every caller in this file.
+func (h *Handler) obsFullIntentDetail(intentID, title string) gin.H {
+	intent, err := h.db.GetIntentInfo(intentID)
+	if err != nil {
+		return gin.H{"id": intentID, "title": firstNWords(title, 5), "titleFull": title}
+	}
+	interactions, err := h.db.GetInteractionsByIntent(intentID)
+	if err != nil {
+		interactions = nil
+	}
+
+	provenanceRecordID := ""
+	txns := make([]gin.H, 0, len(interactions))
+	for _, i := range interactions {
+		if provenanceRecordID == "" && i.ProvenanceRecordID != "" {
+			provenanceRecordID = i.ProvenanceRecordID
+		}
+		txns = append(txns, gin.H{
+			"interactionID":      i.InteractionID,
+			"from":               i.From,
+			"fromName":           i.FromName,
+			"to":                 i.To,
+			"toName":             i.ToName,
+			"type":               i.Type,
+			"direction":          i.Direction,
+			"threat":             i.Threat,
+			"threatID":           i.ThreatID,
+			"time":               i.Time,
+			"message":            i.Message,
+			"signature":          i.Signature,
+			"provenanceReqID":    i.ProvenanceReqID,
+			"provenanceRecordID": i.ProvenanceRecordID,
+		})
+	}
+
+	return gin.H{
+		"id":                 intent.IntentID,
+		"title":              firstNWords(title, 5),
+		"titleFull":          title,
+		"initiatorDID":       intent.InitiatorDID,
+		"initiatorName":      intent.InitiatorName,
+		"startedAt":          intent.StartedAt,
+		"status":             intent.Status,
+		"reviewStatus":       intent.ReviewStatus,
+		"threatDetected":     intent.ThreatDetected,
+		"flowType":           intent.FlowType,
+		"executor":           intent.Executor,
+		"chainDepth":         intent.ChainDepth,
+		"interactionsCount":  intent.InteractionsCount,
+		"agentsCount":        intent.AgentsCount,
+		"toolsCount":         intent.ToolsCount,
+		"firstInteractionAt": intent.FirstInteractionAt,
+		"lastInteractionAt":  intent.LastInteractionAt,
+		"runtimeSeconds":     intent.RuntimeSeconds,
+		"provenanceRecordID": provenanceRecordID,
+		"interactions":       txns,
+	}
+}
+
 func (h *Handler) ObservabilityPaths(c *gin.Context) {
 	orgID, isAdmin, callerDID, ok := h.obsScope(c)
 	if !ok {
@@ -868,15 +945,19 @@ func (h *Handler) ObservabilityPaths(c *gin.Context) {
 		key := uaKey{hop.IntentID, hop.To}
 		uaGroups[key] = append(uaGroups[key], hop)
 	}
-	// Group agent_app hops by (intent, agent, app).
-	type aaKey struct{ intentID, agentDID, appDID string }
+	// Group agent_app hops by (intent, app) — not by which agent actually made
+	// the call. An app reached indirectly (agentDID delegated to another
+	// agent, which then called the app) must still surface against
+	// agentDID's row instead of dead-ending, so the app leg is matched purely
+	// by intent, never by requiring the same agent on both legs.
+	type aaKey struct{ intentID, appDID string }
 	aaGroups := map[aaKey][]*db.ObsHop{}
 	for _, hop := range octx.agentAppHops {
 		uid := octx.intentInitiator[hop.IntentID]
 		if fUser != "" && uid != fUser {
 			continue
 		}
-		key := aaKey{hop.IntentID, hop.From, hop.To}
+		key := aaKey{hop.IntentID, hop.To}
 		aaGroups[key] = append(aaGroups[key], hop)
 	}
 
@@ -895,7 +976,7 @@ func (h *Handler) ObservabilityPaths(c *gin.Context) {
 
 		foundApp := false
 		for aKey, appHops := range aaGroups {
-			if aKey.intentID != key.intentID || aKey.agentDID != key.agentDID {
+			if aKey.intentID != key.intentID {
 				continue
 			}
 			if fApp != "" && aKey.appDID != fApp {
@@ -1047,6 +1128,21 @@ func (h *Handler) ObservabilityPaths(c *gin.Context) {
 	total := len(outRows)
 	pageRows := obsSlicePage(outRows, page, pageSize)
 
+	// Full intent detail (every interaction, not just id/title) is only
+	// fetched for the intents actually being returned on this page — avoids
+	// re-fetching per row when the same intent repeats, and never touches
+	// rows outside the current page.
+	fullIntents := map[string]gin.H{}
+	for _, r := range pageRows {
+		if !r.hasIntent {
+			continue
+		}
+		if _, done := fullIntents[r.key.intentID]; done {
+			continue
+		}
+		fullIntents[r.key.intentID] = h.obsFullIntentDetail(r.key.intentID, r.intentTitle)
+	}
+
 	list := make([]gin.H, 0, len(pageRows))
 	for _, r := range pageRows {
 		var appOut any
@@ -1055,7 +1151,7 @@ func (h *Handler) ObservabilityPaths(c *gin.Context) {
 		}
 		var intentOut any
 		if r.hasIntent {
-			intentOut = gin.H{"id": r.key.intentID, "title": r.intentTitle}
+			intentOut = fullIntents[r.key.intentID]
 		}
 		var gate2Out any
 		if r.gate2 != nil {
