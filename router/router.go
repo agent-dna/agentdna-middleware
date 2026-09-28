@@ -11,7 +11,6 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	r.POST("/core/v1/register-agent", h.CoreRegisterAgent)
 	r.POST("/core/v1/register-tool", h.AppRegistration)
 
-
 	// Dashboard — public
 	public := r.Group("/dashboard/v1")
 	public.POST("/login", h.Login)
@@ -30,15 +29,15 @@ func Register(r *gin.Engine, h *handler.Handler) {
 
 	// Dashboard — JWT protected
 	dashboard := r.Group("/dashboard/v1", h.JWTAuthMiddleware())
-	dashboard.GET("/user-profile", h.UserProfile) 
-	dashboard.GET("/admin-profile", h.AdminProfile) 
+	dashboard.GET("/user-profile", h.UserProfile)
+	dashboard.GET("/admin-profile", h.AdminProfile)
 
 	dashboard.GET("/home-metrics", h.HomeMetrics)
 	dashboard.GET("/interactions-list", h.InteractionsList)
-	dashboard.GET("/agent-metrics", h.AgentMetrics) 
+	dashboard.GET("/agent-metrics", h.AgentMetrics)
 
 	dashboard.GET("/agents-list", h.AgentsList)
-	dashboard.GET("/users-list", h.UsersList) 
+	dashboard.GET("/users-list", h.UsersList)
 	dashboard.POST("/create-user", h.CreateUser)
 	dashboard.GET("/agent-interactions", h.AgentInteractions)
 	dashboard.GET("/agent-intents", h.AgentIntents)
@@ -73,6 +72,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/observability-graph", h.ObservabilityGraph)
 	dashboard.GET("/observability-users", h.ObservabilityUsers)
 	dashboard.GET("/observability-user-flow", h.ObservabilityUserFlow)
+	dashboard.GET("/observability-agent-flow", h.ObservabilityAgentFlow)
 	dashboard.GET("/observability-intents", h.ObservabilityIntents)
 	dashboard.GET("/observability-paths", h.ObservabilityPaths)
 
@@ -82,7 +82,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.POST("/agents-creation-requests-edit", h.AgentsCreationRequestsEdit)
 
 	dashboard.POST("/agent-creation-request-result-submit", h.AgentCreationRequestSubmit)
-	dashboard.POST("/agent-info-edit", h.AgentInfoEdit) 
+	dashboard.POST("/agent-info-edit", h.AgentInfoEdit)
 
 	dashboard.GET("/agent-access-requests-list-org", h.AgentAccessRequestsListOrg)
 	dashboard.GET("/agent-access-requests-list-user", h.AgentAccessRequestsListUser)
@@ -95,6 +95,5 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/agent-policy", h.GetAgentPolicy)
 	dashboard.GET("/agent-policy-history", h.GetAgentPolicyHistory)
 	dashboard.GET("/agent-policy-update", h.GetAgentPolicyUpdate)
-	
-}
 
+}
