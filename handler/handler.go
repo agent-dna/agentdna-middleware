@@ -2447,9 +2447,18 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		return
 	}
 
+	// new_intents.threat_detected is written once by handleIntentWorkflow at
+	// intent-creation time and never recomputed, so it can drift stale
+	// relative to the interactions' own threat flags (the same bug fixed in
+	// observability-paths). Derive it live from the interactions below
+	// instead of trusting that stored column.
+	threatDetected := false
 	provenanceRecordID := ""
 	txns := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
+		if i.Threat {
+			threatDetected = true
+		}
 		if provenanceRecordID == "" && i.ProvenanceRecordID != "" {
 			provenanceRecordID = i.ProvenanceRecordID
 		}
@@ -2478,7 +2487,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"startedAt":          intent.StartedAt,
 		"status":             intent.Status,
 		"reviewStatus":       intent.ReviewStatus,
-		"threatDetected":     intent.ThreatDetected,
+		"threatDetected":     threatDetected,
 		"flowType":           intent.FlowType,
 		"executor":           intent.Executor,
 		"chainDepth":         intent.ChainDepth,

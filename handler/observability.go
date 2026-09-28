@@ -865,9 +865,18 @@ func (h *Handler) obsFullIntentDetail(intentID, title string) gin.H {
 		interactions = nil
 	}
 
+	// threat_detected on new_intents is written once by handleIntentWorkflow at
+	// intent-creation time and never recomputed — it can drift stale relative
+	// to the interactions' own threat flags. Derive it live from the same
+	// interaction rows /interactions-list reads instead of trusting that
+	// stored column, so the two endpoints can't disagree.
+	threatDetected := false
 	provenanceRecordID := ""
 	txns := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
+		if i.Threat {
+			threatDetected = true
+		}
 		if provenanceRecordID == "" && i.ProvenanceRecordID != "" {
 			provenanceRecordID = i.ProvenanceRecordID
 		}
@@ -898,7 +907,7 @@ func (h *Handler) obsFullIntentDetail(intentID, title string) gin.H {
 		"startedAt":          intent.StartedAt,
 		"status":             intent.Status,
 		"reviewStatus":       intent.ReviewStatus,
-		"threatDetected":     intent.ThreatDetected,
+		"threatDetected":     threatDetected,
 		"flowType":           intent.FlowType,
 		"executor":           intent.Executor,
 		"chainDepth":         intent.ChainDepth,
