@@ -1062,13 +1062,11 @@ func (h *Handler) ObservabilityAgentFlow(c *gin.Context) {
 // ---- 4c. GET /dashboard/v1/observability-app-flow ------------------------
 //
 // The app-first mirror of observability-agent-flow: App -> Agent -> Peer
-// agents -> User -> Intent. Unlike the agent-flow endpoint, a peer's "count"
-// here is deliberately the BROAD definition (every hop touching A or the
-// peer within their shared intents), matching the spec's own worked example
-// where a peer with zero direct messages still shows a nonzero count — this
-// is intentionally different from observability-agent-flow's peer count,
-// which was corrected to direct-only hops per explicit instruction on that
-// endpoint.
+// agents -> User -> Intent. A peer's count/allowed/elevated/flagged/outcome/
+// lastAt/policies are direct A<->peer hops only, same as
+// observability-agent-flow — an agent that only shares an intent with A
+// (never messages it directly) still appears in peers[] via intentsCount,
+// but with count: 0, direct: null, outcome: "allowed".
 func (h *Handler) ObservabilityAppFlow(c *gin.Context) {
 	_, isAdmin, callerDID, ok := h.obsScope(c)
 	if !ok {
@@ -1150,13 +1148,15 @@ func (h *Handler) ObservabilityAppFlow(c *gin.Context) {
 			}
 			p.intents[intentID] = true
 			for _, hop := range intentHops {
-				if hop.From == agentDID || hop.To == agentDID || hop.From == otherDID || hop.To == otherDID {
-					p.broadHops = append(p.broadHops, hop)
-				}
+				// count/allowed/elevated/flagged/outcome/lastAt/policies are
+				// exactly A<->peer traffic within S(P, A) — hops directly
+				// between the two, same as observability-agent-flow.
 				if hop.From == agentDID && hop.To == otherDID {
+					p.broadHops = append(p.broadHops, hop)
 					p.directSent++
 				}
 				if hop.From == otherDID && hop.To == agentDID {
+					p.broadHops = append(p.broadHops, hop)
 					p.directRecv++
 				}
 			}
