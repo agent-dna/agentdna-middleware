@@ -28,13 +28,27 @@ const (
 const SourceServerOut = "server_out"
 
 // HopEvidence is what was observed about one interaction's authentication.
+//
+// The top-level fields are the credential this hop arrived with. BackendCalls
+// are what the server then presented to its own backends to answer it - often
+// a key of its own, which is where a user's identity stops.
 type HopEvidence struct {
-	Status       string   `json:"status"`
-	Sources      []string `json:"sources,omitempty"`
-	AuthMethod   string   `json:"authMethod,omitempty"`
-	CredentialID string   `json:"credentialID,omitempty"`
-	IdentityID   *string  `json:"identityID,omitempty"`
-	AuthStatus   string   `json:"authStatus,omitempty"`
+	Status       string        `json:"status"`
+	Sources      []string      `json:"sources,omitempty"`
+	AuthMethod   string        `json:"authMethod,omitempty"`
+	CredentialID string        `json:"credentialID,omitempty"`
+	IdentityID   *string       `json:"identityID,omitempty"`
+	AuthStatus   string        `json:"authStatus,omitempty"`
+	BackendCalls []BackendCall `json:"backendCalls,omitempty"`
+}
+
+// BackendCall is one outbound call a server made while serving a hop.
+type BackendCall struct {
+	Destination  string  `json:"destination"`
+	AuthMethod   string  `json:"authMethod"`
+	CredentialID string  `json:"credentialID,omitempty"`
+	IdentityID   *string `json:"identityID,omitempty"`
+	AuthStatus   string  `json:"authStatus"`
 }
 
 // Continuity is what a run's evidence shows as a whole.
@@ -78,31 +92,46 @@ func evidenceForHop(records []*db.AuthEvidenceRecord) HopEvidence {
 		return HopEvidence{Status: EvidenceNotObserved}
 	}
 
-	// The query does not order its rows, and there is at most one record per
-	// source - (request_id, source) is the primary key. Sorting by source is
-	// what makes the same evidence always read the same way.
-	sort.Slice(records, func(a, b int) bool { return records[a].Source < records[b].Source })
+	// The query does not order its rows. Sorting by source, then destination,
+	// is what makes the same evidence always read the same way.
+	sort.Slice(records, func(a, b int) bool {
+		if records[a].Source != records[b].Source {
+			return records[a].Source < records[b].Source
+		}
+		return records[a].Destination < records[b].Destination
+	})
 
-	sources := make([]string, 0, len(records))
+	view := HopEvidence{Status: EvidenceObserved}
 	onWire := make([]*db.AuthEvidenceRecord, 0, len(records))
 	for _, r := range records {
-		sources = append(sources, r.Source)
-		if r.Source != SourceServerOut {
+		if len(view.Sources) == 0 || view.Sources[len(view.Sources)-1] != r.Source {
+			view.Sources = append(view.Sources, r.Source)
+		}
+		if r.Source == SourceServerOut {
+			view.BackendCalls = append(view.BackendCalls, BackendCall{
+				Destination:  r.Destination,
+				AuthMethod:   r.AuthMethod,
+				CredentialID: r.CredentialID,
+				IdentityID:   r.IdentityID,
+				AuthStatus:   r.AuthStatus,
+			})
+		} else {
 			onWire = append(onWire, r)
 		}
 	}
 
-	described := describing(records, onWire)
-	view := HopEvidence{
-		Status:       EvidenceObserved,
-		Sources:      sources,
-		AuthMethod:   described.AuthMethod,
-		CredentialID: described.CredentialID,
-		IdentityID:   described.IdentityID,
-		AuthStatus:   described.AuthStatus,
+	// Only a point that watched this request arrive can say what it arrived
+	// with. With none, the hop's own credential is left empty rather than
+	// filled from a backend call - that key is the server's, not the caller's.
+	if len(onWire) == 0 {
+		return view
 	}
+	view.AuthMethod = onWire[0].AuthMethod
+	view.CredentialID = onWire[0].CredentialID
+	view.IdentityID = onWire[0].IdentityID
+	view.AuthStatus = onWire[0].AuthStatus
 
-	// One end of the wire, or none: nothing to agree or disagree with.
+	// One end of the wire: nothing to agree or disagree with.
 	if len(onWire) < 2 {
 		return view
 	}
@@ -130,20 +159,6 @@ func evidenceForHop(records []*db.AuthEvidenceRecord) HopEvidence {
 		view.Status = EvidenceMismatch
 	}
 	return view
-}
-
-// describing returns the record a hop's own credential is read from.
-//
-// Any point that watched the request arrive will do. server_out only when
-// nothing else was observed: it describes the next leg rather than this hop,
-// but reporting that is better than reporting nothing.
-//
-// Both slices arrive sorted by source, so the choice is never arbitrary.
-func describing(records, onWire []*db.AuthEvidenceRecord) *db.AuthEvidenceRecord {
-	if len(onWire) > 0 {
-		return onWire[0]
-	}
-	return records[0]
 }
 
 // analyseContinuity walks a run and reports what changed and where.
