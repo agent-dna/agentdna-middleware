@@ -2719,9 +2719,16 @@ type AuthEvidenceRecord struct {
 	AuthStatus   string
 	KeyVersion   string
 	Destination  string
+
+	// When the observer saw this, as seconds since 1970.
+	// Nil when the record did not carry a time; the database then uses its own.
+	ObservedAt *float64
 }
 
 // StoreAuthEvidence saves one record.
+//
+// observed_at is the time the observer saw the request, not the time we stored
+// it. Those differ whenever anything is slow, and the first one is the truth.
 //
 // Records arrive while a run is still in flight, long before its signed chain
 // lands, so nothing is attached to an interaction here. That happens at read
@@ -2731,11 +2738,12 @@ func (d *DB) StoreAuthEvidence(r *AuthEvidenceRecord, orgID string) error {
 	_, err := d.conn.Exec(`
 		INSERT INTO auth_evidence
 		  (request_id, source, run_id, auth_method, credential_id, identity_id,
-		   auth_status, key_version, destination, organization_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		   auth_status, key_version, destination, organization_id, observed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+		        COALESCE(to_timestamp($11), NOW()))
 		ON CONFLICT (request_id, source) DO NOTHING`,
 		r.RequestID, r.Source, r.RunID, r.AuthMethod, r.CredentialID, r.IdentityID,
-		r.AuthStatus, r.KeyVersion, r.Destination, orgID,
+		r.AuthStatus, r.KeyVersion, r.Destination, orgID, r.ObservedAt,
 	)
 	return err
 }
