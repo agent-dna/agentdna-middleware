@@ -1429,6 +1429,75 @@ func (d *DB) SetProvenanceReqID(intentID, reqID string) error {
 	return err
 }
 
+// toolAgentPair is one (agent, tool) combination touched by interactions
+// that are about to be deleted — captured before the delete so
+// pruneToolAgentsList can tell afterward whether the pair has any
+// interaction left at all.
+type toolAgentPair struct {
+	agentDID, toolDID string
+}
+
+// collectToolAgentPairs finds every distinct (initiator_did, interacted_to_did)
+// pair, restricted to interactions whose target is a registered tool, matching
+// the given WHERE clause. Must be called (within tx) before the matching
+// interactions are deleted.
+func collectToolAgentPairs(tx *sql.Tx, whereCol, whereVal string) ([]toolAgentPair, error) {
+	rows, err := tx.Query(`
+		SELECT DISTINCT ni.initiator_did, ni.interacted_to_did
+		FROM new_interactions ni
+		JOIN new_tools t ON t.did = ni.interacted_to_did
+		WHERE ni.`+whereCol+` = $1`,
+		whereVal,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pairs []toolAgentPair
+	for rows.Next() {
+		var p toolAgentPair
+		if err := rows.Scan(&p.agentDID, &p.toolDID); err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, p)
+	}
+	return pairs, rows.Err()
+}
+
+// pruneToolAgentsList drops each pair's agentDID from its tool's agents_list
+// once that agent has no interaction with the tool left at all — agents_list
+// (populated by AddAgentToToolList as interactions happen) otherwise only
+// ever grows, so an agent whose sole interaction with a tool gets deleted
+// (a failed /tx rolled back) would stay listed as having contacted it
+// forever.
+func pruneToolAgentsList(tx *sql.Tx, pairs []toolAgentPair) error {
+	for _, p := range pairs {
+		var remaining int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM new_interactions WHERE initiator_did = $1 AND interacted_to_did = $2`,
+			p.agentDID, p.toolDID,
+		).Scan(&remaining); err != nil {
+			return err
+		}
+		if remaining > 0 {
+			continue
+		}
+		if _, err := tx.Exec(`
+			UPDATE new_tools
+			SET agents_list = (
+				SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)::text
+				FROM jsonb_array_elements_text(COALESCE(NULLIF(agents_list,'')::jsonb, '[]'::jsonb)) AS elem
+				WHERE elem <> $2
+			)
+			WHERE did = $1`,
+			p.toolDID, p.agentDID,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DeleteInteractionsByIntent removes both the interaction rows and the new_intents
 // row itself for an intent — used when the /rubix/v1/tx transaction fails to
 // initiate (response status=false). Previously this only deleted new_interactions
@@ -1444,6 +1513,11 @@ func (d *DB) DeleteInteractionsByIntent(intentID string) (int64, int64, error) {
 	}
 	defer tx.Rollback() // no-op after a successful Commit
 
+	pairs, err := collectToolAgentPairs(tx, "intent_id", intentID)
+	if err != nil {
+		return 0, 0, err
+	}
+
 	res, err := tx.Exec(`DELETE FROM new_interactions WHERE intent_id = $1`, intentID)
 	if err != nil {
 		return 0, 0, err
@@ -1455,6 +1529,10 @@ func (d *DB) DeleteInteractionsByIntent(intentID string) (int64, int64, error) {
 		return 0, 0, err
 	}
 	intentsDeleted, _ := res2.RowsAffected()
+
+	if err := pruneToolAgentsList(tx, pairs); err != nil {
+		return 0, 0, err
+	}
 
 	return interactionsDeleted, intentsDeleted, tx.Commit()
 }
@@ -1476,6 +1554,11 @@ func (d *DB) DeleteInteractionsByProvenanceReqID(reqID string) (int64, int64, er
 	}
 	defer tx.Rollback() // no-op after a successful Commit
 
+	pairs, err := collectToolAgentPairs(tx, "provenance_req_id", reqID)
+	if err != nil {
+		return 0, 0, err
+	}
+
 	res, err := tx.Exec(`DELETE FROM new_interactions WHERE provenance_req_id = $1`, reqID)
 	if err != nil {
 		return 0, 0, err
@@ -1487,6 +1570,10 @@ func (d *DB) DeleteInteractionsByProvenanceReqID(reqID string) (int64, int64, er
 		return 0, 0, err
 	}
 	intentsDeleted, _ := res2.RowsAffected()
+
+	if err := pruneToolAgentsList(tx, pairs); err != nil {
+		return 0, 0, err
+	}
 
 	return interactionsDeleted, intentsDeleted, tx.Commit()
 }
