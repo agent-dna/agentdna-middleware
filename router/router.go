@@ -73,6 +73,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/observability-users", h.ObservabilityUsers)
 	dashboard.GET("/observability-user-flow", h.ObservabilityUserFlow)
 	dashboard.GET("/observability-agent-flow", h.ObservabilityAgentFlow)
+	dashboard.GET("/observability-app-flow", h.ObservabilityAppFlow)
 	dashboard.GET("/observability-intents", h.ObservabilityIntents)
 	dashboard.GET("/observability-paths", h.ObservabilityPaths)
 
