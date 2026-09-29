@@ -1059,6 +1059,227 @@ func (h *Handler) ObservabilityAgentFlow(c *gin.Context) {
 	}})
 }
 
+// ---- 4c. GET /dashboard/v1/observability-app-flow ------------------------
+//
+// The app-first mirror of observability-agent-flow: App -> Agent -> Peer
+// agents -> User -> Intent. Unlike the agent-flow endpoint, a peer's "count"
+// here is deliberately the BROAD definition (every hop touching A or the
+// peer within their shared intents), matching the spec's own worked example
+// where a peer with zero direct messages still shows a nonzero count — this
+// is intentionally different from observability-agent-flow's peer count,
+// which was corrected to direct-only hops per explicit instruction on that
+// endpoint.
+func (h *Handler) ObservabilityAppFlow(c *gin.Context) {
+	_, isAdmin, callerDID, ok := h.obsScope(c)
+	if !ok {
+		return
+	}
+	appDID := c.Query("appDID")
+	agentDID := c.Query("agentDID")
+	peerDID := c.Query("peerDID")
+	if appDID == "" || agentDID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "appDID and agentDID are required"})
+		return
+	}
+
+	octx, err := h.loadObsContext(c, obsScopeDID(isAdmin, callerDID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to load observability data: %v", err)})
+		return
+	}
+	if _, ok := octx.apps[appDID]; !ok {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "app not found"})
+		return
+	}
+	if _, ok := octx.agents[agentDID]; !ok {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "agent not found"})
+		return
+	}
+	if peerDID != "" {
+		if _, ok := octx.agents[peerDID]; !ok {
+			c.JSON(http.StatusNotFound, Response{Status: false, Message: "agent not found"})
+			return
+		}
+	}
+
+	byIntentUA := obsGroupHopsByIntent(octx.userAgentHops)
+	byIntentAA := obsGroupHopsByIntent(octx.agentAgentHops)
+	byIntentAP := obsGroupHopsByIntent(octx.agentAppHops)
+	participants := obsIntentParticipants(octx.userAgentHops, octx.agentAppHops, octx.agentAgentHops)
+
+	// App intents of P: intents with at least one agent_app hop to P, from
+	// any caller.
+	appIntents := map[string]bool{}
+	for _, hop := range octx.agentAppHops {
+		if hop.To == appDID {
+			appIntents[hop.IntentID] = true
+		}
+	}
+
+	// S(P, A): app intents of P where A took part (any hop, either side).
+	var spa []string
+	for intentID := range appIntents {
+		if participants[intentID][agentDID] {
+			spa = append(spa, intentID)
+		}
+	}
+
+	// Peers of A on P: every other agent that took part in at least one
+	// intent of S(P, A). Returned the same regardless of peerDID.
+	type peerAgg struct {
+		broadHops              []*db.ObsHop
+		intents                map[string]bool
+		directSent, directRecv int
+	}
+	peers := map[string]*peerAgg{}
+	var peerOrder []string
+	for _, intentID := range spa {
+		var intentHops []*db.ObsHop
+		intentHops = append(intentHops, byIntentUA[intentID]...)
+		intentHops = append(intentHops, byIntentAA[intentID]...)
+		intentHops = append(intentHops, byIntentAP[intentID]...)
+		for otherDID := range participants[intentID] {
+			if otherDID == agentDID {
+				continue
+			}
+			p, exists := peers[otherDID]
+			if !exists {
+				p = &peerAgg{intents: map[string]bool{}}
+				peers[otherDID] = p
+				peerOrder = append(peerOrder, otherDID)
+			}
+			p.intents[intentID] = true
+			for _, hop := range intentHops {
+				if hop.From == agentDID || hop.To == agentDID || hop.From == otherDID || hop.To == otherDID {
+					p.broadHops = append(p.broadHops, hop)
+				}
+				if hop.From == agentDID && hop.To == otherDID {
+					p.directSent++
+				}
+				if hop.From == otherDID && hop.To == agentDID {
+					p.directRecv++
+				}
+			}
+		}
+	}
+	sort.Strings(peerOrder)
+	peersOut := make([]gin.H, 0, len(peerOrder))
+	for _, peer := range peerOrder {
+		p := peers[peer]
+		name, revoked := "", false
+		if info := octx.agents[peer]; info != nil {
+			name, revoked = info.Name, info.Revoked
+		}
+		var direct any
+		if p.directSent > 0 || p.directRecv > 0 {
+			direct = gin.H{"sent": p.directSent, "received": p.directRecv}
+		}
+		summary := obsSummarizeHops(p.broadHops)
+		peersOut = append(peersOut, gin.H{
+			"agentDID":     peer,
+			"agentName":    name,
+			"handle":       name,
+			"revoked":      revoked,
+			"direct":       direct,
+			"intentsCount": len(p.intents),
+			"count":        summary.Count,
+			"allowed":      summary.Allowed,
+			"elevated":     summary.Elevated,
+			"flagged":      summary.Flagged,
+			"outcome":      summary.Outcome,
+			"lastAt":       summary.LastAt,
+			"policies":     summary.Policies,
+		})
+	}
+
+	// Users: only filled when peerDID is set — initiators of S(P, A, B).
+	usersOut := []gin.H{}
+	usersTotal := 0
+	if peerDID != "" {
+		var spab []string
+		if p, ok := peers[peerDID]; ok {
+			for intentID := range p.intents {
+				spab = append(spab, intentID)
+			}
+		}
+
+		type userAgg struct {
+			hops    []*db.ObsHop
+			intents map[string]bool
+		}
+		userAggs := map[string]*userAgg{}
+		var userOrder []string
+		for _, intentID := range spab {
+			initiator := octx.intentInitiator[intentID]
+			if initiator == "" {
+				continue
+			}
+			u, exists := userAggs[initiator]
+			if !exists {
+				u = &userAgg{intents: map[string]bool{}}
+				userAggs[initiator] = u
+				userOrder = append(userOrder, initiator)
+			}
+			u.intents[intentID] = true
+			u.hops = append(u.hops, byIntentUA[intentID]...)
+			u.hops = append(u.hops, byIntentAA[intentID]...)
+			u.hops = append(u.hops, byIntentAP[intentID]...)
+		}
+		usersTotal = len(userOrder)
+
+		type userRow struct {
+			did          string
+			summary      obsHopSummary
+			intentsCount int
+		}
+		rows := make([]userRow, 0, len(userOrder))
+		for _, did := range userOrder {
+			u := userAggs[did]
+			rows = append(rows, userRow{did: did, summary: obsSummarizeHops(u.hops), intentsCount: len(u.intents)})
+		}
+		sort.Slice(rows, func(i, j int) bool { return rows[i].summary.LastAt > rows[j].summary.LastAt })
+		const usersCap = 200
+		if len(rows) > usersCap {
+			rows = rows[:usersCap]
+		}
+		for _, r := range rows {
+			name, email := "", ""
+			if info := octx.users[r.did]; info != nil {
+				name, email = info.Name, info.Email
+			}
+			usersOut = append(usersOut, gin.H{
+				"userDID":      r.did,
+				"userName":     name,
+				"email":        email,
+				"subtitle":     email,
+				"kind":         "human",
+				"signed":       true,
+				"intentsCount": r.intentsCount,
+				"count":        r.summary.Count,
+				"allowed":      r.summary.Allowed,
+				"elevated":     r.summary.Elevated,
+				"flagged":      r.summary.Flagged,
+				"outcome":      r.summary.Outcome,
+				"lastAt":       r.summary.LastAt,
+				"policies":     r.summary.Policies,
+			})
+		}
+	}
+
+	var peerDIDOut any
+	if peerDID != "" {
+		peerDIDOut = peerDID
+	}
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
+		"appDID":     appDID,
+		"agentDID":   agentDID,
+		"peerDID":    peerDIDOut,
+		"peers":      peersOut,
+		"users":      usersOut,
+		"usersTotal": usersTotal,
+	}})
+}
+
 // ---- 5. GET /dashboard/v1/observability-intents -------------------------
 
 func (h *Handler) ObservabilityIntents(c *gin.Context) {
@@ -1407,10 +1628,12 @@ func (h *Handler) ObservabilityPaths(c *gin.Context) {
 	}
 
 	// Both userDID and agentDID picked -> one row per (user,agent,app,intent).
-	// Otherwise -> one row per (user,agent,app), summed across intents. When
-	// both agentDID and peerDID are set, per-intent grain also applies (one
-	// row per (user,agent,peer,app,intent)) even without userDID.
-	collapse := !(fUser != "" && fAgent != "") && !(fAgent != "" && fPeer != "")
+	// Otherwise -> one row per (user,agent,app), summed across intents.
+	// Per-intent grain also applies whenever agentDID is set together with
+	// either peerDID or appDID — an app-first selection (appDID+agentDID, no
+	// user picked yet) needs intent-level rows just as much as a user-first
+	// one does, otherwise it collapses to coarse rows with no user to key on.
+	collapse := !(fUser != "" && fAgent != "") && !(fAgent != "" && fPeer != "") && !(fAgent != "" && fApp != "")
 
 	type rowKey struct{ userDID, agentDID, peerDID, appDID, intentID string }
 	type rowAgg struct {
