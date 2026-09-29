@@ -19,6 +19,10 @@ type authEvidenceInput struct {
 	AuthStatus   string  `json:"auth_status"`
 	KeyVersion   string  `json:"key_version"`
 	Destination  string  `json:"destination"`
+
+	// Seconds since 1970, from the observer's own clock. A pointer so a
+	// record that leaves it out is stored with the database's time instead.
+	ObservedAt *float64 `json:"observed_at"`
 }
 
 // StoreAuthEvidence takes authentication evidence from an observation point.
@@ -62,6 +66,7 @@ func (h *Handler) StoreAuthEvidence(c *gin.Context) {
 			AuthStatus:   in.AuthStatus,
 			KeyVersion:   in.KeyVersion,
 			Destination:  in.Destination,
+			ObservedAt:   in.ObservedAt,
 		}
 		if err := h.db.StoreAuthEvidence(record, user.OrgID); err == nil {
 			stored++

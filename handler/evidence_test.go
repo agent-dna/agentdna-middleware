@@ -34,6 +34,26 @@ func TestTheSdkRecordParses(t *testing.T) {
 	if got.IdentityID == nil || *got.IdentityID == "" {
 		t.Error("identity_id should have been read")
 	}
+	// The observer's own clock. Without this the row gets the time it was
+	// stored, which is a different thing whenever anything is slow.
+	if got.ObservedAt == nil {
+		t.Fatal("observed_at should have been read")
+	}
+	if *got.ObservedAt != 1789119652.8996422 {
+		t.Errorf("want 1789119652.8996422, got %v", *got.ObservedAt)
+	}
+}
+
+// A record with no time is still storable. The database fills one in.
+func TestAMissingTimeIsAllowed(t *testing.T) {
+	var got authEvidenceInput
+	body := `{"request_id":"s","source":"server_in"}`
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ObservedAt != nil {
+		t.Errorf("want nil, got %v", *got.ObservedAt)
+	}
 }
 
 // An opaque credential sends identity_id as null. It must stay nil, not become
