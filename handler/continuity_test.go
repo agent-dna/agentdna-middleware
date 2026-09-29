@@ -299,14 +299,48 @@ func TestTheHopIsDescribedByAWireRecordWhateverTheOrder(t *testing.T) {
 	}
 }
 
-// Only the outbound leg was observed. It is the wrong leg, but reporting it is
-// better than reporting nothing at all.
-func TestTheOutboundLegAloneStillDescribesSomething(t *testing.T) {
+// Only the outbound leg was observed. That key is the server's, not the
+// caller's, so it is listed as a backend call and the hop's own credential
+// stays empty - it must not start or change the run's identity.
+func TestTheOutboundLegAloneIsABackendCallNotTheHopsCredential(t *testing.T) {
 	got := evidenceForHop([]*db.AuthEvidenceRecord{
-		{Source: "server_out", CredentialID: "cred-service-account", AuthMethod: "api_key"},
+		{Source: "server_out", CredentialID: "cred-service-account", AuthMethod: "api_key", Destination: "api.github.com"},
 	})
 
-	if got.Status != EvidenceObserved || got.CredentialID != "cred-service-account" {
-		t.Errorf("want observed with the outbound credential, got %+v", got)
+	if got.Status != EvidenceObserved || got.CredentialID != "" || got.AuthMethod != "" {
+		t.Errorf("want observed with no credential of its own, got %+v", got)
+	}
+	if len(got.BackendCalls) != 1 || got.BackendCalls[0].CredentialID != "cred-service-account" {
+		t.Errorf("want the outbound credential as a backend call, got %+v", got.BackendCalls)
+	}
+
+	continuity := analyseContinuity([]hopRef{hop("i-1", "sig-1")}, map[string]HopEvidence{"i-1": got})
+	if continuity.StartingCredential != "" || continuity.RequestsObserved != 0 {
+		t.Errorf("a backend key must not start the run, got %+v", continuity)
+	}
+}
+
+// The first real run: one tool call, and the server made two backend calls -
+// one to GitHub with its own token. Both are shown, in a stable order.
+func TestEveryBackendCallOfAHopIsShown(t *testing.T) {
+	got := evidenceForHop([]*db.AuthEvidenceRecord{
+		{Source: "server_out", Destination: "api.github.com", AuthMethod: "bearer_opaque", CredentialID: "cred-github", AuthStatus: "accepted"},
+		{Source: "client_out", Destination: "127.0.0.1", AuthMethod: "none"},
+		{Source: "server_out", Destination: "analytics.internal", AuthMethod: "api_key", CredentialID: "cred-analytics", AuthStatus: "rejected"},
+		{Source: "server_in", Destination: "did:mcp-server", AuthMethod: "none"},
+	})
+
+	if len(got.BackendCalls) != 2 {
+		t.Fatalf("want 2 backend calls, got %+v", got.BackendCalls)
+	}
+	if got.BackendCalls[0].Destination != "analytics.internal" || got.BackendCalls[1].Destination != "api.github.com" {
+		t.Errorf("want calls sorted by destination, got %+v", got.BackendCalls)
+	}
+	if got.BackendCalls[1].CredentialID != "cred-github" || got.BackendCalls[1].AuthStatus != "accepted" {
+		t.Errorf("the GitHub call lost its details: %+v", got.BackendCalls[1])
+	}
+	if want := []string{"client_out", "server_in", "server_out"}; len(got.Sources) != 3 ||
+		got.Sources[0] != want[0] || got.Sources[1] != want[1] || got.Sources[2] != want[2] {
+		t.Errorf("each source listed once, got %v", got.Sources)
 	}
 }

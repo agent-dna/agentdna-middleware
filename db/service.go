@@ -2732,8 +2732,8 @@ type AuthEvidenceRecord struct {
 //
 // Records arrive while a run is still in flight, long before its signed chain
 // lands, so nothing is attached to an interaction here. That happens at read
-// time in GetAuthEvidenceByIntent. Re-sending the same (request_id, source) is
-// a no-op rather than an error.
+// time in GetAuthEvidenceByIntent. Re-sending the same (request_id, source,
+// destination) is a no-op rather than an error.
 func (d *DB) StoreAuthEvidence(r *AuthEvidenceRecord, orgID string) error {
 	_, err := d.conn.Exec(`
 		INSERT INTO auth_evidence
@@ -2741,7 +2741,7 @@ func (d *DB) StoreAuthEvidence(r *AuthEvidenceRecord, orgID string) error {
 		   auth_status, key_version, destination, organization_id, observed_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
 		        COALESCE(to_timestamp($11), NOW()))
-		ON CONFLICT (request_id, source) DO NOTHING`,
+		ON CONFLICT (request_id, source, destination) DO NOTHING`,
 		r.RequestID, r.Source, r.RunID, r.AuthMethod, r.CredentialID, r.IdentityID,
 		r.AuthStatus, r.KeyVersion, r.Destination, orgID, r.ObservedAt,
 	)

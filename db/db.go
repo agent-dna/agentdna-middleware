@@ -359,9 +359,11 @@ func New(dsn string) *DB {
 		-- nothing having been observed. Collapsing the two makes the analysis
 		-- claim an identity change it never saw.
 		--
-		-- The key is (request_id, source): one request is seen by more than one
-		-- point - a server records what arrived and what it then sent onward -
-		-- and without the source in the key those would overwrite each other.
+		-- The key is (request_id, source, destination). One request is seen by
+		-- more than one point - a server records what arrived and what it then
+		-- sent onward - and one server can call several backends while serving
+		-- it. Without source and destination in the key, all but the first of
+		-- those rows would be dropped.
 		CREATE TABLE IF NOT EXISTS auth_evidence (
 			request_id      TEXT NOT NULL,
 			source          TEXT NOT NULL,
@@ -374,7 +376,7 @@ func New(dsn string) *DB {
 			destination     TEXT DEFAULT '',
 			organization_id TEXT DEFAULT '',
 			observed_at     TIMESTAMPTZ DEFAULT NOW(),
-			PRIMARY KEY (request_id, source)
+			PRIMARY KEY (request_id, source, destination)
 		);
 		CREATE INDEX IF NOT EXISTS auth_evidence_run_idx ON auth_evidence (run_id);
 	`)
