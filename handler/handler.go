@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"agentdna-ratelimit-auth/db"
+	"agentdna-ratelimit-auth/email"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -9,6 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 	"io"
 	"log"
 	"math/big"
@@ -20,13 +26,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"agentdna-ratelimit-auth/db"
-	"agentdna-ratelimit-auth/email"
-	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
-	"golang.org/x/crypto/bcrypt"
 )
 
 func enableCors(w *http.ResponseWriter) {
@@ -54,13 +53,33 @@ const (
 type provenanceCtxKey string
 
 const (
-	// ctxIntentIDKey carries the intentID generated while handling a /tx intent
-	// workflow so the /tx response hook can attach provenance_req_id to those rows.
+	// ctxIntentIDKey carries the *branchWriteResult produced while handling a
+	// /tx intent workflow so the /tx response hook knows exactly which rows
+	// this call just inserted (or relabeled), for a possible rollback or for
+	// tracking under the /tx response's result.id.
 	ctxIntentIDKey provenanceCtxKey = "provenance_intent_id"
 	// ctxSignatureIDKey carries the id from a /signature request body so the
-	// /signature response hook knows which provenance rows to update.
+	// /signature response hook knows which pending branch to resolve.
 	ctxSignatureIDKey provenanceCtxKey = "provenance_signature_id"
 )
+
+// branchWriteResult is what handleIntentWorkflow produces for one txn: the
+// intent (nftId) it belongs to, and exactly which interaction rows this call
+// inserted or relabeled — the information needed to either track the txn
+// under its eventual /tx response id (for a possible /signature rollback) or
+// roll it back immediately if /tx itself reports failure.
+type branchWriteResult struct {
+	IntentID    string
+	InsertedIDs []string
+	Renamed     []db.RenamedInteractionID
+}
+
+// isEmpty reports whether this call inserted or relabeled nothing at all —
+// i.e. the txn was a fully duplicate replay of hops already stored for this
+// intent, so there's nothing to roll back or track.
+func (b *branchWriteResult) isEmpty() bool {
+	return b == nil || (len(b.InsertedIDs) == 0 && len(b.Renamed) == 0)
+}
 
 type Handler struct {
 	db                  *db.DB
@@ -366,15 +385,17 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 				case NFTTypeAgent:
 					h.handleAgentNFT(nftInfo)
 				case NFTTypeIntent:
-					// Stash the generated intentID so the /tx response hook can attach
-					// provenance_req_id to the interaction rows we just inserted. Harmless
-					// on non-/tx paths — only captureTxResponse (path-gated) reads it.
-					intentID, wfErr := h.handleIntentWorkflow(nftInfo)
-					if wfErr == nil && intentID != "" {
-						log.Printf("[provenance] tx: captured intent_id=%s, stashing in context", intentID)
-						r = r.WithContext(context.WithValue(r.Context(), ctxIntentIDKey, intentID))
+					// Stash what this call wrote so the /tx response hook can either
+					// roll it back (status=false) or track it under the response's
+					// result.id for a possible /signature-time rollback. Harmless on
+					// non-/tx paths — only captureTxResponse (path-gated) reads it.
+					branch, wfErr := h.handleIntentWorkflow(nftInfo)
+					if wfErr == nil && branch != nil {
+						log.Printf("[provenance] tx: captured intent_id=%s inserted=%d renamed=%d, stashing in context",
+							branch.IntentID, len(branch.InsertedIDs), len(branch.Renamed))
+						r = r.WithContext(context.WithValue(r.Context(), ctxIntentIDKey, branch))
 					} else {
-						log.Printf("[provenance] tx: FAILED to capture intent_id wfErr=%v intentID=%q", wfErr, intentID)
+						log.Printf("[provenance] tx: FAILED to capture intent workflow wfErr=%v", wfErr)
 					}
 				}
 			}
@@ -423,14 +444,17 @@ func readAndRestoreBody(resp *http.Response) ([]byte, error) {
 	return body, nil
 }
 
-// captureTxResponse handles POST /rubix/v1/tx: it stores result.id as provenance_req_id
-// on the intent's interaction rows, or deletes those rows if the tx failed to initiate.
+// captureTxResponse handles POST /rubix/v1/tx: on success it records what this
+// call wrote under the response's result.id, so a later /signature failure can
+// find and roll it back; on failure (status=false) it rolls those rows back
+// immediately, since there will be no /signature call to do it later.
 func (h *Handler) captureTxResponse(resp *http.Response) {
-	intentID, _ := resp.Request.Context().Value(ctxIntentIDKey).(string)
-	if intentID == "" {
-		log.Printf("[provenance] tx: no intent_id in context, skipping (not an intent-workflow tx we're tracking)")
+	branch, _ := resp.Request.Context().Value(ctxIntentIDKey).(*branchWriteResult)
+	if branch == nil {
+		log.Printf("[provenance] tx: no branch result in context, skipping (not an intent-workflow tx we're tracking)")
 		return
 	}
+	intentID := branch.IntentID
 
 	body, err := readAndRestoreBody(resp)
 	if err != nil {
@@ -444,12 +468,17 @@ func (h *Handler) captureTxResponse(resp *http.Response) {
 		return
 	}
 
-	// status=false → the transaction failed to initiate; remove the intent and
-	// interaction rows we inserted during request handling.
+	// status=false → the transaction failed to initiate; remove exactly the
+	// rows this call inserted/relabeled (not the whole intent, which may
+	// already carry other branches from earlier successful txns).
 	if !txResp.Status {
-		interactionsDeleted, intentsDeleted, err := h.db.DeleteInteractionsByIntent(intentID)
+		if branch.isEmpty() {
+			log.Printf("[provenance] tx: status=false intent_id=%s but this txn was a fully duplicate replay — nothing to roll back", intentID)
+			return
+		}
+		interactionsDeleted, intentsDeleted, err := h.db.RollbackBranch(intentID, branch.InsertedIDs, branch.Renamed)
 		if err != nil {
-			log.Printf("[provenance] tx: delete failed intent_id=%s: %v", intentID, err)
+			log.Printf("[provenance] tx: rollback failed intent_id=%s: %v", intentID, err)
 		} else {
 			log.Printf("[provenance] tx: status=false, rolled back intent_id=%s interactions_deleted=%d intents_deleted=%d",
 				intentID, interactionsDeleted, intentsDeleted)
@@ -461,16 +490,21 @@ func (h *Handler) captureTxResponse(resp *http.Response) {
 		log.Printf("[provenance] tx: empty result.id intent_id=%s", intentID)
 		return
 	}
-	log.Printf("[provenance] tx: updating provenance_req_id intent_id=%s req_id=%s", intentID, txResp.Result.ID)
-	if err := h.db.SetProvenanceReqID(intentID, txResp.Result.ID); err != nil {
-		log.Printf("[provenance] tx: set provenance_req_id failed intent_id=%s req_id=%s: %v", intentID, txResp.Result.ID, err)
+	if branch.isEmpty() {
+		log.Printf("[provenance] tx: intent_id=%s fully duplicate replay, not tracking req_id=%s", intentID, txResp.Result.ID)
 		return
 	}
-	log.Printf("[provenance] tx: provenance_req_id updated ok intent_id=%s req_id=%s", intentID, txResp.Result.ID)
+	if err := h.db.InsertPendingBranch(txResp.Result.ID, intentID, branch.InsertedIDs, branch.Renamed); err != nil {
+		log.Printf("[provenance] tx: track pending branch failed intent_id=%s req_id=%s: %v", intentID, txResp.Result.ID, err)
+		return
+	}
+	log.Printf("[provenance] tx: pending branch tracked ok intent_id=%s req_id=%s", intentID, txResp.Result.ID)
 }
 
-// captureSignatureResponse handles POST /rubix/v1/signature: it writes transactionID
-// and the first childNFTId onto the rows previously tagged with provenance_req_id.
+// captureSignatureResponse handles POST /rubix/v1/signature: success just
+// stops tracking the txn (the rows were already correct from insert time —
+// intent_id is the nftId, not this txn's transactionID, so there's nothing to
+// rewrite); failure rolls back whatever this txn wrote.
 func (h *Handler) captureSignatureResponse(resp *http.Response) {
 	reqID, _ := resp.Request.Context().Value(ctxSignatureIDKey).(string)
 	if reqID == "" {
@@ -515,40 +549,32 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 		return
 	}
 
-	log.Printf("[provenance] signature: updating provenance_record req_id=%s transactionID=%s childNFTId=%s", reqID, transactionID, childNFTId)
-	rows, err := h.db.SetProvenanceRecord(reqID, transactionID, childNFTId)
-	if err != nil {
-		log.Printf("[provenance] signature: update failed req_id=%s: %v", reqID, err)
+	if err := h.db.DeletePendingBranch(reqID); err != nil {
+		log.Printf("[provenance] signature: clearing pending branch failed req_id=%s: %v", reqID, err)
 		return
 	}
-
-	if rows == 0 {
-		log.Printf("[provenance] signature: no rows matched provenance_req_id=%s (tx write pending?)", reqID)
-		return
-	}
-	log.Printf("[provenance] signature: provenance_record updated ok rows=%d req_id=%s transactionID=%s childNFTId=%s",
-		rows, reqID, transactionID, childNFTId)
+	log.Printf("[provenance] signature: confirmed ok req_id=%s transactionID=%s childNFTId=%s", reqID, transactionID, childNFTId)
 }
 
-// rollbackFailedProvenance deletes the interaction rows and their parent intent
-// tagged with reqID — called wherever /rubix/v1/signature makes it clear this txn
-// will never get a provenance_record_id, so nothing lingers looking like a normal,
-// successfully-provenanced intent/interaction.
+// rollbackFailedProvenance rolls back exactly the rows tracked under reqID —
+// called wherever /rubix/v1/signature makes it clear this txn will never be
+// confirmed, so nothing lingers looking like a normal, successful branch.
 func (h *Handler) rollbackFailedProvenance(reqID, reason string) {
-	interactionsDeleted, intentsDeleted, err := h.db.DeleteInteractionsByProvenanceReqID(reqID)
+	interactionsDeleted, intentsDeleted, found, err := h.db.RollbackPendingBranch(reqID)
 	if err != nil {
 		log.Printf("[provenance] signature: rollback failed req_id=%s reason=%q: %v", reqID, reason, err)
 		return
 	}
+	if !found {
+		// Nothing was ever tracked under this reqID — either the /tx hook never
+		// ran for it, or this rollback fired twice (DeletePendingBranch/
+		// RollbackPendingBranch already removed the row the first time).
+		log.Printf("[provenance] signature: WARNING rollback req_id=%s matched no pending branch — nothing was tracked under this req_id", reqID)
+		return
+	}
 	log.Printf("[provenance] signature: rollback complete req_id=%s reason=%q interactions_deleted=%d intents_deleted=%d",
 		reqID, reason, interactionsDeleted, intentsDeleted)
-	if interactionsDeleted == 0 && intentsDeleted == 0 {
-		// Nothing matched provenance_req_id at all — either SetProvenanceReqID never ran
-		// for this reqID (the /tx hook missed it), or this rollback fired twice.
-		log.Printf("[provenance] signature: WARNING rollback req_id=%s matched 0 rows in both tables — nothing was tagged with this provenance_req_id, so the intent/interactions (if any) are still sitting there untouched", reqID)
-	}
 }
-
 
 func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 	log.Printf("[agentNFT] received nft_id=%s", nftInfo.NFTId)
@@ -572,20 +598,30 @@ func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 	return h.db.UpsertAgentFromNFT(nftInfo.NFTId, data.AgentDID, deployer, orgID, data.Policy, agentName)
 }
 
-// handleIntentWorkflow stores the intent-workflow interactions and returns the
-// generated intentID so the caller can correlate the /tx response for provenance.
-func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
+// handleIntentWorkflow stores the intent-workflow interactions and returns
+// what this call wrote (intent id plus inserted/relabeled interaction ids) so
+// the caller can correlate the /tx response for provenance and roll back
+// precisely this call's contribution if the txn ultimately fails.
+func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, error) {
 	data, err := parseIntentWorkflow(nftInfo.Data)
 	if err != nil {
 		log.Printf("[intentWorkflow] failed to parse nft_id=%s: %v", nftInfo.NFTId, err)
-		return "", err
+		return nil, err
 	}
 	if data.Envelope == nil {
 		log.Printf("[intentWorkflow] envelope is nil nft_id=%s", nftInfo.NFTId)
-		return "", fmt.Errorf("handleIntentWorkflow: envelope is nil")
+		return nil, fmt.Errorf("handleIntentWorkflow: envelope is nil")
 	}
 
-	intentID := uuid.New().String()
+	// intent_id is the workflow's nft/content id (data.id) — the same value
+	// across every txn belonging to this logical intent, including ones that
+	// share a common hop prefix and then branch. Falls back to a random id
+	// only for malformed data that's missing it, so ingestion doesn't crash.
+	intentID := data.Id
+	if intentID == "" {
+		intentID = uuid.New().String()
+		log.Printf("[intentWorkflow] WARNING data.id missing nft_id=%s, falling back to random intent_id=%s", nftInfo.NFTId, intentID)
+	}
 	orgID := h.orgID
 
 	// All envelope nodes sorted oldest→newest.
@@ -654,7 +690,19 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		msg := extractPayloadText(env.Payload)
 		threat := env.Code != 0 && env.Code != 1000
 
-		blockID := fmt.Sprintf("%s-block-%d", intentID, idx)
+		// Keyed by the envelope's own hash rather than idx: idx is only this
+		// call's local position in its own DAG walk, and since intent_id is
+		// now shared across every txn/branch of one nftId, two different
+		// txns' envelopes can land on the same idx. A hash-based id is stable
+		// and collision-free across calls — the same envelope reappearing in
+		// a later txn's shared prefix maps to the same id (safe no-op via
+		// ON CONFLICT DO NOTHING below), while two different envelopes never
+		// collide.
+		blockIDSuffix := env.Hash
+		if blockIDSuffix == "" {
+			blockIDSuffix = fmt.Sprintf("idx%d", idx)
+		}
+		blockID := fmt.Sprintf("%s-block-%s", intentID, blockIDSuffix)
 		blockRec := &db.IntentBlockRecord{
 			ID:             blockID,
 			IntentID:       intentID,
@@ -715,7 +763,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 			if env.Hash != "" && hashToThreatID[env.Hash] != "" {
 				log.Printf("[intentWorkflow] skipping duplicate threat idx=%d code=%d hash=%s (already recorded)", idx, env.Code, env.Hash)
 			} else {
-				threatID := fmt.Sprintf("%s-threat-%d", intentID, idx)
+				threatID := fmt.Sprintf("%s-threat-%s", intentID, blockIDSuffix)
 				if err := h.db.StoreThreat(threatID, intentID, blockID, env.Code, threatMsg, time.Unix(env.Epoch, 0).UTC()); err != nil {
 					log.Printf("[intentWorkflow] StoreThreat idx=%d code=%d: %v", idx, env.Code, err)
 				} else {
@@ -789,23 +837,43 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		}
 	}
 
-	// ── Store interactions ───────────────────────────────────────────────────
+	// ── Work out what's actually new in this txn ─────────────────────────────
+	// intent_id is now shared across every txn/branch of one nftId, so a
+	// second (or later) txn for the same intent may repeat a shared hop
+	// prefix verbatim before diverging — resolveBranchIDs compares this txn's
+	// hop sequence against what's already stored and decides: nothing new
+	// (fully duplicate replay), a plain trunk extension, or a genuine fork
+	// (optionally relabeling the existing trunk tail into branch "a" the
+	// first time a fork is discovered at a given position).
+	existingHops, err := h.db.GetIntentHops(intentID)
+	if err != nil {
+		return nil, fmt.Errorf("handleIntentWorkflow: GetIntentHops: %v", err)
+	}
+	isNewIntent := len(existingHops) == 0
+	assignment := resolveBranchIDs(intentID, existingHops, interactions)
+
+	for _, r := range assignment.Renamed {
+		if err := h.db.RenameInteractionID(r.From, r.To); err != nil {
+			return nil, fmt.Errorf("handleIntentWorkflow: RenameInteractionID %s->%s: %v", r.From, r.To, err)
+		}
+		log.Printf("[intentWorkflow] relabeled trunk row into branch %s -> %s", r.From, r.To)
+	}
+
+	// ── Store only the newly-discovered interactions ─────────────────────────
 	threatDetected := false
-	interactionIDs := make([]string, 0, len(interactions))
-	for idx, ix := range interactions {
-		iid := fmt.Sprintf("%s-%d", intentID, idx+1)
-		interactionIDs = append(interactionIDs, iid)
+	for i, iid := range assignment.InsertIDs {
+		ix := interactions[assignment.FirstNew+i]
 		if ix.Threat {
 			threatDetected = true
 		}
 		eventTime := time.Unix(ix.Epoch, 0).UTC()
 		threatID := hashToThreatID[ix.Hash]
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, threatID, eventTime,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, ix.Hash, threatID, eventTime,
 		); err != nil {
-			return "", fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
+			return nil, fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
 		}
-		log.Printf("[intentWorkflow] interaction[%d] from=%s to=%s type=%s threat=%v", idx, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
+		log.Printf("[intentWorkflow] interaction id=%s from=%s to=%s type=%s threat=%v", iid, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
 
 		// If this interaction's target is a registered tool, record that the
 		// initiating agent has contacted it.
@@ -816,14 +884,45 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		}
 	}
 
-	// ── Store intent ─────────────────────────────────────────────────────────
-	flowType := detectFlowTypeFromExtracts(interactions)
-	if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, len(allEnvelopes), threatDetected, interactionIDs); err != nil {
-		log.Printf("[intentWorkflow] intent save error: %v", err)
-		return "", err
+	branch := &branchWriteResult{IntentID: intentID, InsertedIDs: assignment.InsertIDs, Renamed: assignment.Renamed}
+	if branch.isEmpty() {
+		log.Printf("[intentWorkflow] intent_id=%s: this txn was a fully duplicate replay of hops already stored, nothing new to save", intentID)
+		return branch, nil
 	}
-	log.Printf("[intentWorkflow] saved intent_id=%s interactions=%d threat=%v flowType=%s", intentID, len(interactionIDs), threatDetected, flowType)
-	return intentID, nil
+
+	// ── Store/merge the intent row ───────────────────────────────────────────
+	// interaction_ids reflects every hop stored for this intent across every
+	// branch — existing rows (with any rename applied) plus what this call
+	// just inserted — not just this txn's own contribution.
+	renameMap := make(map[string]string, len(assignment.Renamed))
+	for _, r := range assignment.Renamed {
+		renameMap[r.From] = r.To
+	}
+	allInteractionIDs := make([]string, 0, len(existingHops)+len(assignment.InsertIDs))
+	for _, row := range existingHops {
+		id := row.InteractionID
+		if newID, ok := renameMap[id]; ok {
+			id = newID
+		}
+		allInteractionIDs = append(allInteractionIDs, id)
+	}
+	allInteractionIDs = append(allInteractionIDs, assignment.InsertIDs...)
+
+	flowType := detectFlowTypeFromExtracts(interactions)
+	if isNewIntent {
+		if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, len(allEnvelopes), threatDetected, allInteractionIDs); err != nil {
+			log.Printf("[intentWorkflow] intent save error: %v", err)
+			return nil, err
+		}
+	} else {
+		if err := h.db.MergeIntentBranch(intentID, len(allEnvelopes), threatDetected, allInteractionIDs); err != nil {
+			log.Printf("[intentWorkflow] intent merge error: %v", err)
+			return nil, err
+		}
+	}
+	log.Printf("[intentWorkflow] saved intent_id=%s new_interactions=%d total_interactions=%d threat=%v flowType=%s",
+		intentID, len(assignment.InsertIDs), len(allInteractionIDs), threatDetected, flowType)
+	return branch, nil
 }
 
 func (h *Handler) GetIntentBlockData(c *gin.Context) {
@@ -1034,9 +1133,7 @@ func (h *Handler) Signup(c *gin.Context) {
 		return
 	}
 
-
-
-	if err := h.db.StoreOrgUser( req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
+	if err := h.db.StoreOrgUser(req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register user: %v", err)})
 		return
 	}
@@ -1251,18 +1348,18 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"agentCount":                metrics.AgentCount,
-			"intentCount":               metrics.IntentCount,
-			"interactionsCount":         metrics.InteractionsCount,
-			"threatCount":               metrics.ThreatCount,
-			"appCount":                  metrics.AppCount,
-			"agentCount24hChange":       metrics.AgentCount24hChange,
-			"intentCount24hChange":      metrics.IntentCount24hChange,
+			"agentCount":                 metrics.AgentCount,
+			"intentCount":                metrics.IntentCount,
+			"interactionsCount":          metrics.InteractionsCount,
+			"threatCount":                metrics.ThreatCount,
+			"appCount":                   metrics.AppCount,
+			"agentCount24hChange":        metrics.AgentCount24hChange,
+			"intentCount24hChange":       metrics.IntentCount24hChange,
 			"interactionsCount24hChange": metrics.InteractionsCount24hChange,
-			"threatCount24hChange":      metrics.ThreatCount24hChange,
-			"appCount24hChange":         metrics.AppCount24hChange,
-			"agentList":                 agentList,
-			"flowEnabled":               metrics.AgentCount > 0,
+			"threatCount24hChange":       metrics.ThreatCount24hChange,
+			"appCount24hChange":          metrics.AppCount24hChange,
+			"agentList":                  agentList,
+			"flowEnabled":                metrics.AgentCount > 0,
 		},
 	})
 }
@@ -2126,39 +2223,35 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 	}
 
 	type interactionOut struct {
-		InteractionID      string `json:"interactionID"`
-		Initiator          string `json:"initiator"`
-		InitiatorName      string `json:"initiatorName"`
-		To                 string `json:"to"`
-		ToName             string `json:"toName"`
-		Type               string `json:"type"`
-		Message            string `json:"message"`
-		IntentID           string `json:"intentID"`
-		Threat             bool   `json:"threat"`
-		ThreatID           string `json:"threatID"`
-		Epoch              int64  `json:"epoch"`
-		Signature          string `json:"signature"`
-		ProvenanceReqID    string `json:"provenanceReqID"`
-		ProvenanceRecordID string `json:"provenanceRecordID"`
+		InteractionID string `json:"interactionID"`
+		Initiator     string `json:"initiator"`
+		InitiatorName string `json:"initiatorName"`
+		To            string `json:"to"`
+		ToName        string `json:"toName"`
+		Type          string `json:"type"`
+		Message       string `json:"message"`
+		IntentID      string `json:"intentID"`
+		Threat        bool   `json:"threat"`
+		ThreatID      string `json:"threatID"`
+		Epoch         int64  `json:"epoch"`
+		Signature     string `json:"signature"`
 	}
 
 	list := make([]interactionOut, 0, len(interactions))
 	for _, ix := range interactions {
 		list = append(list, interactionOut{
-			InteractionID:      ix.InteractionID,
-			Initiator:          ix.From,
-			InitiatorName:      ix.FromName,
-			To:                 ix.To,
-			ToName:             ix.ToName,
-			Type:               ix.Type,
-			Message:            ix.Message,
-			IntentID:           ix.IntentID,
-			Threat:             ix.Threat,
-			ThreatID:           ix.ThreatID,
-			Epoch:              ix.Time.Unix(),
-			Signature:          ix.Signature,
-			ProvenanceReqID:    ix.ProvenanceReqID,
-			ProvenanceRecordID: ix.ProvenanceRecordID,
+			InteractionID: ix.InteractionID,
+			Initiator:     ix.From,
+			InitiatorName: ix.FromName,
+			To:            ix.To,
+			ToName:        ix.ToName,
+			Type:          ix.Type,
+			Message:       ix.Message,
+			IntentID:      ix.IntentID,
+			Threat:        ix.Threat,
+			ThreatID:      ix.ThreatID,
+			Epoch:         ix.Time.Unix(),
+			Signature:     ix.Signature,
 		})
 	}
 
@@ -2453,30 +2546,24 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 	// observability-paths). Derive it live from the interactions below
 	// instead of trusting that stored column.
 	threatDetected := false
-	provenanceRecordID := ""
 	txns := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
 		if i.Threat {
 			threatDetected = true
 		}
-		if provenanceRecordID == "" && i.ProvenanceRecordID != "" {
-			provenanceRecordID = i.ProvenanceRecordID
-		}
 		txns = append(txns, gin.H{
-			"interactionID":      i.InteractionID,
-			"from":               i.From,
-			"fromName":           i.FromName,
-			"to":                 i.To,
-			"toName":             i.ToName,
-			"type":               i.Type,
-			"direction":          i.Direction,
-			"threat":             i.Threat,
-			"threatID":           i.ThreatID,
-			"time":               i.Time,
-			"message":            i.Message,
-			"signature":          i.Signature,
-			"provenanceReqID":    i.ProvenanceReqID,
-			"provenanceRecordID": i.ProvenanceRecordID,
+			"interactionID": i.InteractionID,
+			"from":          i.From,
+			"fromName":      i.FromName,
+			"to":            i.To,
+			"toName":        i.ToName,
+			"type":          i.Type,
+			"direction":     i.Direction,
+			"threat":        i.Threat,
+			"threatID":      i.ThreatID,
+			"time":          i.Time,
+			"message":       i.Message,
+			"signature":     i.Signature,
 		})
 	}
 
@@ -2497,7 +2584,6 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"firstInteractionAt": intent.FirstInteractionAt,
 		"lastInteractionAt":  intent.LastInteractionAt,
 		"runtimeSeconds":     intent.RuntimeSeconds,
-		"provenanceRecordID": provenanceRecordID,
 		"interactions":       txns,
 	}
 	if intent.EndedAt != nil {
@@ -2670,19 +2756,18 @@ func (h *Handler) UserInfo(c *gin.Context) {
 	interactionList := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
 		interactionList = append(interactionList, gin.H{
-			"interactionID":      i.InteractionID,
-			"from":               i.From,
-			"fromName":           i.FromName,
-			"to":                 i.To,
-			"toName":             i.ToName,
-			"type":               i.Type,
-			"threat":             i.Threat,
-			"threatID":           i.ThreatID,
-			"intentID":           i.IntentID,
-			"message":            i.Message,
-			"signature":          i.Signature,
-			"provenanceRecordID": i.ProvenanceRecordID,
-			"time":               i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
+			"interactionID": i.InteractionID,
+			"from":          i.From,
+			"fromName":      i.FromName,
+			"to":            i.To,
+			"toName":        i.ToName,
+			"type":          i.Type,
+			"threat":        i.Threat,
+			"threatID":      i.ThreatID,
+			"intentID":      i.IntentID,
+			"message":       i.Message,
+			"signature":     i.Signature,
+			"time":          i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	}
 
@@ -2704,18 +2789,17 @@ func (h *Handler) UserInfo(c *gin.Context) {
 	threatList := make([]gin.H, 0, len(threats))
 	for _, i := range threats {
 		threatList = append(threatList, gin.H{
-			"interactionID":      i.InteractionID,
-			"from":               i.From,
-			"fromName":           i.FromName,
-			"to":                 i.To,
-			"toName":             i.ToName,
-			"type":               i.Type,
-			"threat":             i.Threat,
-			"intentID":           i.IntentID,
-			"message":            i.Message,
-			"signature":          i.Signature,
-			"provenanceRecordID": i.ProvenanceRecordID,
-			"time":               i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
+			"interactionID": i.InteractionID,
+			"from":          i.From,
+			"fromName":      i.FromName,
+			"to":            i.To,
+			"toName":        i.ToName,
+			"type":          i.Type,
+			"threat":        i.Threat,
+			"intentID":      i.IntentID,
+			"message":       i.Message,
+			"signature":     i.Signature,
+			"time":          i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	}
 
@@ -2838,19 +2922,18 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 	interactionList := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
 		interactionList = append(interactionList, gin.H{
-			"interactionID":      i.InteractionID,
-			"from":               i.From,
-			"fromName":           i.FromName,
-			"to":                 i.To,
-			"toName":             i.ToName,
-			"type":               i.Type,
-			"threat":             i.Threat,
-			"threatID":           i.ThreatID,
-			"intentID":           i.IntentID,
-			"message":            i.Message,
-			"signature":          i.Signature,
-			"provenanceRecordID": i.ProvenanceRecordID,
-			"time":               i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
+			"interactionID": i.InteractionID,
+			"from":          i.From,
+			"fromName":      i.FromName,
+			"to":            i.To,
+			"toName":        i.ToName,
+			"type":          i.Type,
+			"threat":        i.Threat,
+			"threatID":      i.ThreatID,
+			"intentID":      i.IntentID,
+			"message":       i.Message,
+			"signature":     i.Signature,
+			"time":          i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	}
 
@@ -2982,7 +3065,7 @@ func (h *Handler) callUpdateAgent(agentName, agentID, policy, adminDID, orgID st
 	mw.WriteField("org_id", orgID)
 	mw.WriteField("agent_name", agentName)
 	mw.WriteField("agent_id", agentID)
-	
+
 	fw, err := mw.CreateFormFile("policy", "policy.txt")
 	if err != nil {
 		return fmt.Errorf("callUpdateAgent: create form file: %v", err)

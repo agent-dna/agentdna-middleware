@@ -1484,30 +1484,24 @@ func (h *Handler) obsFullIntentDetail(intentID, title string) gin.H {
 	// interaction rows /interactions-list reads instead of trusting that
 	// stored column, so the two endpoints can't disagree.
 	threatDetected := false
-	provenanceRecordID := ""
 	txns := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
 		if i.Threat {
 			threatDetected = true
 		}
-		if provenanceRecordID == "" && i.ProvenanceRecordID != "" {
-			provenanceRecordID = i.ProvenanceRecordID
-		}
 		txns = append(txns, gin.H{
-			"interactionID":      i.InteractionID,
-			"from":               i.From,
-			"fromName":           i.FromName,
-			"to":                 i.To,
-			"toName":             i.ToName,
-			"type":               i.Type,
-			"direction":          i.Direction,
-			"threat":             i.Threat,
-			"threatID":           i.ThreatID,
-			"time":               i.Time,
-			"message":            i.Message,
-			"signature":          i.Signature,
-			"provenanceReqID":    i.ProvenanceReqID,
-			"provenanceRecordID": i.ProvenanceRecordID,
+			"interactionID": i.InteractionID,
+			"from":          i.From,
+			"fromName":      i.FromName,
+			"to":            i.To,
+			"toName":        i.ToName,
+			"type":          i.Type,
+			"direction":     i.Direction,
+			"threat":        i.Threat,
+			"threatID":      i.ThreatID,
+			"time":          i.Time,
+			"message":       i.Message,
+			"signature":     i.Signature,
 		})
 	}
 
@@ -1530,7 +1524,6 @@ func (h *Handler) obsFullIntentDetail(intentID, title string) gin.H {
 		"firstInteractionAt": intent.FirstInteractionAt,
 		"lastInteractionAt":  intent.LastInteractionAt,
 		"runtimeSeconds":     intent.RuntimeSeconds,
-		"provenanceRecordID": provenanceRecordID,
 		"interactions":       txns,
 	}
 }

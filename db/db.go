@@ -10,16 +10,16 @@ import (
 )
 
 type OrgMetrics struct {
-	AgentCount                int
-	IntentCount               int
-	InteractionsCount         int
-	ThreatCount               int
-	AppCount                  int
-	AgentCount24hChange       int
-	IntentCount24hChange      int
+	AgentCount                 int
+	IntentCount                int
+	InteractionsCount          int
+	ThreatCount                int
+	AppCount                   int
+	AgentCount24hChange        int
+	IntentCount24hChange       int
 	InteractionsCount24hChange int
-	ThreatCount24hChange      int
-	AppCount24hChange         int
+	ThreatCount24hChange       int
+	AppCount24hChange          int
 }
 
 type AdminRecord struct {
@@ -66,24 +66,22 @@ type UserDetailRecord struct {
 }
 
 type InteractionRecord struct {
-	InteractionID       string
-	From                string
-	FromName            string
-	To                  string
-	ToName              string
-	Type                string
-	Direction           string
-	Threat              bool
-	ThreatID            string
-	ThreatCode          int
-	ThreatTitle         string
-	IntentID            string
-	Message             string
-	Signature           string
-	ProvenanceReqID     string
-	ProvenanceRecordID  string
-	ReviewStatus        string
-	Time                time.Time
+	InteractionID string
+	From          string
+	FromName      string
+	To            string
+	ToName        string
+	Type          string
+	Direction     string
+	Threat        bool
+	ThreatID      string
+	ThreatCode    int
+	ThreatTitle   string
+	IntentID      string
+	Message       string
+	Signature     string
+	ReviewStatus  string
+	Time          time.Time
 }
 
 type ThreatRecord struct {
@@ -108,26 +106,26 @@ type TopThreatRecord struct {
 }
 
 type IntentRecord struct {
-	IntentID             string
-	InitiatorDID         string
-	InitiatorName        string
-	OrgID                string
-	StartedAt            time.Time
-	EndedAt              *time.Time
-	Status               string
-	ReviewStatus         string
-	ThreatDetected       bool
-	FlowType             string
-	Executor             string
-	ChainDepth           int
-	InteractionsCount    int
-	AgentsCount          int
-	ToolsCount           int
-	ThreatCount          int
-	FirstInteractionAt   *time.Time
-	LastInteractionAt    *time.Time
-	RuntimeSeconds       float64
-	Title                string
+	IntentID           string
+	InitiatorDID       string
+	InitiatorName      string
+	OrgID              string
+	StartedAt          time.Time
+	EndedAt            *time.Time
+	Status             string
+	ReviewStatus       string
+	ThreatDetected     bool
+	FlowType           string
+	Executor           string
+	ChainDepth         int
+	InteractionsCount  int
+	AgentsCount        int
+	ToolsCount         int
+	ThreatCount        int
+	FirstInteractionAt *time.Time
+	LastInteractionAt  *time.Time
+	RuntimeSeconds     float64
+	Title              string
 }
 
 type ToolRecord struct {
@@ -321,9 +319,10 @@ func New(dsn string) *DB {
 		);
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS type TEXT DEFAULT '';
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS direction TEXT DEFAULT '';
-		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS provenance_req_id TEXT;
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT '';
-		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS provenance_record_id TEXT;
+		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT '';
+		ALTER TABLE new_interactions DROP COLUMN IF EXISTS provenance_req_id;
+		ALTER TABLE new_interactions DROP COLUMN IF EXISTS provenance_record_id;
 		DO $$
 		BEGIN
 			IF EXISTS (
@@ -347,8 +346,8 @@ func New(dsn string) *DB {
 			executor         TEXT DEFAULT 'user',
 			chain_depth      INTEGER DEFAULT 0
 		);
-		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS provenance_req_id TEXT;
-		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS provenance_record_id TEXT;
+		ALTER TABLE new_intents DROP COLUMN IF EXISTS provenance_req_id;
+		ALTER TABLE new_intents DROP COLUMN IF EXISTS provenance_record_id;
 		-- Review status: distinct from the workflow "status" column above.
 		-- Tracks human triage of the intent: Ongoing -> Acknowledged | Flagged.
 		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'Ongoing';
@@ -356,6 +355,19 @@ func New(dsn string) *DB {
 			did             TEXT PRIMARY KEY,
 			name            TEXT,
 			organization_id TEXT
+		);
+		-- pending_branches: short-lived bridge between the two separate HTTP
+		-- calls of one on-chain txn (/rubix/v1/tx then /rubix/v1/signature).
+		-- Since intent_id is now the nftId shared across every txn/branch for
+		-- that intent, we can no longer use intent_id to find "the rows this
+		-- particular txn call just inserted" once /signature responds — this
+		-- table is that lookup, keyed by the /tx response's result.id, and is
+		-- deleted (either way) as soon as /signature resolves.
+		CREATE TABLE IF NOT EXISTS pending_branches (
+			req_id     TEXT PRIMARY KEY,
+			intent_id  TEXT NOT NULL,
+			payload    TEXT NOT NULL,
+			created_at TIMESTAMPTZ DEFAULT NOW()
 		);
 	`)
 	if err != nil {
