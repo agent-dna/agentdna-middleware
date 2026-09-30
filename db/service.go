@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 func (d *DB) StoreAdmin(did, orgID, apiKey, email, passwordHash string) error {
@@ -602,7 +604,7 @@ func (d *DB) GetInteractionsByUser(userDID, orgID string, limit, offset int) ([]
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents)
 		ORDER BY time DESC
@@ -632,7 +634,7 @@ func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		       ni.initiator_did, COALESCE(ni.initiator_name, ''),
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
 		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
-		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
+		       COALESCE(ni.signature, ''), COALESCE(ni.threat_id, ''),
 		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Ongoing')
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
@@ -697,7 +699,7 @@ func (d *DB) GetInteractionsByOrg(orgID string, limit, offset int) ([]*Interacti
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE organization_id = $1
 		ORDER BY time DESC
@@ -732,7 +734,7 @@ func (d *DB) GetInteractionsByOrgAndIntent(orgID, intentID string, limit, offset
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE organization_id = $1 AND intent_id = $2
 		ORDER BY time ASC
@@ -760,7 +762,7 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		       ni.initiator_did, COALESCE(ni.initiator_name, ''),
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
 		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
-		       COALESCE(ni.signature, ''), COALESCE(ni.provenance_req_id, ''), COALESCE(ni.provenance_record_id, ''), COALESCE(ni.threat_id, ''),
+		       COALESCE(ni.signature, ''), COALESCE(ni.threat_id, ''),
 		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Ongoing')
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
@@ -1199,7 +1201,7 @@ func (d *DB) GetOrgUserNameByDID(did string) (string, error) {
 	return name, err
 }
 
-func (d *DB) StoreOrgUser( orgID, name, email, passwordHash string) error {
+func (d *DB) StoreOrgUser(orgID, name, email, passwordHash string) error {
 	if name == "" {
 		// Find the next available user_N name.
 		var n int
@@ -1214,7 +1216,7 @@ func (d *DB) StoreOrgUser( orgID, name, email, passwordHash string) error {
 			}
 		}
 	}
-	
+
 	_, err := d.conn.Exec(
 		`INSERT INTO new_org_users (nft_id, did, organization_id, name, email, password) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
 		"default-card-id", "default-id", orgID, name, email, passwordHash,
@@ -1379,7 +1381,7 @@ func (d *DB) GetAgentNFTID(agentDID string) (string, error) {
 	return nftID.String, err
 }
 
-func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message, signature, threatID string, eventTime time.Time) error {
+func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message, signature, hash, threatID string, eventTime time.Time) error {
 	threatInt := 0
 	if threat {
 		threatInt = 1
@@ -1389,11 +1391,61 @@ func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDI
 	}
 	_, err := d.conn.Exec(
 		`INSERT INTO new_interactions
-		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id, message, signature, threat_id, time)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT DO NOTHING`,
-		id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction, threatInt, intentID, orgID, message, signature, threatID, eventTime,
+		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id, message, signature, hash, threat_id, time)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) ON CONFLICT DO NOTHING`,
+		id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction, threatInt, intentID, orgID, message, signature, hash, threatID, eventTime,
 	)
 	return err
+}
+
+// RenameInteractionID relabels an already-stored interaction row — used when a
+// later txn reveals that a position previously thought to be plain trunk
+// ("<intentID>-N") was actually the start of a fork, so it's retroactively
+// relabeled into branch "a" ("<intentID>-N-a-1").
+func (d *DB) RenameInteractionID(oldID, newID string) error {
+	_, err := d.conn.Exec(`UPDATE new_interactions SET interaction_id = $1 WHERE interaction_id = $2`, newID, oldID)
+	return err
+}
+
+// IntentHopRow is one stored hop of an intent (nftId), returned so the caller
+// can reconstruct the trunk/branch tree by parsing interaction_id and compare
+// against a new txn's hop sequence by (hash, from, to).
+type IntentHopRow struct {
+	InteractionID string
+	Hash          string
+	From, To      string
+}
+
+// GetIntentHops returns every stored hop for the given intent_id (nftId),
+// across every branch, unordered — the caller sorts/classifies by parsing
+// each InteractionID's numeric/branch suffix.
+func (d *DB) GetIntentHops(intentID string) ([]IntentHopRow, error) {
+	rows, err := d.conn.Query(
+		`SELECT interaction_id, COALESCE(hash, ''), initiator_did, interacted_to_did FROM new_interactions WHERE intent_id = $1`,
+		intentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []IntentHopRow
+	for rows.Next() {
+		var r IntentHopRow
+		if err := rows.Scan(&r.InteractionID, &r.Hash, &r.From, &r.To); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// IntentExists reports whether an intent (nftId) has already been stored —
+// the caller uses this to decide between inserting a brand-new new_intents
+// row and merging into an existing one.
+func (d *DB) IntentExists(intentID string) (bool, error) {
+	var exists bool
+	err := d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM new_intents WHERE intent_id = $1)`, intentID).Scan(&exists)
+	return exists, err
 }
 
 func (d *DB) StoreIntent(intentID, initiatorDID, orgID, flowType, executor string, chainDepth int, threatDetected bool, interactionIDs []string) error {
@@ -1414,40 +1466,85 @@ func (d *DB) StoreIntent(intentID, initiatorDID, orgID, flowType, executor strin
 	return err
 }
 
-// SetProvenanceReqID attaches the /rubix/v1/tx response id to every interaction row
-// of the given intent (provenance_req_id). Called from the proxy response hook.
-func (d *DB) SetProvenanceReqID(intentID, reqID string) error {
-	_, err := d.conn.Exec(
-		`UPDATE new_interactions SET provenance_req_id = $1 WHERE intent_id = $2`,
-		reqID, intentID,
-	)
-
+// MergeIntentBranch folds a later txn's branch into an already-existing
+// intent (nftId): the interaction_ids list, threat flag and chain depth all
+// need to account for every branch now, not just the one this txn added.
+func (d *DB) MergeIntentBranch(intentID string, chainDepth int, threatDetected bool, interactionIDs []string) error {
+	interactionIDsJSON, err := json.Marshal(interactionIDs)
+	if err != nil {
+		return err
+	}
+	threatInt := 0
+	if threatDetected {
+		threatInt = 1
+	}
 	_, err = d.conn.Exec(
-		`UPDATE new_intents SET provenance_req_id = $1 WHERE intent_id = $2`,
-		reqID, intentID,
+		`UPDATE new_intents
+		 SET interaction_ids = $2,
+		     threat_detected = CASE WHEN threat_detected = 1 THEN 1 ELSE $3 END,
+		     chain_depth     = GREATEST(chain_depth, $4),
+		     ended_at        = NOW()
+		 WHERE intent_id = $1`,
+		intentID, string(interactionIDsJSON), threatInt, chainDepth,
 	)
 	return err
 }
 
-// toolAgentPair is one (agent, tool) combination touched by interactions
-// that are about to be deleted — captured before the delete so
-// pruneToolAgentsList can tell afterward whether the pair has any
-// interaction left at all.
-type toolAgentPair struct {
-	agentDID, toolDID string
+// RenamedInteractionID records a trunk row relabeled into a branch when a
+// later txn revealed its position was actually a fork point (e.g.
+// "nft-3" -> "nft-3-a-1"). Kept so a failed /signature confirmation for the
+// *new* branch can undo the relabel and restore the original trunk numbering.
+type RenamedInteractionID struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
-// collectToolAgentPairs finds every distinct (initiator_did, interacted_to_did)
-// pair, restricted to interactions whose target is a registered tool, matching
-// the given WHERE clause. Must be called (within tx) before the matching
-// interactions are deleted.
-func collectToolAgentPairs(tx *sql.Tx, whereCol, whereVal string) ([]toolAgentPair, error) {
+// pendingBranchPayload is the JSON blob stored in pending_branches.payload.
+type pendingBranchPayload struct {
+	InsertedIDs []string               `json:"insertedIds"`
+	Renamed     []RenamedInteractionID `json:"renamed"`
+}
+
+// InsertPendingBranch records, keyed by the /rubix/v1/tx response's result.id,
+// exactly which interaction rows this call just inserted (and which existing
+// rows it relabeled into a branch) — the only way to find those rows again
+// once the /rubix/v1/signature response/request arrives as a separate HTTP
+// call, since intent_id is now the nftId and is no longer unique per txn.
+func (d *DB) InsertPendingBranch(reqID, intentID string, insertedIDs []string, renamed []RenamedInteractionID) error {
+	payload, err := json.Marshal(pendingBranchPayload{InsertedIDs: insertedIDs, Renamed: renamed})
+	if err != nil {
+		return err
+	}
+	_, err = d.conn.Exec(
+		`INSERT INTO pending_branches (req_id, intent_id, payload) VALUES ($1, $2, $3)
+		 ON CONFLICT (req_id) DO UPDATE SET intent_id = $2, payload = $3, created_at = NOW()`,
+		reqID, intentID, string(payload),
+	)
+	return err
+}
+
+// DeletePendingBranch removes the tracking row once /rubix/v1/signature
+// confirms the txn succeeded — nothing else needs to change, since intent_id
+// was already correct from insert time.
+func (d *DB) DeletePendingBranch(reqID string) error {
+	_, err := d.conn.Exec(`DELETE FROM pending_branches WHERE req_id = $1`, reqID)
+	return err
+}
+
+// collectToolAgentPairsByIDs is collectToolAgentPairs restricted to an
+// explicit list of interaction_ids rather than a single WHERE column match —
+// used when rolling back a specific branch's rows (identified by id list),
+// not a whole intent/provenance group.
+func collectToolAgentPairsByIDs(tx *sql.Tx, ids []string) ([]toolAgentPair, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
 	rows, err := tx.Query(`
 		SELECT DISTINCT ni.initiator_did, ni.interacted_to_did
 		FROM new_interactions ni
 		JOIN new_tools t ON t.did = ni.interacted_to_did
-		WHERE ni.`+whereCol+` = $1`,
-		whereVal,
+		WHERE ni.interaction_id = ANY($1)`,
+		pq.Array(ids),
 	)
 	if err != nil {
 		return nil, err
@@ -1462,6 +1559,126 @@ func collectToolAgentPairs(tx *sql.Tx, whereCol, whereVal string) ([]toolAgentPa
 		pairs = append(pairs, p)
 	}
 	return pairs, rows.Err()
+}
+
+// RollbackBranch undoes exactly one txn's contribution to an intent: deletes
+// the rows it inserted, reverses any trunk-row relabeling that only happened
+// because this (now-failing) branch revealed a fork, and — if the intent has
+// no rows left at all afterward — deletes the intent row too. Otherwise the
+// intent's interaction_ids list is recomputed from what's actually left, so a
+// failed later branch never leaves stale references behind.
+//
+// Used both when /rubix/v1/tx itself reports status=false (called directly,
+// synchronously, with the ids/renames handleIntentWorkflow just produced) and
+// when /rubix/v1/signature fails (called via RollbackPendingBranch, which
+// looks the same ids/renames up from the pending_branches row).
+func (d *DB) RollbackBranch(intentID string, insertedIDs []string, renamed []RenamedInteractionID) (int64, int64, error) {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+
+	pairs, err := collectToolAgentPairsByIDs(tx, insertedIDs)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	var interactionsDeleted int64
+	if len(insertedIDs) > 0 {
+		res, err := tx.Exec(`DELETE FROM new_interactions WHERE interaction_id = ANY($1)`, pq.Array(insertedIDs))
+		if err != nil {
+			return 0, 0, err
+		}
+		interactionsDeleted, _ = res.RowsAffected()
+	}
+
+	for _, r := range renamed {
+		if _, err := tx.Exec(`UPDATE new_interactions SET interaction_id = $1 WHERE interaction_id = $2`, r.From, r.To); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	var remaining int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM new_interactions WHERE intent_id = $1`, intentID).Scan(&remaining); err != nil {
+		return 0, 0, err
+	}
+
+	var intentsDeleted int64
+	if remaining == 0 {
+		res2, err := tx.Exec(`DELETE FROM new_intents WHERE intent_id = $1`, intentID)
+		if err != nil {
+			return 0, 0, err
+		}
+		intentsDeleted, _ = res2.RowsAffected()
+	} else {
+		rows, err := tx.Query(`SELECT interaction_id FROM new_interactions WHERE intent_id = $1`, intentID)
+		if err != nil {
+			return 0, 0, err
+		}
+		var remainingIDs []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return 0, 0, err
+			}
+			remainingIDs = append(remainingIDs, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return 0, 0, err
+		}
+		remainingIDsJSON, err := json.Marshal(remainingIDs)
+		if err != nil {
+			return 0, 0, err
+		}
+		if _, err := tx.Exec(`UPDATE new_intents SET interaction_ids = $2 WHERE intent_id = $1`, intentID, string(remainingIDsJSON)); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	if err := pruneToolAgentsList(tx, pairs); err != nil {
+		return 0, 0, err
+	}
+
+	return interactionsDeleted, intentsDeleted, tx.Commit()
+}
+
+// RollbackPendingBranch is RollbackBranch for the /rubix/v1/signature failure
+// path: it looks up which rows belong to reqID (since that call is a separate
+// HTTP request from the /tx call that inserted them), rolls them back, and
+// removes the tracking row. found=false means nothing was ever tagged with
+// this reqID (e.g. InsertPendingBranch never ran).
+func (d *DB) RollbackPendingBranch(reqID string) (interactionsDeleted, intentsDeleted int64, found bool, err error) {
+	var intentID, payloadJSON string
+	err = d.conn.QueryRow(`SELECT intent_id, payload FROM pending_branches WHERE req_id = $1`, reqID).Scan(&intentID, &payloadJSON)
+	if err == sql.ErrNoRows {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	var payload pendingBranchPayload
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		return 0, 0, false, err
+	}
+	interactionsDeleted, intentsDeleted, err = d.RollbackBranch(intentID, payload.InsertedIDs, payload.Renamed)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if err := d.DeletePendingBranch(reqID); err != nil {
+		return 0, 0, false, err
+	}
+	return interactionsDeleted, intentsDeleted, true, nil
+}
+
+// toolAgentPair is one (agent, tool) combination touched by interactions
+// that are about to be deleted — captured before the delete so
+// pruneToolAgentsList can tell afterward whether the pair has any
+// interaction left at all.
+type toolAgentPair struct {
+	agentDID, toolDID string
 }
 
 // pruneToolAgentsList drops each pair's agentDID from its tool's agents_list
@@ -1498,182 +1715,6 @@ func pruneToolAgentsList(tx *sql.Tx, pairs []toolAgentPair) error {
 	return nil
 }
 
-// DeleteInteractionsByIntent removes both the interaction rows and the new_intents
-// row itself for an intent — used when the /rubix/v1/tx transaction fails to
-// initiate (response status=false). Previously this only deleted new_interactions
-// and left new_intents behind "by design", but that orphaned intent row keeps its
-// stale aggregate fields (threat_detected, chain_depth, ...) computed before the
-// rows they depended on were removed, so it shows up in intent-list looking like a
-// real intent with 0 interactions. Deleting both keeps that from happening — same
-// fix as DeleteInteractionsByProvenanceReqID for the /signature failure path.
-func (d *DB) DeleteInteractionsByIntent(intentID string) (int64, int64, error) {
-	tx, err := d.conn.Begin()
-	if err != nil {
-		return 0, 0, err
-	}
-	defer tx.Rollback() // no-op after a successful Commit
-
-	pairs, err := collectToolAgentPairs(tx, "intent_id", intentID)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	res, err := tx.Exec(`DELETE FROM new_interactions WHERE intent_id = $1`, intentID)
-	if err != nil {
-		return 0, 0, err
-	}
-	interactionsDeleted, _ := res.RowsAffected()
-
-	res2, err := tx.Exec(`DELETE FROM new_intents WHERE intent_id = $1`, intentID)
-	if err != nil {
-		return 0, 0, err
-	}
-	intentsDeleted, _ := res2.RowsAffected()
-
-	if err := pruneToolAgentsList(tx, pairs); err != nil {
-		return 0, 0, err
-	}
-
-	return interactionsDeleted, intentsDeleted, tx.Commit()
-}
-
-// DeleteInteractionsByProvenanceReqID removes both the interaction rows and their
-// parent new_intents row, tagged with the given /tx provenance id — used when
-// /rubix/v1/signature makes it clear this txn will never get a
-// provenance_record_id (status=false, no minted child, missing ids). Deleting only
-// the interactions and leaving new_intents behind produces an orphaned intent row
-// whose stale aggregate fields (threat_detected, chain_depth, ...) were computed
-// before the rollback and no longer reflect anything real, so both go together.
-// Returns (interactionsDeleted, intentsDeleted, err) — both counts are surfaced
-// (rather than just the interactions count) so a caller-side log can tell a "nothing
-// was ever tagged with this reqID" no-op apart from a real delete.
-func (d *DB) DeleteInteractionsByProvenanceReqID(reqID string) (int64, int64, error) {
-	tx, err := d.conn.Begin()
-	if err != nil {
-		return 0, 0, err
-	}
-	defer tx.Rollback() // no-op after a successful Commit
-
-	pairs, err := collectToolAgentPairs(tx, "provenance_req_id", reqID)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	res, err := tx.Exec(`DELETE FROM new_interactions WHERE provenance_req_id = $1`, reqID)
-	if err != nil {
-		return 0, 0, err
-	}
-	interactionsDeleted, _ := res.RowsAffected()
-
-	res2, err := tx.Exec(`DELETE FROM new_intents WHERE provenance_req_id = $1`, reqID)
-	if err != nil {
-		return 0, 0, err
-	}
-	intentsDeleted, _ := res2.RowsAffected()
-
-	if err := pruneToolAgentsList(tx, pairs); err != nil {
-		return 0, 0, err
-	}
-
-	return interactionsDeleted, intentsDeleted, tx.Commit()
-}
-
-// SetProvenanceRecord attaches the /rubix/v1/signature response data to the rows
-// matched by the /tx provenance id and returns the number of interaction rows updated
-// (0 means the /tx write has not landed yet, so the caller skips).
-//
-// intent_id is overwritten with childNFTId in BOTH new_intents and new_interactions
-// per product requirement, so the two tables stay joined. Done in one transaction:
-// we look up the current intent_id (the UUID) from the tagged interaction rows before
-// rewriting it.
-func (d *DB) SetProvenanceRecord(reqID, transactionID, childNFTId string) (int64, error) {
-	tx, err := d.conn.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback() // no-op after a successful Commit
-
-	// Find the current intent_id (UUID) tagged with this provenance id.
-	var oldIntentID string
-	err = tx.QueryRow(
-		`SELECT intent_id FROM new_interactions WHERE provenance_req_id = $1 LIMIT 1`,
-		reqID,
-	).Scan(&oldIntentID)
-	if err == sql.ErrNoRows {
-		return 0, nil // /tx write not landed yet — caller skips
-	}
-	if err != nil {
-		return 0, err
-	}
-
-	// transactionID is used as both the new intent_id and provenance_record_id.
-	// Repoint intent row and rewrite interaction_ids JSON (uuid-N → transactionID-N).
-	if _, err := tx.Exec(
-		`UPDATE new_intents
-		 SET intent_id            = $1,
-		     provenance_record_id = $1,
-		     interaction_ids      = REPLACE(interaction_ids, $2, $1)
-		 WHERE intent_id = $2`,
-		transactionID, oldIntentID,
-	); err != nil {
-		return 0, err
-	}
-
-	// Rewrite interaction PKs (uuid-N → transactionID-N) and set provenance fields.
-	// threat_id is rewritten the same way (uuid-threat-N → transactionID-threat-N)
-	// so it keeps pointing at the threats row renamed below — left alone, only
-	// rows with a threat (threat_id <> '') are touched, so non-threat rows are
-	// unaffected.
-	suffixStart := len(oldIntentID) + 2
-	res, err := tx.Exec(
-		`UPDATE new_interactions
-		 SET interaction_id       = $1 || '-' || SUBSTR(interaction_id, $3),
-		     provenance_record_id = $1,
-		     intent_id            = $1,
-		     threat_id            = CASE WHEN threat_id <> '' THEN $1 || '-' || SUBSTR(threat_id, $3) ELSE threat_id END
-		 WHERE provenance_req_id = $2`,
-		transactionID, reqID, suffixStart,
-	)
-	if err != nil {
-		return 0, err
-	}
-
-	// Mirror the rename in intent_block_data (uuid-N → transactionID-N).
-	if _, err := tx.Exec(
-		`UPDATE intent_block_data
-		 SET id        = $1 || '-' || SUBSTR(id, $3),
-		     intent_id = $1
-		 WHERE intent_id = $2`,
-		transactionID, oldIntentID, suffixStart,
-	); err != nil {
-		return 0, err
-	}
-
-	// Mirror the rename in threats (uuid-N → transactionID-N) so
-	// threats.intent_id keeps joining against new_intents.intent_id, and
-	// threats.interaction_id keeps pointing at the renamed intent_block_data
-	// row (block IDs use the same "<intentID>-block-N" pattern).
-	if _, err := tx.Exec(
-		`UPDATE threats
-		 SET id            = $1 || '-' || SUBSTR(id, $3),
-		     interaction_id = $1 || '-' || SUBSTR(interaction_id, $3),
-		     intent_id      = $1
-		 WHERE intent_id = $2`,
-		transactionID, oldIntentID, suffixStart,
-	); err != nil {
-		return 0, err
-	}
-
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return rows, nil
-}
-
 func (d *DB) CountInteractionsByAgent(agentDID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(
@@ -1692,7 +1733,7 @@ func scanInteractionNewRows(rows *sql.Rows) ([]*InteractionRecord, error) {
 			&r.From, &r.FromName,
 			&r.To, &r.ToName,
 			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
-			&r.Signature, &r.ProvenanceReqID, &r.ProvenanceRecordID, &r.ThreatID,
+			&r.Signature, &r.ThreatID,
 		); err != nil {
 			return nil, err
 		}
@@ -1714,7 +1755,7 @@ func scanInteractionNewRowsWithTitle(rows *sql.Rows) ([]*InteractionRecord, erro
 			&r.From, &r.FromName,
 			&r.To, &r.ToName,
 			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
-			&r.Signature, &r.ProvenanceReqID, &r.ProvenanceRecordID, &r.ThreatID,
+			&r.Signature, &r.ThreatID,
 			&r.ThreatCode, &r.ThreatTitle, &r.ReviewStatus,
 		); err != nil {
 			return nil, err
@@ -1731,7 +1772,7 @@ func (d *DB) GetInteractionsByAgent(agentDID string, limit, offset int) ([]*Inte
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE initiator_did = $1
 		ORDER BY time DESC
@@ -2042,7 +2083,7 @@ func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, err
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, '')
 		FROM new_interactions WHERE intent_id = $1 ORDER BY time ASC`,
 		intentID,
 	)
@@ -2304,7 +2345,7 @@ func (d *DB) GetInteractionsByTool(toolDID, orgID string, limit, offset int) ([]
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(provenance_req_id, ''), COALESCE(provenance_record_id, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, '')
 		FROM new_interactions
 		WHERE interacted_to_did = $1 AND organization_id = $2
 		ORDER BY time DESC
@@ -2531,8 +2572,8 @@ func (d *DB) GetInteractionSeries(orgID, rangeParam string) ([]InteractionSeries
 }
 
 type AgentsAppsMetrics struct {
-	TopAgents        []*AgentVolumeRecord
-	TopApps          []*ToolRecord
+	TopAgents         []*AgentVolumeRecord
+	TopApps           []*ToolRecord
 	TotalInteractions int
 	TotalThreats      int
 	TotalAgents       int

@@ -68,7 +68,7 @@ type signatureRequest struct {
 // signatureResponse is the response body of POST /rubix/v1/signature. We extract the
 // transactionID and the first mintedNFTChildren[].childNFTId.
 type signatureResponse struct {
-	Status bool   `json:"status"`
+	Status bool `json:"status"`
 	Result struct {
 		MintedNFTChildren []struct {
 			ChildNFTId string `json:"childNFTId"`
@@ -119,7 +119,12 @@ type agentNFTMetadata struct {
 }
 
 // intentWorkflowData is the top-level structure for the intent_workflow format.
+// Id is the nft/content id (e.g. an IPFS CID) shared by every txn belonging to
+// the same logical intent — it's what intent_id is now derived from, replacing
+// the old scheme of a fresh random UUID rewritten to the on-chain transaction
+// id after /rubix/v1/signature confirmed.
 type intentWorkflowData struct {
+	Id       string            `json:"id"`
 	Type     string            `json:"type"`
 	Version  string            `json:"version"`
 	Remarks  string            `json:"remarks"`

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 
 	"agentdna-ratelimit-auth/db"
 	cid "github.com/ipfs/go-cid"
@@ -302,6 +304,197 @@ func buildEnvelopeChain(blocks []*db.IntentBlockRecord) *workflowEnvelope {
 		prev.To = blocks[len(blocks)-1].ToDID
 	}
 	return prev
+}
+
+// hopIDKind classifies an already-stored interaction_id by its shape, as
+// produced by resolveBranchIDs: plain trunk ("<intentID>-N") or a branch hop
+// ("<intentID>-<forkPos>-<letter>-<offset>").
+type hopIDKind int
+
+const (
+	hopKindTrunk hopIDKind = iota
+	hopKindBranch
+)
+
+type parsedHopID struct {
+	kind   hopIDKind
+	n      int // trunk position, or fork position for a branch hop
+	letter string
+	offset int
+}
+
+// parseHopID classifies an interaction_id belonging to intentID. IDs that
+// don't match either shape (e.g. malformed rows from before this scheme, or
+// simply garbage) are reported as !ok and ignored by the caller — safer than
+// guessing, since a wrongly-classified row could corrupt the branch tree.
+func parseHopID(intentID, id string) (parsedHopID, bool) {
+	prefix := intentID + "-"
+	if !strings.HasPrefix(id, prefix) {
+		return parsedHopID{}, false
+	}
+	parts := strings.Split(id[len(prefix):], "-")
+	switch len(parts) {
+	case 1:
+		n, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return parsedHopID{}, false
+		}
+		return parsedHopID{kind: hopKindTrunk, n: n}, true
+	case 3:
+		n, err1 := strconv.Atoi(parts[0])
+		offset, err2 := strconv.Atoi(parts[2])
+		if err1 != nil || err2 != nil || parts[1] == "" {
+			return parsedHopID{}, false
+		}
+		return parsedHopID{kind: hopKindBranch, n: n, letter: parts[1], offset: offset}, true
+	default:
+		return parsedHopID{}, false
+	}
+}
+
+// branchAssignment is the result of matching a txn's hop sequence against
+// whatever is already stored for its intent (nftId).
+type branchAssignment struct {
+	// InsertIDs are the interaction_ids to store for interactions[FirstNew:],
+	// one per remaining hop in order. Empty when this txn is a fully
+	// duplicate replay of hops already stored.
+	InsertIDs []string
+	FirstNew  int
+	// Renamed lists existing trunk rows that need relabeling into a branch
+	// because this txn revealed their position was actually a fork point.
+	Renamed []db.RenamedInteractionID
+}
+
+// resolveBranchIDs compares a txn's hop sequence (already deduped within the
+// call) against every hop already stored for intentID, and decides what (if
+// anything) is new:
+//   - fully duplicate replay: no existing branch was extended, nothing to insert.
+//   - pure extension: the new hops just continue the trunk (or an existing
+//     branch) further — no fork.
+//   - a fork: the new hops diverge from an existing sequence at some position.
+//     The first time a fork is discovered at a given position, the existing
+//     trunk tail from that position onward is relabeled into branch "a" and
+//     the new arrival becomes "b"; later forks at the same position get the
+//     next unused letter. Only one level of branching is modeled — a further
+//     divergence *within* an already-forked branch mints a new branch at the
+//     original fork position rather than nesting, per the id scheme
+//     "<intentID>-<forkPos>-<letter>-<offset>".
+func resolveBranchIDs(intentID string, existing []db.IntentHopRow, interactions []interactionExtract) branchAssignment {
+	type branchEntry struct {
+		offset int
+		row    db.IntentHopRow
+	}
+
+	trunk := map[int]db.IntentHopRow{}
+	branches := map[int]map[string][]branchEntry{}
+	maxTrunkN := 0
+	for _, row := range existing {
+		p, ok := parseHopID(intentID, row.InteractionID)
+		if !ok {
+			continue
+		}
+		if p.kind == hopKindTrunk {
+			trunk[p.n] = row
+			if p.n > maxTrunkN {
+				maxTrunkN = p.n
+			}
+		} else {
+			if branches[p.n] == nil {
+				branches[p.n] = map[string][]branchEntry{}
+			}
+			branches[p.n][p.letter] = append(branches[p.n][p.letter], branchEntry{offset: p.offset, row: row})
+		}
+	}
+	trunkSeq := make([]db.IntentHopRow, maxTrunkN)
+	for n, row := range trunk {
+		trunkSeq[n-1] = row
+	}
+	for forkPos := range branches {
+		for letter := range branches[forkPos] {
+			entries := branches[forkPos][letter]
+			sort.Slice(entries, func(i, j int) bool { return entries[i].offset < entries[j].offset })
+			branches[forkPos][letter] = entries
+		}
+	}
+
+	same := func(a db.IntentHopRow, b interactionExtract) bool {
+		return a.Hash == b.Hash && a.From == b.FromDID && a.To == b.ToDID
+	}
+
+	matched := 0
+	for matched < len(trunkSeq) && matched < len(interactions) && same(trunkSeq[matched], interactions[matched]) {
+		matched++
+	}
+
+	if matched == len(interactions) {
+		return branchAssignment{} // fully duplicate replay
+	}
+
+	// forkPos (1-based) is where the new tail picks up: either a genuine
+	// mismatch against trunk data still hanging off this intent, or simply
+	// the next position after the trunk. trunkHasDataHere distinguishes the
+	// two: it's true only when trunkSeq itself still has an (mismatching)
+	// entry there. Once a fork is first discovered, every trunk row from that
+	// position on is relabeled into a branch (below), so on any later call
+	// trunkSeq must have already stopped short of forkPos — trunkHasDataHere
+	// and an existing branches[forkPos] are mutually exclusive.
+	forkPos := matched + 1
+	trunkHasDataHere := matched < len(trunkSeq)
+
+	if !trunkHasDataHere && len(branches[forkPos]) == 0 {
+		// Pure extension — trunk has nothing more, and this position has
+		// never forked before.
+		ids := make([]string, 0, len(interactions)-matched)
+		for i := matched; i < len(interactions); i++ {
+			ids = append(ids, fmt.Sprintf("%s-%d", intentID, i+1))
+		}
+		return branchAssignment{InsertIDs: ids, FirstNew: matched}
+	}
+
+	// Does the new tail continue an already-known branch at this fork point?
+	for letter, entries := range branches[forkPos] {
+		if len(entries) == 0 || !same(entries[0].row, interactions[matched]) {
+			continue
+		}
+		branchMatched := 0
+		for branchMatched < len(entries) && matched+branchMatched < len(interactions) &&
+			same(entries[branchMatched].row, interactions[matched+branchMatched]) {
+			branchMatched++
+		}
+		if matched+branchMatched == len(interactions) {
+			return branchAssignment{} // fully duplicate of this branch
+		}
+		if branchMatched == len(entries) {
+			// Pure extension of this existing branch.
+			ids := make([]string, 0, len(interactions)-matched-branchMatched)
+			for i := matched + branchMatched; i < len(interactions); i++ {
+				ids = append(ids, fmt.Sprintf("%s-%d-%s-%d", intentID, forkPos, letter, i-matched+1))
+			}
+			return branchAssignment{InsertIDs: ids, FirstNew: matched + branchMatched}
+		}
+		// Diverges further within this branch — minted as a brand new branch
+		// at forkPos below rather than a nested sub-fork.
+		break
+	}
+
+	// Brand new branch at forkPos.
+	var renamed []db.RenamedInteractionID
+	letter := string(rune('a' + len(branches[forkPos])))
+	if len(branches[forkPos]) == 0 && trunkHasDataHere {
+		// First fork ever discovered at forkPos — relabel the existing trunk
+		// tail into branch "a" and use "b" for the new arrival.
+		for n := forkPos; n <= maxTrunkN; n++ {
+			oldID := fmt.Sprintf("%s-%d", intentID, n)
+			newID := fmt.Sprintf("%s-%d-a-%d", intentID, forkPos, n-forkPos+1)
+			renamed = append(renamed, db.RenamedInteractionID{From: oldID, To: newID})
+		}
+		letter = "b"
+	}
+	ids := make([]string, 0, len(interactions)-matched)
+	for i := matched; i < len(interactions); i++ {
+		ids = append(ids, fmt.Sprintf("%s-%d-%s-%d", intentID, forkPos, letter, i-matched+1))
+	}
+	return branchAssignment{InsertIDs: ids, FirstNew: matched, Renamed: renamed}
 }
 
 func (h *Handler) resolveActorName(did, fallback string) string {
