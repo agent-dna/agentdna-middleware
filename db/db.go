@@ -405,6 +405,13 @@ func New(dsn string) *DB {
 	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_did    TEXT NOT NULL DEFAULT ''`)
 	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_name   TEXT NOT NULL DEFAULT ''`)
 	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_type   TEXT NOT NULL DEFAULT ''`)
+	// raw_data was referenced by StoreIntentBlockData's INSERT and
+	// GetIntentBlocksByIntent's SELECT since they were written, but the
+	// column itself was never created — every insert silently failed
+	// (logged, not fatal) and every read errored outright. Backfilling it
+	// only starts rows saving correctly from here on; nothing existed to
+	// recover for rows inserted before this.
+	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS raw_data JSONB NOT NULL DEFAULT '{}'::jsonb`)
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE`)
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS message TEXT DEFAULT ''`)
