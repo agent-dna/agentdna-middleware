@@ -158,4 +158,5 @@ type interactionExtract struct {
 	Signature string
 	Hash      string
 	Epoch     int64
+	RawData   json.RawMessage
 }

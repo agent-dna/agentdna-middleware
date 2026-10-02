@@ -199,6 +199,7 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID, exec
 			Signature: ed.parent.Signature,
 			Hash:      ed.parent.Hash,
 			Epoch:     ed.parent.Epoch,
+			RawData:   envelopeRawJSON(ed.parent),
 		})
 		seenAsFrom[fromDID] = true
 	}
@@ -217,9 +218,22 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID, exec
 		Signature: root.Signature,
 		Hash:      root.Hash,
 		Epoch:     root.Epoch,
+		RawData:   envelopeRawJSON(root),
 	})
 
 	return result
+}
+
+// envelopeRawJSON serializes the envelope an interaction was extracted from,
+// as received — including its full nested parent_envelope chain. That means
+// later hops repeat every earlier hop's data; the redundancy is intentional
+// for now.
+func envelopeRawJSON(e *workflowEnvelope) json.RawMessage {
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return json.RawMessage("{}")
+	}
+	return raw
 }
 
 // deriveWorkflowInteractionType infers type from position and chain history.

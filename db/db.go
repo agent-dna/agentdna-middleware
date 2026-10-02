@@ -321,6 +321,7 @@ func New(dsn string) *DB {
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS direction TEXT DEFAULT '';
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT '';
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT '';
+		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS raw_data JSONB NOT NULL DEFAULT '{}'::jsonb;
 		ALTER TABLE new_interactions DROP COLUMN IF EXISTS provenance_req_id;
 		ALTER TABLE new_interactions DROP COLUMN IF EXISTS provenance_record_id;
 		DO $$
