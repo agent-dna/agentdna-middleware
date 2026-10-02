@@ -1381,7 +1381,7 @@ func (d *DB) GetAgentNFTID(agentDID string) (string, error) {
 	return nftID.String, err
 }
 
-func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message, signature, hash, threatID string, eventTime time.Time) error {
+func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message, signature, hash, threatID string, rawData json.RawMessage, eventTime time.Time) error {
 	threatInt := 0
 	if threat {
 		threatInt = 1
@@ -1389,11 +1389,14 @@ func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDI
 	if eventTime.IsZero() {
 		eventTime = time.Now()
 	}
+	if len(rawData) == 0 {
+		rawData = json.RawMessage("{}")
+	}
 	_, err := d.conn.Exec(
 		`INSERT INTO new_interactions
-		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id, message, signature, hash, threat_id, time)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) ON CONFLICT DO NOTHING`,
-		id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction, threatInt, intentID, orgID, message, signature, hash, threatID, eventTime,
+		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id, message, signature, hash, threat_id, raw_data, time)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) ON CONFLICT DO NOTHING`,
+		id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction, threatInt, intentID, orgID, message, signature, hash, threatID, string(rawData), eventTime,
 	)
 	return err
 }
@@ -2092,6 +2095,30 @@ func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, err
 	}
 	defer rows.Close()
 	return scanInteractionNewRows(rows)
+}
+
+// GetInteractionRawDataByIntent returns each interaction's stored raw
+// envelope JSON for the given intent, keyed by interaction_id. Kept separate
+// from GetInteractionsByIntent so scanInteractionNewRows (shared by every
+// interaction list query) doesn't drag the raw payload along everywhere.
+func (d *DB) GetInteractionRawDataByIntent(intentID string) (map[string]json.RawMessage, error) {
+	rows, err := d.conn.Query(
+		`SELECT interaction_id, COALESCE(raw_data, '{}') FROM new_interactions WHERE intent_id = $1`,
+		intentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[string]json.RawMessage{}
+	for rows.Next() {
+		var id, raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
+		}
+		result[id] = json.RawMessage(raw)
+	}
+	return result, rows.Err()
 }
 
 func (d *DB) GetToolByNameOrDID(query, orgID string) (*ToolRecord, error) {

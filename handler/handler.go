@@ -869,7 +869,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 		eventTime := time.Unix(ix.Epoch, 0).UTC()
 		threatID := hashToThreatID[ix.Hash]
 		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, ix.Hash, threatID, eventTime,
+			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, ix.Hash, threatID, ix.RawData, eventTime,
 		); err != nil {
 			return nil, fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
 		}
@@ -2539,6 +2539,11 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch interactions: %v", err)})
 		return
 	}
+	rawByID, err := h.db.GetInteractionRawDataByIntent(intentID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch interaction raw data: %v", err)})
+		return
+	}
 
 	// new_intents.threat_detected is written once by handleIntentWorkflow at
 	// intent-creation time and never recomputed, so it can drift stale
@@ -2550,6 +2555,10 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 	for _, i := range interactions {
 		if i.Threat {
 			threatDetected = true
+		}
+		raw := rawByID[i.InteractionID]
+		if len(raw) == 0 {
+			raw = json.RawMessage("{}")
 		}
 		txns = append(txns, gin.H{
 			"interactionID": i.InteractionID,
@@ -2564,6 +2573,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 			"time":          i.Time,
 			"message":       i.Message,
 			"signature":     i.Signature,
+			"rawData":       raw,
 		})
 	}
 
