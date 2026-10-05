@@ -2,6 +2,8 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"log"
 	"time"
 
@@ -120,11 +122,47 @@ type IntentRecord struct {
 	InteractionsCount  int
 	AgentsCount        int
 	ToolsCount         int
+	Apps               IntentApps // distinct new_tools entries the intent called; same set ToolsCount counts
 	ThreatCount        int
 	FirstInteractionAt *time.Time
 	LastInteractionAt  *time.Time
 	RuntimeSeconds     float64
 	Title              string
+}
+
+// IntentApp is one app (new_tools row) an intent called.
+type IntentApp struct {
+	DID  string `json:"did"`
+	Name string `json:"name"`
+}
+
+// IntentApps scans the JSONB array of {did, name} objects the intent queries
+// aggregate per intent.
+type IntentApps []IntentApp
+
+func (a *IntentApps) Scan(src any) error {
+	var b []byte
+	switch v := src.(type) {
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	case nil:
+		*a = IntentApps{}
+		return nil
+	default:
+		return fmt.Errorf("IntentApps: unsupported type %T", src)
+	}
+	return json.Unmarshal(b, a)
+}
+
+// DIDs returns just the app DIDs, never nil.
+func (a IntentApps) DIDs() []string {
+	dids := make([]string, 0, len(a))
+	for _, app := range a {
+		dids = append(dids, app.DID)
+	}
+	return dids
 }
 
 type ToolRecord struct {

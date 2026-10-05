@@ -498,3 +498,11 @@ func (h *Handler) resolveActorName(did, fallback string) string {
 	}
 	return fallback
 }
+
+// orEmptyApps returns a, or an empty slice when a is nil, so JSON renders [] not null.
+func orEmptyApps(a db.IntentApps) db.IntentApps {
+	if a == nil {
+		return db.IntentApps{}
+	}
+	return a
+}

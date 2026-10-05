@@ -535,6 +535,7 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		       COUNT(i.interaction_id)                                                  AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
 		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN i.interacted_to_did END) AS tools_count,
+		       COALESCE(JSONB_AGG(DISTINCT JSONB_BUILD_OBJECT('did', t.did, 'name', COALESCE(t.name, ''))) FILTER (WHERE t.did IS NOT NULL), '[]') AS apps,
 		       SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                           AS threat_count,
 		       MIN(i.time)                                                               AS first_interaction_at,
 		       MAX(i.time)                                                               AS last_interaction_at,
@@ -565,7 +566,7 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
 			&r.StartedAt, &endedAt, &r.Status, &r.ReviewStatus, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
-			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
+			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.Apps, &r.ThreatCount,
 			&firstAt, &lastAt, &r.Title,
 		); err != nil {
 			return nil, err
@@ -1807,6 +1808,7 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 		       COUNT(i.interaction_id)                                                AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
 		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN i.interacted_to_did END) AS tools_count,
+		       COALESCE(JSONB_AGG(DISTINCT JSONB_BUILD_OBJECT('did', t.did, 'name', COALESCE(t.name, ''))) FILTER (WHERE t.did IS NOT NULL), '[]') AS apps,
 		       SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                          AS threat_count,
 		       MIN(i.time)                                                             AS first_interaction_at,
 		       MAX(i.time)                                                             AS last_interaction_at,
@@ -1837,7 +1839,7 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
 			&r.StartedAt, &endedAt, &r.Status, &r.ReviewStatus, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
-			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
+			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.Apps, &r.ThreatCount,
 			&firstAt, &lastAt, &r.Title,
 		); err != nil {
 			return nil, err
@@ -2023,6 +2025,7 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 		       COUNT(i.interaction_id)                                                AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
 		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN i.interacted_to_did END) AS tools_count,
+		       COALESCE(JSONB_AGG(DISTINCT JSONB_BUILD_OBJECT('did', t.did, 'name', COALESCE(t.name, ''))) FILTER (WHERE t.did IS NOT NULL), '[]') AS apps,
 		       MIN(i.time)                                                             AS first_interaction_at,
 		       MAX(i.time)                                                             AS last_interaction_at
 		FROM new_intents ni
@@ -2037,7 +2040,7 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 		&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &orgID,
 		&r.StartedAt, &endedAt, &r.Status, &r.ReviewStatus, &threatInt,
 		&r.FlowType, &r.Executor, &r.ChainDepth,
-		&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount,
+		&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.Apps,
 		&firstAt, &lastAt,
 	)
 	if err != nil {
@@ -2217,6 +2220,7 @@ func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*Inte
 		       COUNT(ix.interaction_id)                                                 AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN ix.interacted_to_did END) AS agents_count,
 		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN ix.interacted_to_did END) AS tools_count,
+		       COALESCE(JSONB_AGG(DISTINCT JSONB_BUILD_OBJECT('did', t.did, 'name', COALESCE(t.name, ''))) FILTER (WHERE t.did IS NOT NULL), '[]') AS apps,
 		       SUM(CASE WHEN ix.threat = 1 THEN 1 ELSE 0 END)                           AS threat_count,
 		       MIN(ix.time)                                                              AS first_interaction_at,
 		       MAX(ix.time)                                                              AS last_interaction_at,
@@ -2248,7 +2252,7 @@ func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*Inte
 			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
 			&r.StartedAt, &endedAt, &r.Status, &threatInt,
 			&r.FlowType, &r.Executor, &r.ChainDepth,
-			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.ThreatCount,
+			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.Apps, &r.ThreatCount,
 			&firstAt, &lastAt, &r.Title,
 		); err != nil {
 			return nil, err

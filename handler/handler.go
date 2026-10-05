@@ -2058,6 +2058,8 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 			"interactionsCount":  i.InteractionsCount,
 			"agentsCount":        i.AgentsCount,
 			"toolsCount":         i.ToolsCount,
+			"appDIDs":            i.Apps.DIDs(),
+			"apps":               orEmptyApps(i.Apps),
 			"threatCount":        i.ThreatCount,
 			"firstInteractionAt": i.FirstInteractionAt,
 			"lastInteractionAt":  i.LastInteractionAt,
@@ -2142,6 +2144,8 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 		"interactionsCount": intent.InteractionsCount,
 		"agentsCount":       intent.AgentsCount,
 		"toolsCount":        intent.ToolsCount,
+		"appDIDs":           intent.Apps.DIDs(),
+		"apps":              orEmptyApps(intent.Apps),
 		"startedAt":         intent.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 
@@ -2216,7 +2220,7 @@ func (h *Handler) AppRegistration(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "tool_name and tool_id are required"})
 		return
 	}
-	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, "AGENT_DNA_BETA"); err != nil {
+	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, h.orgID); err != nil {
 		log.Printf("[AppRegistration] db error tool_id=%s err=%v", req.ToolID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to register app"})
 		return
@@ -2467,6 +2471,8 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"interactionsCount":  intent.InteractionsCount,
 		"agentsCount":        intent.AgentsCount,
 		"toolsCount":         intent.ToolsCount,
+		"appDIDs":            intent.Apps.DIDs(),
+		"apps":               orEmptyApps(intent.Apps),
 		"firstInteractionAt": intent.FirstInteractionAt,
 		"lastInteractionAt":  intent.LastInteractionAt,
 		"runtimeSeconds":     intent.RuntimeSeconds,
