@@ -339,6 +339,20 @@ func New(dsn string) *DB {
 		-- existing rows over so old and new intents read the same.
 		ALTER TABLE new_intents ALTER COLUMN review_status SET DEFAULT 'Unreviewed';
 		UPDATE new_intents SET review_status = 'Unreviewed' WHERE review_status = 'Ongoing' OR review_status IS NULL;
+		-- Initiator display name, resolved at ingest the same way each
+		-- interaction's initiator_name is. Read queries prefer the live
+		-- new_org_users/new_agents name and fall back to this, so the intent
+		-- never shows a blank name the interactions themselves have.
+		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS initiator_name TEXT DEFAULT '';
+		UPDATE new_intents ni SET initiator_name = sub.name
+		FROM (
+			SELECT DISTINCT ON (i.intent_id) i.intent_id, i.initiator_name AS name
+			FROM new_interactions i
+			JOIN new_intents x ON x.intent_id = i.intent_id AND x.initiator_did = i.initiator_did
+			WHERE COALESCE(i.initiator_name, '') <> ''
+			ORDER BY i.intent_id, i.time ASC
+		) sub
+		WHERE ni.intent_id = sub.intent_id AND COALESCE(ni.initiator_name, '') = '';
 		CREATE TABLE IF NOT EXISTS new_tools (
 			did             TEXT PRIMARY KEY,
 			name            TEXT,
