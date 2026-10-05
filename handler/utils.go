@@ -224,11 +224,15 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID, exec
 	return result
 }
 
-// envelopeRawJSON serializes the envelope an interaction was extracted from,
-// as received — including its full nested parent_envelope chain. That means
-// later hops repeat every earlier hop's data; the redundancy is intentional
-// for now.
+// envelopeRawJSON returns the envelope an interaction was extracted from,
+// byte-for-byte as received — including its full nested parent_envelope
+// chain, so later hops repeat every earlier hop's data (intentional for now).
+// Only envelopes built in code rather than decoded from a request have no
+// captured bytes; those fall back to being marshalled.
 func envelopeRawJSON(e *workflowEnvelope) json.RawMessage {
+	if len(e.raw) > 0 {
+		return e.raw
+	}
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return json.RawMessage("{}")
