@@ -333,8 +333,12 @@ func New(dsn string) *DB {
 		ALTER TABLE new_intents DROP COLUMN IF EXISTS provenance_req_id;
 		ALTER TABLE new_intents DROP COLUMN IF EXISTS provenance_record_id;
 		-- Review status: distinct from the workflow "status" column above.
-		-- Tracks human triage of the intent: Ongoing -> Acknowledged | Flagged.
-		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'Ongoing';
+		-- Tracks human triage of the intent: Unreviewed -> Acknowledged | Flagged.
+		ALTER TABLE new_intents ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'Unreviewed';
+		-- 'Ongoing' was renamed to 'Unreviewed': move the column default and any
+		-- existing rows over so old and new intents read the same.
+		ALTER TABLE new_intents ALTER COLUMN review_status SET DEFAULT 'Unreviewed';
+		UPDATE new_intents SET review_status = 'Unreviewed' WHERE review_status = 'Ongoing' OR review_status IS NULL;
 		CREATE TABLE IF NOT EXISTS new_tools (
 			did             TEXT PRIMARY KEY,
 			name            TEXT,

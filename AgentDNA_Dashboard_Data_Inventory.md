@@ -240,7 +240,7 @@ These are fields the database queries already fetch into a Go struct, but that g
 `IntentRecord.Title` is always truncated to 5 words by `firstNWords()` in `buildIntentList`. No list or detail endpoint returns the untruncated title, even though it's in the DB record.
 
 **6. Intent diagram drops reviewStatus and executor**
-`GetIntentInfo` fetches `ReviewStatus` and `Executor` (and `IntentInfo` returns both), but `IntentDiagram`'s `basicInfo` omits both — so the human-triage state (Ongoing / Acknowledged / Flagged) isn't visible on the diagram view.
+`GetIntentInfo` fetches `ReviewStatus` and `Executor` (and `IntentInfo` returns both), but `IntentDiagram`'s `basicInfo` omits both — so the human-triage state (Unreviewed / Acknowledged / Flagged) isn't visible on the diagram view.
 
 **7. Request queues never expose orgID**
 `buildRequestList` (shared by creation-requests and access-requests endpoints) never includes `orgID` in its rows, though the underlying query is org-scoped.

@@ -1405,7 +1405,7 @@ func (h *Handler) ObservabilityIntents(c *gin.Context) {
 			appCallsOut = append(appCallsOut, gin.H{"agentDID": k.agentDID, "appDID": k.appDID, "count": callCounts[k]})
 		}
 
-		title, reviewStatus, startedAt := "", "Ongoing", lastAt
+		title, reviewStatus, startedAt := "", "Unreviewed", lastAt
 		if info := infoMap[id]; info != nil {
 			title, reviewStatus, startedAt = info.Title, info.ReviewStatus, info.StartedAt
 		}
