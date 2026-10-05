@@ -1177,6 +1177,7 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 
 	var metrics *db.OrgMetrics
 	var agents []*db.AgentVolumeRecord
+	var unacknowledgedTotal int
 	var err error
 
 	if isAdmin {
@@ -1185,11 +1186,21 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
 			return
 		}
+		unacknowledgedTotal, err = h.db.CountUnacknowledgedThreatIntentsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count unacknowledged intents: %v", err)})
+			return
+		}
 		agents, err = h.db.GetTopAgentsByOrg(orgID, 5, 0)
 	} else {
 		metrics, err = h.db.GetUserMetrics(userDID, orgID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
+			return
+		}
+		unacknowledgedTotal, err = h.db.CountUnacknowledgedThreatIntentsByUser(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count unacknowledged intents: %v", err)})
 			return
 		}
 		agents, err = h.db.GetTopAgentsByUser(userDID, orgID, 5, 0)
@@ -1224,6 +1235,7 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 			"appCount24hChange":          metrics.AppCount24hChange,
 			"agentList":                  agentList,
 			"flowEnabled":                metrics.AgentCount > 0,
+			"unacknowledgedTotal":        unacknowledgedTotal,
 		},
 	})
 }

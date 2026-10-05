@@ -2058,7 +2058,36 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 	return r, nil
 }
 
-// UpdateIntentReviewStatus sets the human-triage review_status (Ongoing /
+// CountUnacknowledgedThreatIntentsByOrg counts the org's threat intents
+// (threat_detected = 1) whose review_status is anything other than
+// Acknowledged. Clean intents never count, whatever their review_status.
+func (d *DB) CountUnacknowledgedThreatIntentsByOrg(orgID string) (int, error) {
+	var n int
+	err := d.conn.QueryRow(`
+		SELECT COUNT(*) FROM new_intents
+		WHERE organization_id = $1
+		  AND threat_detected = 1
+		  AND COALESCE(review_status, 'Unreviewed') <> 'Acknowledged'`,
+		orgID,
+	).Scan(&n)
+	return n, err
+}
+
+// CountUnacknowledgedThreatIntentsByUser is the user-scoped variant of
+// CountUnacknowledgedThreatIntentsByOrg, limited to the intents the user can see.
+func (d *DB) CountUnacknowledgedThreatIntentsByUser(userDID, orgID string) (int, error) {
+	var n int
+	err := d.conn.QueryRow(userScopeIntentsCTE+`
+		SELECT COUNT(*) FROM new_intents ni
+		WHERE ni.intent_id IN (SELECT intent_id FROM user_intents)
+		  AND ni.threat_detected = 1
+		  AND COALESCE(ni.review_status, 'Unreviewed') <> 'Acknowledged'`,
+		userDID, orgID,
+	).Scan(&n)
+	return n, err
+}
+
+// UpdateIntentReviewStatus sets the human-triage review_status (Unreviewed /
 // Acknowledged / Flagged) for an intent, scoped to the caller's org so one
 // org can't touch another's intents. Returns sql.ErrNoRows if no row matched
 // (bad intentID or org mismatch).
