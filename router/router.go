@@ -50,8 +50,6 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/intent-info", h.IntentInfo)
 	dashboard.POST("/update-intent-status", h.UpdateIntentStatus)
 	dashboard.GET("/intent-diagram", h.IntentDiagram)
-	dashboard.GET("/intent-block-data", h.GetIntentBlockData)
-	dashboard.GET("/intent-raw-data", h.GetIntentRawData)
 	dashboard.POST("/update-password", h.UpdatePassword)
 	dashboard.POST("/update-profile", h.UpdateProfile)
 	dashboard.GET("/tools-list", h.ToolsList)
