@@ -2,7 +2,6 @@ package db
 
 import (
 	"database/sql"
-	"encoding/json"
 	"log"
 	"time"
 
@@ -212,33 +211,6 @@ type OrgUserRecord struct {
 	Key             string
 }
 
-type IntentBlockRecord struct {
-	ID             string
-	IntentID       string
-	BlockIndex     int
-	AgentDID       string
-	AgentName      string
-	Direction      string
-	BlockType      string
-	Message        string
-	Response       string
-	DelegateTo     string
-	ReceivedFrom   string
-	CbacApp        string
-	CbacDecision   string
-	ThreatDetected bool
-	TrustIssues    []string
-	Signature      string
-	CreatedAt      time.Time
-	FromDID        string
-	FromName       string
-	FromType       string
-	ToDID          string
-	ToName         string
-	ToType         string
-	RawData        json.RawMessage
-}
-
 type DB struct {
 	conn *sql.DB
 }
@@ -375,44 +347,7 @@ func New(dsn string) *DB {
 		log.Fatal(err)
 	}
 
-	_, err = conn.Exec(`
-		CREATE TABLE IF NOT EXISTS intent_block_data (
-			id             TEXT PRIMARY KEY,
-			intent_id      TEXT NOT NULL,
-			block_index    INTEGER,
-			agent_did      TEXT DEFAULT '',
-			agent_name     TEXT DEFAULT '',
-			direction      TEXT DEFAULT '',
-			block_type     TEXT DEFAULT '',
-			message        TEXT DEFAULT '',
-			response       TEXT DEFAULT '',
-			delegate_to    TEXT DEFAULT '',
-			received_from  TEXT DEFAULT '',
-			cbac_app       TEXT DEFAULT '',
-			cbac_decision  TEXT DEFAULT '',
-			threat_detected INTEGER DEFAULT 0,
-			trust_issues   TEXT DEFAULT '[]',
-			created_at     TIMESTAMPTZ DEFAULT NOW()
-		);
-	`)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	// Runtime migrations for existing databases.
-	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS from_did  TEXT NOT NULL DEFAULT ''`)
-	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS from_name TEXT NOT NULL DEFAULT ''`)
-	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS from_type TEXT NOT NULL DEFAULT ''`)
-	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_did    TEXT NOT NULL DEFAULT ''`)
-	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_name   TEXT NOT NULL DEFAULT ''`)
-	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS to_type   TEXT NOT NULL DEFAULT ''`)
-	// raw_data was referenced by StoreIntentBlockData's INSERT and
-	// GetIntentBlocksByIntent's SELECT since they were written, but the
-	// column itself was never created — every insert silently failed
-	// (logged, not fatal) and every read errored outright. Backfilling it
-	// only starts rows saving correctly from here on; nothing existed to
-	// recover for rows inserted before this.
-	conn.Exec(`ALTER TABLE intent_block_data ADD COLUMN IF NOT EXISTS raw_data JSONB NOT NULL DEFAULT '{}'::jsonb`)
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE`)
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS message TEXT DEFAULT ''`)

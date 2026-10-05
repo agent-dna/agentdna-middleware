@@ -658,69 +658,22 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 		executor = initiatorDID
 	}
 
-	// Build child map: parent node → its children (envelopes that list it as parent).
-	// Used to derive the "to" of each node.
-	childMap := map[*workflowEnvelope][]*workflowEnvelope{}
-	visitedCM := map[*workflowEnvelope]bool{}
-	var buildChildMap func(e *workflowEnvelope)
-	buildChildMap = func(e *workflowEnvelope) {
-		if e == nil || visitedCM[e] {
-			return
-		}
-		visitedCM[e] = true
-		for _, p := range e.ParentEnvelope {
-			childMap[p] = append(childMap[p], e)
-			buildChildMap(p)
-		}
-	}
-	buildChildMap(data.Envelope)
-
-	// ── Store one raw block row per envelope node ─────────────────────────────
+	// ── Store a threat row per threat-signalling envelope ─────────────────────
 	hashToThreatID := map[string]string{} // envelope hash → threat ID, for linking interactions
 	for idx, env := range allEnvelopes {
-		// Derive to: first child's From, or initiatorDID for root if different.
-		var toDID string
-		if children := childMap[env]; len(children) > 0 {
-			toDID = children[0].From
-		} else if env.From != initiatorDID {
-			toDID = initiatorDID
-		}
-
-		rawJSON, _ := json.Marshal(env)
 		msg := extractPayloadText(env.Payload)
 		threat := env.Code != 0 && env.Code != 1000
 
-		// Keyed by the envelope's own hash rather than idx: idx is only this
-		// call's local position in its own DAG walk, and since intent_id is
-		// now shared across every txn/branch of one nftId, two different
-		// txns' envelopes can land on the same idx. A hash-based id is stable
-		// and collision-free across calls — the same envelope reappearing in
-		// a later txn's shared prefix maps to the same id (safe no-op via
-		// ON CONFLICT DO NOTHING below), while two different envelopes never
-		// collide.
+		// threats.interaction_id is keyed by the envelope's own hash rather
+		// than idx: idx is only this call's local position in its own DAG
+		// walk, and since intent_id is shared across every txn/branch of one
+		// nftId, two different txns' envelopes can land on the same idx. A
+		// hash-based id is stable and collision-free across calls.
 		blockIDSuffix := env.Hash
 		if blockIDSuffix == "" {
 			blockIDSuffix = fmt.Sprintf("idx%d", idx)
 		}
 		blockID := fmt.Sprintf("%s-block-%s", intentID, blockIDSuffix)
-		blockRec := &db.IntentBlockRecord{
-			ID:             blockID,
-			IntentID:       intentID,
-			BlockIndex:     idx,
-			AgentDID:       env.From,
-			AgentName:      h.resolveActorName(env.From, ""),
-			Message:        msg,
-			Signature:      env.Signature,
-			ThreatDetected: threat,
-			TrustIssues:    []string{},
-			CreatedAt:      time.Unix(env.Epoch, 0).UTC(),
-			FromDID:        env.From,
-			ToDID:          toDID,
-			RawData:        json.RawMessage(rawJSON),
-		}
-		if err := h.db.StoreIntentBlockData(blockRec); err != nil {
-			log.Printf("[intentWorkflow] block data save error idx=%d: %v", idx, err)
-		}
 
 		// If this envelope signals a threat, resolve the message and store it.
 		if threat {
@@ -923,95 +876,6 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 	log.Printf("[intentWorkflow] saved intent_id=%s new_interactions=%d total_interactions=%d threat=%v flowType=%s",
 		intentID, len(assignment.InsertIDs), len(allInteractionIDs), threatDetected, flowType)
 	return branch, nil
-}
-
-func (h *Handler) GetIntentBlockData(c *gin.Context) {
-	intentID := c.Query("intent_id")
-	if intentID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intent_id is required"})
-		return
-	}
-	blocks, err := h.db.GetIntentBlocksByIntent(intentID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
-		return
-	}
-	type blockActor struct {
-		DID  string `json:"did"`
-		Name string `json:"name"`
-		Type string `json:"type"`
-	}
-	type blockOut struct {
-		ID             string     `json:"id"`
-		BlockIndex     int        `json:"block_index"`
-		BlockType      string     `json:"block_type"`
-		From           blockActor `json:"from"`
-		To             blockActor `json:"to"`
-		Message        string     `json:"message"`
-		Signature      string     `json:"signature"`
-		ThreatDetected bool       `json:"threat_detected"`
-		TrustIssues    []string   `json:"trust_issues"`
-		CreatedAt      string     `json:"created_at"`
-		ParentBlock    *blockOut  `json:"parent_block"`
-	}
-	// Build nested structure: blocks[0] is innermost (no parent), each successive
-	// block wraps the previous as parent_block, outermost (latest) is the root.
-	var root *blockOut
-	for _, b := range blocks {
-		issues := b.TrustIssues
-		if issues == nil {
-			issues = []string{}
-		}
-		node := &blockOut{
-			ID:         b.ID,
-			BlockIndex: b.BlockIndex,
-			BlockType:  b.BlockType,
-			From: blockActor{
-				DID:  b.FromDID,
-				Name: b.FromName,
-				Type: b.FromType,
-			},
-			To: blockActor{
-				DID:  b.ToDID,
-				Name: b.ToName,
-				Type: b.ToType,
-			},
-			Message:        b.Message,
-			Signature:      b.Signature,
-			ThreatDetected: b.ThreatDetected,
-			TrustIssues:    issues,
-			CreatedAt:      b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-			ParentBlock:    root,
-		}
-		root = node
-	}
-	c.JSON(http.StatusOK, Response{Status: true, Data: root})
-}
-
-func (h *Handler) GetIntentRawData(c *gin.Context) {
-	intentID := c.Query("intent_id")
-	if intentID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intent_id is required"})
-		return
-	}
-	blocks, err := h.db.GetIntentBlocksByIntent(intentID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
-		return
-	}
-	type blockRaw struct {
-		BlockIndex int             `json:"block_index"`
-		RawData    json.RawMessage `json:"raw_data"`
-	}
-	result := make([]blockRaw, 0, len(blocks))
-	for _, b := range blocks {
-		raw := b.RawData
-		if len(raw) == 0 {
-			raw = json.RawMessage("{}")
-		}
-		result = append(result, blockRaw{BlockIndex: b.BlockIndex, RawData: raw})
-	}
-	c.JSON(http.StatusOK, Response{Status: true, Data: result})
 }
 
 func (h *Handler) issueToken(claims JWTClaims) (string, error) {

@@ -285,41 +285,6 @@ func detectFlowTypeFromExtracts(interactions []interactionExtract) string {
 	}
 }
 
-// resolveActorName looks up a display name for the given DID from the agents
-// table first, then the users table. Falls back to the envelope-provided name
-// if neither has a record or the DID is empty.
-// buildEnvelopeChain converts an ordered slice of IntentBlockRecords (oldest first)
-// into a nested *workflowEnvelope tree for the /intent-block-data and /intent-diagram APIs.
-func buildEnvelopeChain(blocks []*db.IntentBlockRecord) *workflowEnvelope {
-	if len(blocks) == 0 {
-		return nil
-	}
-	var prev *workflowEnvelope
-	for _, b := range blocks {
-		code := 1000
-		if b.ThreatDetected {
-			code = 2001
-		}
-		payloadJSON, _ := json.Marshal(b.Message)
-		env := &workflowEnvelope{
-			From:      b.FromDID,
-			Payload:   json.RawMessage(payloadJSON),
-			Epoch:     b.CreatedAt.Unix(),
-			Code:      code,
-			Signature: b.Signature,
-			RawData:   b.RawData,
-		}
-		if prev != nil {
-			env.ParentEnvelope = []*workflowEnvelope{prev}
-		}
-		prev = env
-	}
-	if prev != nil && len(blocks) > 0 {
-		prev.To = blocks[len(blocks)-1].ToDID
-	}
-	return prev
-}
-
 // hopIDKind classifies an already-stored interaction_id by its shape, as
 // produced by resolveBranchIDs: plain trunk ("<intentID>-N") or a branch hop
 // ("<intentID>-<forkPos>-<letter>-<offset>").
@@ -511,6 +476,9 @@ func resolveBranchIDs(intentID string, existing []db.IntentHopRow, interactions 
 	return branchAssignment{InsertIDs: ids, FirstNew: matched, Renamed: renamed}
 }
 
+// resolveActorName looks up a display name for the given DID from the agents
+// table first, then the users table. Falls back to the envelope-provided name
+// if neither has a record or the DID is empty.
 func (h *Handler) resolveActorName(did, fallback string) string {
 	if did == "" || did == "none" {
 		return fallback
