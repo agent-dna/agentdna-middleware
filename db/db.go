@@ -293,7 +293,18 @@ func New(dsn string) *DB {
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS direction TEXT DEFAULT '';
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT '';
 		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT '';
-		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS raw_data JSONB NOT NULL DEFAULT '{}'::jsonb;
+		-- JSON (not JSONB): JSON keeps the input text exactly, JSONB reorders keys
+		-- and strips whitespace. raw_data must be the envelope exactly as received.
+		ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS raw_data JSON NOT NULL DEFAULT '{}'::json;
+		DO $$
+		BEGIN
+			IF EXISTS (SELECT 1 FROM information_schema.columns
+			           WHERE table_name = 'new_interactions' AND column_name = 'raw_data' AND data_type = 'jsonb') THEN
+				ALTER TABLE new_interactions ALTER COLUMN raw_data DROP DEFAULT;
+				ALTER TABLE new_interactions ALTER COLUMN raw_data TYPE JSON USING raw_data::json;
+				ALTER TABLE new_interactions ALTER COLUMN raw_data SET DEFAULT '{}'::json;
+			END IF;
+		END $$;
 		ALTER TABLE new_interactions DROP COLUMN IF EXISTS provenance_req_id;
 		ALTER TABLE new_interactions DROP COLUMN IF EXISTS provenance_record_id;
 		DO $$

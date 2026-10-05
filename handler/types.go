@@ -141,8 +141,27 @@ type workflowEnvelope struct {
 	RunID          string              `json:"run_id"`
 	Hash           string              `json:"hash"`
 	Signature      string              `json:"signature"`
-	RawData        json.RawMessage     `json:"raw_data,omitempty"`
 	ParentEnvelope []*workflowEnvelope `json:"parent_envelope"`
+
+	// raw is this envelope's exact bytes as received (including its nested
+	// parent_envelope chain), captured by UnmarshalJSON. Stored verbatim in
+	// new_interactions.raw_data; never re-encoded.
+	raw json.RawMessage
+}
+
+// UnmarshalJSON decodes the envelope as usual and also keeps a copy of the
+// exact input bytes. Nested parent envelopes go through this too, so every
+// node in the DAG carries its own untouched raw bytes.
+func (e *workflowEnvelope) UnmarshalJSON(b []byte) error {
+	type plain workflowEnvelope // drops the method, avoiding recursion
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*e = workflowEnvelope(p)
+	// encoding/json may reuse b after we return, so copy it.
+	e.raw = append(json.RawMessage(nil), b...)
+	return nil
 }
 
 // interactionExtract holds one extracted hop from the chain.
