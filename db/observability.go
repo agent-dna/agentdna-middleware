@@ -180,7 +180,7 @@ func (d *DB) GetObsIntentInfo(orgID string, intentIDs []string) (map[string]*Obs
 	rows, err := d.conn.Query(
 		`SELECT ni.intent_id,
 		        COALESCE((SELECT message FROM new_interactions WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), ''),
-		        COALESCE(ni.review_status, 'Ongoing'),
+		        COALESCE(ni.review_status, 'Unreviewed'),
 		        ni.started_at
 		 FROM new_intents ni
 		 WHERE ni.intent_id = ANY($1)`,

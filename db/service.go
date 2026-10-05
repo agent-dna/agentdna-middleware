@@ -530,7 +530,7 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		SELECT ni.intent_id, ni.initiator_did,
 		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
-		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Ongoing'), ni.threat_detected,
+		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Unreviewed'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COUNT(i.interaction_id)                                                  AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
@@ -635,7 +635,7 @@ func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
 		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
 		       COALESCE(ni.signature, ''), COALESCE(ni.threat_id, ''),
-		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Ongoing')
+		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Unreviewed')
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
@@ -763,7 +763,7 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
 		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
 		       COALESCE(ni.signature, ''), COALESCE(ni.threat_id, ''),
-		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Ongoing')
+		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Unreviewed')
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
@@ -1802,7 +1802,7 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 		SELECT ni.intent_id, ni.initiator_did,
 		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
-		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Ongoing'), ni.threat_detected,
+		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Unreviewed'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COUNT(i.interaction_id)                                                AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
@@ -2016,7 +2016,7 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 		SELECT ni.intent_id, ni.initiator_did,
 		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
-		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Ongoing'), ni.threat_detected,
+		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Unreviewed'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COUNT(i.interaction_id)                                                AS interactions_count,
 		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,

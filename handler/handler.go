@@ -2468,13 +2468,13 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 }
 
 var validIntentReviewStatuses = map[string]bool{
-	"Ongoing":      true,
+	"Unreviewed":   true,
 	"Acknowledged": true,
 	"Flagged":      true,
 }
 
 // POST /dashboard/v1/update-intent-status
-// Body: {"intentID": "...", "status": "Acknowledged" | "Flagged" | "Ongoing"}
+// Body: {"intentID": "...", "status": "Acknowledged" | "Flagged" | "Unreviewed"}
 func (h *Handler) UpdateIntentStatus(c *gin.Context) {
 	w := http.ResponseWriter(c.Writer)
 	enableCors(&w)
@@ -2498,7 +2498,7 @@ func (h *Handler) UpdateIntentStatus(c *gin.Context) {
 		return
 	}
 	if !validIntentReviewStatuses[req.Status] {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "status must be one of Ongoing, Acknowledged, Flagged"})
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "status must be one of Unreviewed, Acknowledged, Flagged"})
 		return
 	}
 
