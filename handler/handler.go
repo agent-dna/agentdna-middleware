@@ -863,7 +863,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 
 	flowType := detectFlowTypeFromExtracts(interactions)
 	if isNewIntent {
-		if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, len(allEnvelopes), threatDetected, allInteractionIDs); err != nil {
+		if err := h.db.StoreIntent(intentID, initiatorDID, initiatorName, orgID, flowType, executor, len(allEnvelopes), threatDetected, allInteractionIDs); err != nil {
 			log.Printf("[intentWorkflow] intent save error: %v", err)
 			return nil, err
 		}

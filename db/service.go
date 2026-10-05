@@ -528,7 +528,7 @@ func (d *DB) CountIntentsByUser(userDID, orgID string) (int, error) {
 func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(userScopeIntentsCTE+`
 		SELECT ni.intent_id, ni.initiator_did,
-		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
+		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), NULLIF(ni.initiator_name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
 		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Unreviewed'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
@@ -1451,7 +1451,7 @@ func (d *DB) IntentExists(intentID string) (bool, error) {
 	return exists, err
 }
 
-func (d *DB) StoreIntent(intentID, initiatorDID, orgID, flowType, executor string, chainDepth int, threatDetected bool, interactionIDs []string) error {
+func (d *DB) StoreIntent(intentID, initiatorDID, initiatorName, orgID, flowType, executor string, chainDepth int, threatDetected bool, interactionIDs []string) error {
 	interactionIDsJSON, err := json.Marshal(interactionIDs)
 	if err != nil {
 		return err
@@ -1462,9 +1462,9 @@ func (d *DB) StoreIntent(intentID, initiatorDID, orgID, flowType, executor strin
 	}
 	_, err = d.conn.Exec(
 		`INSERT INTO new_intents
-		 (intent_id, initiator_did, organization_id, interaction_ids, status, threat_detected, flow_type, executor, chain_depth)
-		 VALUES ($1, $2, $3, $4, 'completed', $5, $6, $7, $8) ON CONFLICT DO NOTHING`,
-		intentID, initiatorDID, orgID, string(interactionIDsJSON), threatInt, flowType, executor, chainDepth,
+		 (intent_id, initiator_did, initiator_name, organization_id, interaction_ids, status, threat_detected, flow_type, executor, chain_depth)
+		 VALUES ($1, $2, $3, $4, $5, 'completed', $6, $7, $8, $9) ON CONFLICT DO NOTHING`,
+		intentID, initiatorDID, initiatorName, orgID, string(interactionIDsJSON), threatInt, flowType, executor, chainDepth,
 	)
 	return err
 }
@@ -1800,7 +1800,7 @@ func (d *DB) CountIntentsByOrg(orgID string) (int, error) {
 func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
 		SELECT ni.intent_id, ni.initiator_did,
-		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
+		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), NULLIF(ni.initiator_name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
 		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Unreviewed'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
@@ -1874,7 +1874,7 @@ func (d *DB) CountAgentIntents(agentDID, orgID string) (int, error) {
 
 func (d *DB) GetAgentIntents(agentDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at,
+		SELECT ni.intent_id, ni.initiator_did, COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), NULLIF(ni.initiator_name, ''), ''), ni.started_at,
 		       ni.ended_at, ni.status, ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COALESCE((SELECT message FROM new_interactions
@@ -1882,8 +1882,9 @@ func (d *DB) GetAgentIntents(agentDID, orgID string, limit, offset int) ([]*Inte
 		FROM new_intents ni
 		JOIN new_interactions i ON i.intent_id = ni.intent_id
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
 		WHERE i.initiator_did = $1 AND ni.organization_id = $2
-		GROUP BY ni.intent_id, u.name
+		GROUP BY ni.intent_id, u.name, ag_init.name
 		ORDER BY ni.started_at DESC
 		LIMIT $3 OFFSET $4`,
 		agentDID, orgID, limit, offset,
@@ -1906,13 +1907,14 @@ func (d *DB) CountUserIntents(userDID, orgID string) (int, error) {
 
 func (d *DB) GetUserIntents(userDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT ni.intent_id, ni.initiator_did, COALESCE(u.name, ''), ni.started_at, ni.ended_at,
+		SELECT ni.intent_id, ni.initiator_did, COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), NULLIF(ni.initiator_name, ''), ''), ni.started_at, ni.ended_at,
 		       ni.status, ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
 		       COALESCE((SELECT message FROM new_interactions
 		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
 		WHERE ni.initiator_did = $1 AND ni.organization_id = $2
 		ORDER BY ni.started_at DESC
 		LIMIT $3 OFFSET $4`,
@@ -2014,7 +2016,7 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 	var threatInt int
 	err := d.conn.QueryRow(`
 		SELECT ni.intent_id, ni.initiator_did,
-		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
+		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), NULLIF(ni.initiator_name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
 		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Unreviewed'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
@@ -2208,7 +2210,7 @@ func (d *DB) CountIntentsByTool(toolDID, orgID string) (int, error) {
 func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
 		SELECT ni.intent_id, ni.initiator_did,
-		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), ''),
+		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), NULLIF(ni.initiator_name, ''), ''),
 		       COALESCE(ni.organization_id, ''),
 		       ni.started_at, ni.ended_at, ni.status, ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
