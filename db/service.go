@@ -1382,7 +1382,43 @@ func (d *DB) GetAgentNFTID(agentDID string) (string, error) {
 	return nftID.String, err
 }
 
-func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message, signature, hash, threatID string, rawData json.RawMessage, eventTime time.Time) error {
+// intentLockNamespace is the first key of the two-key advisory lock taken per
+// intent, so these locks can never collide with any other advisory lock the
+// app (or another service on the same database) takes in future.
+const intentLockNamespace = 7301
+
+// lockIntent blocks until this transaction holds the advisory lock for
+// intentID. It's released automatically when the transaction commits or rolls
+// back. Two different intents only contend if their hashtext() collides,
+// which just serializes them — harmless.
+func lockIntent(tx *sql.Tx, intentID string) error {
+	_, err := tx.Exec(`SELECT pg_advisory_xact_lock($1, hashtext($2))`, intentLockNamespace, intentID)
+	return err
+}
+
+
+type IntentTx struct {
+	tx *sql.Tx
+}
+
+
+func (d *DB) WithIntentLock(intentID string, fn func(t *IntentTx) error) error {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+
+	if err := lockIntent(tx, intentID); err != nil {
+		return fmt.Errorf("lock intent %s: %w", intentID, err)
+	}
+	if err := fn(&IntentTx{tx: tx}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (t *IntentTx) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDID, interactedToName, interactionType, direction string, threat bool, intentID, orgID, message, signature, hash, threatID string, rawData json.RawMessage, eventTime time.Time) error {
 	threatInt := 0
 	if threat {
 		threatInt = 1
@@ -1393,7 +1429,7 @@ func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDI
 	if len(rawData) == 0 {
 		rawData = json.RawMessage("{}")
 	}
-	_, err := d.conn.Exec(
+	_, err := t.tx.Exec(
 		`INSERT INTO new_interactions
 		 (interaction_id, initiator_did, initiator_name, interacted_to_did, interacted_to_name, type, direction, threat, intent_id, organization_id, message, signature, hash, threat_id, raw_data, time)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) ON CONFLICT DO NOTHING`,
@@ -1406,8 +1442,8 @@ func (d *DB) StoreNewInteraction(id, initiatorDID, initiatorName, interactedToDI
 // later txn reveals that a position previously thought to be plain trunk
 // ("<intentID>-N") was actually the start of a fork, so it's retroactively
 // relabeled into branch "a" ("<intentID>-N-a-1").
-func (d *DB) RenameInteractionID(oldID, newID string) error {
-	_, err := d.conn.Exec(`UPDATE new_interactions SET interaction_id = $1 WHERE interaction_id = $2`, newID, oldID)
+func (t *IntentTx) RenameInteractionID(oldID, newID string) error {
+	_, err := t.tx.Exec(`UPDATE new_interactions SET interaction_id = $1 WHERE interaction_id = $2`, newID, oldID)
 	return err
 }
 
@@ -1423,8 +1459,8 @@ type IntentHopRow struct {
 // GetIntentHops returns every stored hop for the given intent_id (nftId),
 // across every branch, unordered — the caller sorts/classifies by parsing
 // each InteractionID's numeric/branch suffix.
-func (d *DB) GetIntentHops(intentID string) ([]IntentHopRow, error) {
-	rows, err := d.conn.Query(
+func (t *IntentTx) GetIntentHops(intentID string) ([]IntentHopRow, error) {
+	rows, err := t.tx.Query(
 		`SELECT interaction_id, COALESCE(hash, ''), initiator_did, interacted_to_did FROM new_interactions WHERE intent_id = $1`,
 		intentID,
 	)
@@ -1452,7 +1488,7 @@ func (d *DB) IntentExists(intentID string) (bool, error) {
 	return exists, err
 }
 
-func (d *DB) StoreIntent(intentID, initiatorDID, initiatorName, orgID, flowType, executor string, chainDepth int, threatDetected bool, interactionIDs []string) error {
+func (t *IntentTx) StoreIntent(intentID, initiatorDID, initiatorName, orgID, flowType, executor string, chainDepth int, threatDetected bool, interactionIDs []string) error {
 	interactionIDsJSON, err := json.Marshal(interactionIDs)
 	if err != nil {
 		return err
@@ -1461,7 +1497,7 @@ func (d *DB) StoreIntent(intentID, initiatorDID, initiatorName, orgID, flowType,
 	if threatDetected {
 		threatInt = 1
 	}
-	_, err = d.conn.Exec(
+	_, err = t.tx.Exec(
 		`INSERT INTO new_intents
 		 (intent_id, initiator_did, initiator_name, organization_id, interaction_ids, status, threat_detected, flow_type, executor, chain_depth)
 		 VALUES ($1, $2, $3, $4, $5, 'completed', $6, $7, $8, $9) ON CONFLICT DO NOTHING`,
@@ -1473,7 +1509,7 @@ func (d *DB) StoreIntent(intentID, initiatorDID, initiatorName, orgID, flowType,
 // MergeIntentBranch folds a later txn's branch into an already-existing
 // intent (nftId): the interaction_ids list, threat flag and chain depth all
 // need to account for every branch now, not just the one this txn added.
-func (d *DB) MergeIntentBranch(intentID string, chainDepth int, threatDetected bool, interactionIDs []string) error {
+func (t *IntentTx) MergeIntentBranch(intentID string, chainDepth int, threatDetected bool, interactionIDs []string) error {
 	interactionIDsJSON, err := json.Marshal(interactionIDs)
 	if err != nil {
 		return err
@@ -1482,7 +1518,7 @@ func (d *DB) MergeIntentBranch(intentID string, chainDepth int, threatDetected b
 	if threatDetected {
 		threatInt = 1
 	}
-	_, err = d.conn.Exec(
+	_, err = t.tx.Exec(
 		`UPDATE new_intents
 		 SET interaction_ids = $2,
 		     threat_detected = CASE WHEN threat_detected = 1 THEN 1 ELSE $3 END,
@@ -1582,6 +1618,12 @@ func (d *DB) RollbackBranch(intentID string, insertedIDs []string, renamed []Ren
 		return 0, 0, err
 	}
 	defer tx.Rollback() // no-op after a successful Commit
+
+	// Same per-intent lock as WithIntentLock, so a rollback can't interleave
+	// with another txn of this intent resolving/relabeling branches.
+	if err := lockIntent(tx, intentID); err != nil {
+		return 0, 0, err
+	}
 
 	pairs, err := collectToolAgentPairsByIDs(tx, insertedIDs)
 	if err != nil {
