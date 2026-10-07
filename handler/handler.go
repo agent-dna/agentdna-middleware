@@ -844,9 +844,9 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 			}
 			log.Printf("[intentWorkflow] interaction id=%s from=%s to=%s type=%s threat=%v", iid, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
 
-			// If this interaction's target is a registered tool, record (after
-			// commit) that the initiating agent has contacted it.
-			if h.db.IsNewTool(ix.ToDID) {
+			// If this interaction's target is a registered tool, record (afte
+	
+			if h.db.IsNewTool(ix.ToDID) && !h.db.IsNewTool(ix.FromDID) {
 				toolContacts = append(toolContacts, [2]string{ix.ToDID, ix.FromDID})
 			}
 		}
