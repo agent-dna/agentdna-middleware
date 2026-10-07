@@ -1324,6 +1324,12 @@ func (d *DB) IsNewTool(did string) bool {
 	return exists
 }
 
+func (d *DB) GetToolNameByDID(did string) (string, error) {
+	var name string
+	err := d.conn.QueryRow(`SELECT COALESCE(name, '') FROM new_tools WHERE did = $1`, did).Scan(&name)
+	return name, err
+}
+
 func (d *DB) RevokeAgent(agentDID string) error {
 	res, err := d.conn.Exec(`UPDATE new_agents SET revoked = TRUE WHERE did = $1`, agentDID)
 	if err != nil {

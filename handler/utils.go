@@ -496,6 +496,9 @@ func (h *Handler) resolveActorName(did, fallback string) string {
 	if name, err := h.db.GetOrgUserNameByDID(did); err == nil && name != "" {
 		return name
 	}
+	if name, err := h.db.GetToolNameByDID(did); err == nil && name != "" {
+		return name
+	}
 	return fallback
 }
 
