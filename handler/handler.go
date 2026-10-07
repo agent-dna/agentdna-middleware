@@ -798,83 +798,112 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 	// (fully duplicate replay), a plain trunk extension, or a genuine fork
 	// (optionally relabeling the existing trunk tail into branch "a" the
 	// first time a fork is discovered at a given position).
-	existingHops, err := h.db.GetIntentHops(intentID)
-	if err != nil {
-		return nil, fmt.Errorf("handleIntentWorkflow: GetIntentHops: %v", err)
-	}
-	isNewIntent := len(existingHops) == 0
-	assignment := resolveBranchIDs(intentID, existingHops, interactions)
-
-	for _, r := range assignment.Renamed {
-		if err := h.db.RenameInteractionID(r.From, r.To); err != nil {
-			return nil, fmt.Errorf("handleIntentWorkflow: RenameInteractionID %s->%s: %v", r.From, r.To, err)
+	//
+	// Everything from reading the existing hops through saving the intent row
+	// runs in one transaction holding this intent's advisory lock. Without it,
+	// two txns of the same nftId arriving close together (parallel agent
+	// branches) both read "no hops yet", both mint "<id>-1..N", and the
+	// second's rows are silently dropped by ON CONFLICT DO NOTHING — leaving
+	// one straight line instead of a fork. With it, the later txn waits, then
+	// sees the earlier one's rows and resolves a proper branch.
+	var (
+		branch            *branchWriteResult
+		toolContacts      [][2]string // (tool, agent) pairs, applied after commit
+		threatDetected    bool
+		flowType          string
+		allInteractionIDs []string
+		insertedCount     int
+	)
+	err = h.db.WithIntentLock(intentID, func(tx *db.IntentTx) error {
+		existingHops, err := tx.GetIntentHops(intentID)
+		if err != nil {
+			return fmt.Errorf("GetIntentHops: %v", err)
 		}
-		log.Printf("[intentWorkflow] relabeled trunk row into branch %s -> %s", r.From, r.To)
-	}
+		isNewIntent := len(existingHops) == 0
+		assignment := resolveBranchIDs(intentID, existingHops, interactions)
 
-	// ── Store only the newly-discovered interactions ─────────────────────────
-	threatDetected := false
-	for i, iid := range assignment.InsertIDs {
-		ix := interactions[assignment.FirstNew+i]
-		if ix.Threat {
-			threatDetected = true
+		for _, r := range assignment.Renamed {
+			if err := tx.RenameInteractionID(r.From, r.To); err != nil {
+				return fmt.Errorf("RenameInteractionID %s->%s: %v", r.From, r.To, err)
+			}
+			log.Printf("[intentWorkflow] relabeled trunk row into branch %s -> %s", r.From, r.To)
 		}
-		eventTime := time.Unix(ix.Epoch, 0).UTC()
-		threatID := hashToThreatID[ix.Hash]
-		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, ix.Hash, threatID, ix.RawData, eventTime,
-		); err != nil {
-			return nil, fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
-		}
-		log.Printf("[intentWorkflow] interaction id=%s from=%s to=%s type=%s threat=%v", iid, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
 
-		// If this interaction's target is a registered tool, record that the
-		// initiating agent has contacted it.
-		if h.db.IsNewTool(ix.ToDID) {
-			if err := h.db.AddAgentToToolList(ix.ToDID, ix.FromDID); err != nil {
-				log.Printf("[intentWorkflow] AddAgentToToolList tool=%s agent=%s: %v", ix.ToDID, ix.FromDID, err)
+		// ── Store only the newly-discovered interactions ─────────────────────
+		for i, iid := range assignment.InsertIDs {
+			ix := interactions[assignment.FirstNew+i]
+			if ix.Threat {
+				threatDetected = true
+			}
+			eventTime := time.Unix(ix.Epoch, 0).UTC()
+			threatID := hashToThreatID[ix.Hash]
+			if err := tx.StoreNewInteraction(
+				iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, ix.Hash, threatID, ix.RawData, eventTime,
+			); err != nil {
+				return fmt.Errorf("StoreNewInteraction: %v", err)
+			}
+			log.Printf("[intentWorkflow] interaction id=%s from=%s to=%s type=%s threat=%v", iid, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
+
+			// If this interaction's target is a registered tool, record (after
+			// commit) that the initiating agent has contacted it.
+			if h.db.IsNewTool(ix.ToDID) {
+				toolContacts = append(toolContacts, [2]string{ix.ToDID, ix.FromDID})
 			}
 		}
+
+		branch = &branchWriteResult{IntentID: intentID, InsertedIDs: assignment.InsertIDs, Renamed: assignment.Renamed}
+		if branch.isEmpty() {
+			return nil
+		}
+
+		// ── Store/merge the intent row ───────────────────────────────────────
+		// interaction_ids reflects every hop stored for this intent across
+		// every branch — existing rows (with any rename applied) plus what
+		// this call just inserted — not just this txn's own contribution.
+		renameMap := make(map[string]string, len(assignment.Renamed))
+		for _, r := range assignment.Renamed {
+			renameMap[r.From] = r.To
+		}
+		allInteractionIDs = make([]string, 0, len(existingHops)+len(assignment.InsertIDs))
+		for _, row := range existingHops {
+			id := row.InteractionID
+			if newID, ok := renameMap[id]; ok {
+				id = newID
+			}
+			allInteractionIDs = append(allInteractionIDs, id)
+		}
+		allInteractionIDs = append(allInteractionIDs, assignment.InsertIDs...)
+		insertedCount = len(assignment.InsertIDs)
+
+		flowType = detectFlowTypeFromExtracts(interactions)
+		if isNewIntent {
+			if err := tx.StoreIntent(intentID, initiatorDID, initiatorName, orgID, flowType, executor, len(allEnvelopes), threatDetected, allInteractionIDs); err != nil {
+				return fmt.Errorf("intent save: %v", err)
+			}
+		} else {
+			if err := tx.MergeIntentBranch(intentID, len(allEnvelopes), threatDetected, allInteractionIDs); err != nil {
+				return fmt.Errorf("intent merge: %v", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("[intentWorkflow] intent_id=%s: branch write failed, rolled back: %v", intentID, err)
+		return nil, fmt.Errorf("handleIntentWorkflow: %v", err)
 	}
 
-	branch := &branchWriteResult{IntentID: intentID, InsertedIDs: assignment.InsertIDs, Renamed: assignment.Renamed}
+	for _, tc := range toolContacts {
+		if err := h.db.AddAgentToToolList(tc[0], tc[1]); err != nil {
+			log.Printf("[intentWorkflow] AddAgentToToolList tool=%s agent=%s: %v", tc[0], tc[1], err)
+		}
+	}
+
 	if branch.isEmpty() {
 		log.Printf("[intentWorkflow] intent_id=%s: this txn was a fully duplicate replay of hops already stored, nothing new to save", intentID)
 		return branch, nil
 	}
-
-	// ── Store/merge the intent row ───────────────────────────────────────────
-	// interaction_ids reflects every hop stored for this intent across every
-	// branch — existing rows (with any rename applied) plus what this call
-	// just inserted — not just this txn's own contribution.
-	renameMap := make(map[string]string, len(assignment.Renamed))
-	for _, r := range assignment.Renamed {
-		renameMap[r.From] = r.To
-	}
-	allInteractionIDs := make([]string, 0, len(existingHops)+len(assignment.InsertIDs))
-	for _, row := range existingHops {
-		id := row.InteractionID
-		if newID, ok := renameMap[id]; ok {
-			id = newID
-		}
-		allInteractionIDs = append(allInteractionIDs, id)
-	}
-	allInteractionIDs = append(allInteractionIDs, assignment.InsertIDs...)
-
-	flowType := detectFlowTypeFromExtracts(interactions)
-	if isNewIntent {
-		if err := h.db.StoreIntent(intentID, initiatorDID, initiatorName, orgID, flowType, executor, len(allEnvelopes), threatDetected, allInteractionIDs); err != nil {
-			log.Printf("[intentWorkflow] intent save error: %v", err)
-			return nil, err
-		}
-	} else {
-		if err := h.db.MergeIntentBranch(intentID, len(allEnvelopes), threatDetected, allInteractionIDs); err != nil {
-			log.Printf("[intentWorkflow] intent merge error: %v", err)
-			return nil, err
-		}
-	}
 	log.Printf("[intentWorkflow] saved intent_id=%s new_interactions=%d total_interactions=%d threat=%v flowType=%s",
-		intentID, len(assignment.InsertIDs), len(allInteractionIDs), threatDetected, flowType)
+		intentID, insertedCount, len(allInteractionIDs), threatDetected, flowType)
 	return branch, nil
 }
 
