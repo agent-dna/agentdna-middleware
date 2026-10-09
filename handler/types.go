@@ -6,6 +6,7 @@ import (
 
 type Response struct {
 	Status  bool   `json:"status"`
+	Code    string `json:"code,omitempty"`
 	Data    any    `json:"data,omitempty"`
 	Message string `json:"message"`
 }

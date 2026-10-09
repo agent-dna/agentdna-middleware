@@ -6,12 +6,12 @@ import (
 	"agentdna-ratelimit-auth/db"
 )
 
-func hop(id, hash, from, to string) db.IntentHopRow {
-	return db.IntentHopRow{InteractionID: id, Hash: hash, From: from, To: to}
+func hop(id, sig, from, to string) db.IntentHopRow {
+	return db.IntentHopRow{InteractionID: id, Signature: sig, From: from, To: to}
 }
 
-func extract(hash, from, to string) interactionExtract {
-	return interactionExtract{Hash: hash, FromDID: from, ToDID: to}
+func extract(sig, from, to string) interactionExtract {
+	return interactionExtract{Signature: sig, FromDID: from, ToDID: to}
 }
 
 func TestResolveBranchIDs_NewIntent(t *testing.T) {
@@ -179,5 +179,46 @@ func TestParseHopID(t *testing.T) {
 		if ok && p.kind != c.wantKind {
 			t.Errorf("parseHopID(%q) kind = %v, want %v", c.id, p.kind, c.wantKind)
 		}
+	}
+}
+
+// TestResolveBranchIDs_ForkWithSameSignature covers a fork where both sides
+// carry the same signature: one envelope went on to two different receivers.
+// The signature alone would call hop 2 a match and miss the fork; the
+// receiver is what tells the two apart.
+func TestResolveBranchIDs_ForkWithSameSignature(t *testing.T) {
+	existing := []db.IntentHopRow{
+		hop("nft1-1", "s1", "u", "a"),
+		hop("nft1-2", "s2", "a", "b"),
+	}
+	interactions := []interactionExtract{
+		extract("s1", "u", "a"),
+		extract("s2", "a", "c"), // same envelope, different receiver
+	}
+	got := resolveBranchIDs("nft1", existing, interactions)
+
+	if len(got.Renamed) != 1 || got.Renamed[0].From != "nft1-2" || got.Renamed[0].To != "nft1-2-a-1" {
+		t.Fatalf("Renamed = %v, want [{nft1-2 nft1-2-a-1}]", got.Renamed)
+	}
+	if len(got.InsertIDs) != 1 || got.InsertIDs[0] != "nft1-2-b-1" {
+		t.Fatalf("InsertIDs = %v, want [nft1-2-b-1]", got.InsertIDs)
+	}
+	if got.FirstNew != 1 {
+		t.Errorf("FirstNew = %d, want 1", got.FirstNew)
+	}
+}
+
+// TestResolveBranchIDs_EmptySignatureNeverMatches makes sure unsigned hops
+// are never treated as the same hop, even with the same receiver.
+func TestResolveBranchIDs_EmptySignatureNeverMatches(t *testing.T) {
+	existing := []db.IntentHopRow{
+		hop("nft1-1", "", "u", "a"),
+	}
+	interactions := []interactionExtract{
+		extract("", "u", "a"),
+	}
+	got := resolveBranchIDs("nft1", existing, interactions)
+	if len(got.InsertIDs) == 0 {
+		t.Fatal("an unsigned hop must not be treated as a duplicate of a stored one")
 	}
 }

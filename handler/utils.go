@@ -57,6 +57,55 @@ func parseIntentWorkflow(data string) (*intentWorkflowData, error) {
 	return &d, nil
 }
 
+// validateIntentWorkflow rejects intent txns the middleware can't store
+// faithfully: without data.id a replay can't be recognised (each would get a
+// new random intent), and without signatures hops can't be told apart.
+func validateIntentWorkflow(d *intentWorkflowData) error {
+	if strings.TrimSpace(d.Id) == "" {
+		return fmt.Errorf("missing id")
+	}
+	if d.Envelope == nil {
+		return fmt.Errorf("missing envelope")
+	}
+	for _, e := range collectAllEnvelopes(d.Envelope) {
+		if e.From == "" {
+			return fmt.Errorf("an envelope has no from")
+		}
+		if e.Signature == "" {
+			return fmt.Errorf("envelope from %s has no signature", e.From)
+		}
+	}
+	return nil
+}
+
+// Error codes returned when an intent_workflow txn is rejected.
+const (
+	// ErrCodeUnregisteredActor: an actor in the txn is not a registered user,
+	// agent or tool. data.unregisteredDIDs lists them.
+	ErrCodeUnregisteredActor = "UNREGISTERED_ACTOR"
+	// ErrCodeActorCheckFailed: the registry lookup itself failed; retryable.
+	ErrCodeActorCheckFailed = "ACTOR_CHECK_FAILED"
+)
+
+// intentActorDIDs returns every actor a txn's interactions will name: each
+// envelope's sender (which is also every hop's receiver) plus the executor
+// the closing hop is addressed to.
+func intentActorDIDs(d *intentWorkflowData, executor string) []string {
+	seen := map[string]bool{}
+	var dids []string
+	add := func(did string) {
+		if did != "" && !seen[did] {
+			seen[did] = true
+			dids = append(dids, did)
+		}
+	}
+	for _, e := range collectAllEnvelopes(d.Envelope) {
+		add(e.From)
+	}
+	add(executor)
+	return dids
+}
+
 // extractPayloadText returns the human-readable text from an envelope payload.
 // Payload can be a plain JSON string or a JSON array of content blocks
 // (e.g. [{type:"text", text:"..."}]). Returns the raw JSON bytes as a string
@@ -400,8 +449,12 @@ func resolveBranchIDs(intentID string, existing []db.IntentHopRow, interactions 
 		}
 	}
 
+	// A hop is identified by its envelope's signature plus its receiver. The
+	// signature alone is not enough: at a fork the same envelope goes on to
+	// different receivers, so both sides carry the same signature. An empty
+	// signature never matches, or every unsigned hop would collapse together.
 	same := func(a db.IntentHopRow, b interactionExtract) bool {
-		return a.Hash == b.Hash && a.From == b.FromDID && a.To == b.ToDID
+		return a.Signature != "" && a.Signature == b.Signature && a.To == b.ToDID
 	}
 
 	matched := 0

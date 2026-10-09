@@ -1390,6 +1390,40 @@ func (d *DB) IsNewTool(did string) bool {
 	return exists
 }
 
+// UnregisteredDIDs returns the DIDs in dids that are not a registered user,
+// admin, agent or tool, in the order given. One query for the whole list. A user
+// counts as registered under any DID they hold (user_dids), not only their
+// latest one, so txns signed with an older DID still pass.
+func (d *DB) UnregisteredDIDs(dids []string) ([]string, error) {
+	if len(dids) == 0 {
+		return nil, nil
+	}
+	rows, err := d.conn.Query(`
+		SELECT x.did
+		FROM unnest($1::text[]) WITH ORDINALITY AS x(did, pos)
+		WHERE NOT EXISTS (SELECT 1 FROM user_dids     ud WHERE ud.dids @> ARRAY[x.did])
+		  AND NOT EXISTS (SELECT 1 FROM new_org_users u WHERE u.did = x.did)
+		  AND NOT EXISTS (SELECT 1 FROM new_admins    ad WHERE ad.did = x.did)
+		  AND NOT EXISTS (SELECT 1 FROM new_agents    a WHERE a.did = x.did)
+		  AND NOT EXISTS (SELECT 1 FROM new_tools     t WHERE t.did = x.did)
+		ORDER BY x.pos`,
+		pq.Array(dids),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var did string
+		if err := rows.Scan(&did); err != nil {
+			return nil, err
+		}
+		out = append(out, did)
+	}
+	return out, rows.Err()
+}
+
 func (d *DB) GetToolNameByDID(did string) (string, error) {
 	var name string
 	err := d.conn.QueryRow(`SELECT COALESCE(name, '') FROM new_tools WHERE did = $1`, did).Scan(&name)
@@ -1524,7 +1558,7 @@ func (t *IntentTx) RenameInteractionID(oldID, newID string) error {
 // against a new txn's hop sequence by (hash, from, to).
 type IntentHopRow struct {
 	InteractionID string
-	Hash          string
+	Signature     string
 	From, To      string
 }
 
@@ -1533,7 +1567,7 @@ type IntentHopRow struct {
 // each InteractionID's numeric/branch suffix.
 func (t *IntentTx) GetIntentHops(intentID string) ([]IntentHopRow, error) {
 	rows, err := t.tx.Query(
-		`SELECT interaction_id, COALESCE(hash, ''), initiator_did, interacted_to_did FROM new_interactions WHERE intent_id = $1`,
+		`SELECT interaction_id, COALESCE(signature, ''), initiator_did, interacted_to_did FROM new_interactions WHERE intent_id = $1`,
 		intentID,
 	)
 	if err != nil {
@@ -1543,7 +1577,7 @@ func (t *IntentTx) GetIntentHops(intentID string) ([]IntentHopRow, error) {
 	var out []IntentHopRow
 	for rows.Next() {
 		var r IntentHopRow
-		if err := rows.Scan(&r.InteractionID, &r.Hash, &r.From, &r.To); err != nil {
+		if err := rows.Scan(&r.InteractionID, &r.Signature, &r.From, &r.To); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

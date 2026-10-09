@@ -402,11 +402,41 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 				case NFTTypeAgent:
 					h.handleAgentNFT(nftInfo)
 				case NFTTypeIntent:
+					// Malformed intent txns are rejected here and never reach the
+					// Rubix node: every real txn carries data.id and signed envelopes.
+					data, err := parseIntentWorkflow(nftInfo.Data)
+					if err == nil {
+						err = validateIntentWorkflow(data)
+					}
+					if err != nil {
+						log.Printf("[NFT] rejected intent_workflow nft_id=%s: %v", nftInfo.NFTId, err)
+						c.AbortWithStatusJSON(http.StatusBadRequest, Response{Status: false, Message: "invalid intent_workflow transaction: " + err.Error()})
+						return
+					}
+					// Every actor must already be a registered user, agent or tool.
+					// Unknown ones are never created from a txn: the whole txn is
+					// rejected, nothing is stored and it never reaches the node.
+					unknown, err := h.db.UnregisteredDIDs(intentActorDIDs(data, nftInfo.Initiator))
+					if err != nil {
+						log.Printf("[NFT] rejected intent_workflow nft_id=%s: actor lookup failed: %v", nftInfo.NFTId, err)
+						c.AbortWithStatusJSON(http.StatusServiceUnavailable, Response{Status: false, Code: ErrCodeActorCheckFailed, Message: "could not verify the transaction's actors, try again"})
+						return
+					}
+					if len(unknown) > 0 {
+						log.Printf("[NFT] rejected intent_workflow nft_id=%s: unregistered actors %v", nftInfo.NFTId, unknown)
+						c.AbortWithStatusJSON(http.StatusForbidden, Response{
+							Status:  false,
+							Code:    ErrCodeUnregisteredActor,
+							Message: fmt.Sprintf("transaction rejected: %d actor(s) not registered as a user, agent or tool", len(unknown)),
+							Data:    gin.H{"unregisteredDIDs": unknown},
+						})
+						return
+					}
 					// Stash what this call wrote so the /tx response hook can either
 					// roll it back (status=false) or track it under the response's
 					// result.id for a possible /signature-time rollback. Harmless on
 					// non-/tx paths — only captureTxResponse (path-gated) reads it.
-					branch, wfErr := h.handleIntentWorkflow(nftInfo)
+					branch, wfErr := h.handleIntentWorkflow(nftInfo, data)
 					if wfErr == nil && branch != nil {
 						log.Printf("[provenance] tx: captured intent_id=%s inserted=%d renamed=%d, stashing in context",
 							branch.IntentID, len(branch.InsertedIDs), len(branch.Renamed))
@@ -619,26 +649,13 @@ func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 // what this call wrote (intent id plus inserted/relabeled interaction ids) so
 // the caller can correlate the /tx response for provenance and roll back
 // precisely this call's contribution if the txn ultimately fails.
-func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, error) {
-	data, err := parseIntentWorkflow(nftInfo.Data)
-	if err != nil {
-		log.Printf("[intentWorkflow] failed to parse nft_id=%s: %v", nftInfo.NFTId, err)
-		return nil, err
-	}
-	if data.Envelope == nil {
-		log.Printf("[intentWorkflow] envelope is nil nft_id=%s", nftInfo.NFTId)
-		return nil, fmt.Errorf("handleIntentWorkflow: envelope is nil")
-	}
-
+// data must already have passed validateIntentWorkflow (non-empty id, every
+// envelope signed).
+func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo, data *intentWorkflowData) (*branchWriteResult, error) {
 	// intent_id is the workflow's nft/content id (data.id) — the same value
 	// across every txn belonging to this logical intent, including ones that
-	// share a common hop prefix and then branch. Falls back to a random id
-	// only for malformed data that's missing it, so ingestion doesn't crash.
+	// share a common hop prefix and then branch.
 	intentID := data.Id
-	if intentID == "" {
-		intentID = uuid.New().String()
-		log.Printf("[intentWorkflow] WARNING data.id missing nft_id=%s, falling back to random intent_id=%s", nftInfo.NFTId, intentID)
-	}
 	orgID := h.orgID
 
 	// All envelope nodes sorted oldest→newest.
@@ -677,6 +694,10 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 
 	// ── Store a threat row per threat-signalling envelope ─────────────────────
 	hashToThreatID := map[string]string{} // envelope hash → threat ID, for linking interactions
+	// Guard/CBAC envelopes carry an interaction hash as their payload, not
+	// text; their hops show the resolved reason instead (keyed by signature,
+	// which every envelope has).
+	guardMessageBySig := map[string]string{}
 	for idx, env := range allEnvelopes {
 		msg := extractPayloadText(env.Payload)
 		threat := env.Code != 0 && env.Code != 1000
@@ -720,6 +741,12 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 					threatMsg = rec.Title
 				}
 			}
+			if cbacGuardCodes[env.Code] {
+				if threatMsg == "" {
+					threatMsg = fmt.Sprintf("Threat code %d", env.Code)
+				}
+				guardMessageBySig[env.Signature] = threatMsg
+			}
 			// The DAG can legitimately contain two distinct envelope objects that
 			// carry the same hash (e.g. the same signed message reachable via two
 			// converging branches) — collectAllEnvelopes only dedupes by pointer
@@ -749,20 +776,28 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 	// ── Extract interactions from DAG edges ──────────────────────────────────
 	rawInteractions := extractInteractionsFromEnvelopes(data.Envelope, initiatorDID, executor)
 
-	// Deduplicate: drop only when hash + from + to are all identical.
-	type dedupKey struct{ hash, from, to string }
+	// Deduplicate: drop only when signature + to are identical — the same
+	// hop identity resolveBranchIDs matches on.
+	type dedupKey struct{ signature, to string }
 	seenKey := map[dedupKey]bool{}
 	interactions := rawInteractions[:0]
 	for _, ix := range rawInteractions {
-		k := dedupKey{ix.Hash, ix.FromDID, ix.ToDID}
-		if ix.Hash != "" && seenKey[k] {
-			log.Printf("[intentWorkflow] dropping duplicate hash=%s from=%s to=%s", ix.Hash, ix.FromDID, ix.ToDID)
+		k := dedupKey{ix.Signature, ix.ToDID}
+		if ix.Signature != "" && seenKey[k] {
+			log.Printf("[intentWorkflow] dropping duplicate signature=%s from=%s to=%s", ix.Signature, ix.FromDID, ix.ToDID)
 			continue
 		}
-		if ix.Hash != "" {
+		if ix.Signature != "" {
 			seenKey[k] = true
 		}
 		interactions = append(interactions, ix)
+	}
+
+	// Guard hops display the resolved reason, never the raw hash payload.
+	for i, ix := range interactions {
+		if msg, ok := guardMessageBySig[ix.Signature]; ok {
+			interactions[i].Message = msg
+		}
 	}
 
 	// Resolve display names.
@@ -773,39 +808,6 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 
 	log.Printf("[intentWorkflow] parsed ok — dag_envelopes=%d interactions=%d initiator=%s intentID=%s orgID=%s",
 		len(allEnvelopes), len(interactions), initiatorDID, intentID, orgID)
-
-	// ── Ensure actors exist in the correct tables ────────────────────────────
-	seenDIDs := map[string]bool{}
-	for _, ix := range interactions {
-		for _, did := range []string{ix.FromDID, ix.ToDID} {
-			if did == "" || seenDIDs[did] {
-				continue
-			}
-			seenDIDs[did] = true
-			name := h.resolveActorName(did, "")
-			// Already a known user — skip.
-			if uname, err := h.db.GetOrgUserNameByDID(did); err == nil && uname != "" {
-				log.Printf("[intentWorkflow] did=%s is a user, skipping", did)
-				continue
-			}
-			// Already a known agent — skip.
-			if agent, err := h.db.GetAgentInfo(did); err == nil && agent.AgentDID != "" {
-				log.Printf("[intentWorkflow] did=%s is already an agent, skipping", did)
-				continue
-			}
-			// Found in new_tools table — skip (registered tool/app).
-			if h.db.IsNewTool(did) {
-				log.Printf("[intentWorkflow] did=%s is a registered tool, skipping", did)
-				continue
-			}
-			// Unknown DID — store as agent.
-			if err := h.db.StoreNewAgent(uuid.New().String(), did, initiatorDID, orgID, "", name); err != nil {
-				log.Printf("[intentWorkflow] StoreNewAgent did=%s: %v", did, err)
-			} else {
-				log.Printf("[intentWorkflow] new agent stored did=%s name=%s", did, name)
-			}
-		}
-	}
 
 	// ── Work out what's actually new in this txn ─────────────────────────────
 	// intent_id is now shared across every txn/branch of one nftId, so a
@@ -831,7 +833,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 		allInteractionIDs []string
 		insertedCount     int
 	)
-	err = h.db.WithIntentLock(intentID, func(tx *db.IntentTx) error {
+	err := h.db.WithIntentLock(intentID, func(tx *db.IntentTx) error {
 		existingHops, err := tx.GetIntentHops(intentID)
 		if err != nil {
 			return fmt.Errorf("GetIntentHops: %v", err)
