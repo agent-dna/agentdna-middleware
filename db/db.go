@@ -177,7 +177,8 @@ type ToolRecord struct {
 }
 
 type UserInfoRecord struct {
-	UserDID           string
+	UserDID           string   // primary (latest) DID
+	DIDs              []string // every DID the user holds, oldest first
 	UserName          string
 	DisplayName       string
 	CreatedAt         time.Time
@@ -432,6 +433,118 @@ func New(dsn string) *DB {
 	conn.Exec(`ALTER TABLE new_org_users DROP CONSTRAINT IF EXISTS new_org_users_pkey`)
 	conn.Exec(`ALTER TABLE new_org_users ADD COLUMN IF NOT EXISTS email_pk_added BOOLEAN DEFAULT FALSE`)
 	conn.Exec(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE table_name='new_org_users' AND constraint_type='PRIMARY KEY') THEN ALTER TABLE new_org_users ADD PRIMARY KEY (email); END IF; END $$`)
+	// user_dids: one row per user (email PRIMARY KEY) holding every DID the
+	// user owns in dids, oldest first. new_org_users.did stays as the user's
+	// latest/primary DID. email follows new_org_users.email via ON UPDATE
+	// CASCADE (UpdateUserEmail). The user_dids_normalize trigger dedupes the
+	// list and rejects a DID already held by another user (unique_violation).
+	for _, stmt := range []string{
+		// Convert the old one-row-per-DID layout (did PRIMARY KEY) in place.
+		`DO $$ BEGIN
+			IF EXISTS (SELECT 1 FROM information_schema.columns
+			           WHERE table_name = 'user_dids' AND column_name = 'did') THEN
+				CREATE TABLE user_dids_new (
+					email      TEXT PRIMARY KEY REFERENCES new_org_users(email) ON UPDATE CASCADE ON DELETE CASCADE,
+					dids       TEXT[] NOT NULL DEFAULT '{}',
+					created_at TIMESTAMPTZ DEFAULT NOW()
+				);
+				INSERT INTO user_dids_new (email, dids, created_at)
+				SELECT email, array_agg(did ORDER BY created_at, did), MIN(created_at)
+				FROM user_dids GROUP BY email;
+				DROP TABLE user_dids;
+				ALTER TABLE user_dids_new RENAME TO user_dids;
+				ALTER TABLE user_dids RENAME CONSTRAINT user_dids_new_pkey TO user_dids_pkey;
+				ALTER TABLE user_dids RENAME CONSTRAINT user_dids_new_email_fkey TO user_dids_email_fkey;
+			END IF;
+		END $$`,
+		`CREATE TABLE IF NOT EXISTS user_dids (
+			email      TEXT PRIMARY KEY REFERENCES new_org_users(email) ON UPDATE CASCADE ON DELETE CASCADE,
+			dids       TEXT[] NOT NULL DEFAULT '{}',
+			created_at TIMESTAMPTZ DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_user_dids_dids ON user_dids USING GIN (dids)`,
+		// The advisory lock serialises writers so two users can't claim the
+		// same DID concurrently.
+		`CREATE OR REPLACE FUNCTION user_dids_normalize() RETURNS trigger
+		 LANGUAGE plpgsql AS $$
+		 DECLARE
+			self_email TEXT := NEW.email;
+			taken      TEXT;
+		 BEGIN
+			IF TG_OP = 'UPDATE' THEN
+				self_email := OLD.email;
+			END IF;
+			NEW.dids := ARRAY(
+				SELECT d FROM unnest(NEW.dids) WITH ORDINALITY AS t(d, n)
+				WHERE d IS NOT NULL AND d NOT IN ('', 'none', 'default-id')
+				GROUP BY d ORDER BY MIN(n));
+			PERFORM pg_advisory_xact_lock(hashtext('user_dids'));
+			SELECT d INTO taken
+			FROM user_dids ud, unnest(ud.dids) AS d
+			WHERE ud.email NOT IN (NEW.email, self_email)
+			  AND ud.dids && NEW.dids AND d = ANY(NEW.dids)
+			LIMIT 1;
+			IF taken IS NOT NULL THEN
+				RAISE EXCEPTION 'did % already registered to another user', taken
+					USING ERRCODE = 'unique_violation';
+			END IF;
+			RETURN NEW;
+		 END $$`,
+		`DROP TRIGGER IF EXISTS user_dids_normalize ON user_dids`,
+		`CREATE TRIGGER user_dids_normalize BEFORE INSERT OR UPDATE OF dids ON user_dids
+		 FOR EACH ROW EXECUTE FUNCTION user_dids_normalize()`,
+		// Backfill each user's primary DID into their list (skipping DIDs
+		// another user already holds).
+		`INSERT INTO user_dids (email, dids)
+		 SELECT DISTINCT ON (u.did) u.email, ARRAY[u.did]
+		 FROM new_org_users u
+		 WHERE u.did IS NOT NULL AND u.did NOT IN ('', 'none', 'default-id')
+		   AND NOT EXISTS (SELECT 1 FROM user_dids WHERE dids @> ARRAY[u.did])
+		 ORDER BY u.did, u.created_at
+		 ON CONFLICT (email) DO UPDATE SET dids = user_dids.dids || EXCLUDED.dids`,
+		// user_did_set(did) expands any one DID to every DID its user holds.
+		// The input DID is always included, so agent/admin DIDs passed through
+		// user-scoped queries behave exactly as a plain "= $1" did before.
+		`CREATE OR REPLACE FUNCTION user_did_set(p_did TEXT) RETURNS SETOF TEXT
+		 LANGUAGE sql STABLE AS $$
+			SELECT unnest(dids) FROM user_dids WHERE dids @> ARRAY[p_did]
+			UNION
+			SELECT p_did
+		 $$`,
+	} {
+		if _, err := conn.Exec(stmt); err != nil {
+			log.Printf("[migrate] user_dids: %v", err)
+		}
+	}
+	// sessions: dashboard logins. token_hash is the SHA-256 of the random
+	// session token the browser holds in its cookie; the raw token is never
+	// stored. account_id is new_org_users.email for account_type 'user' and
+	// new_admins.did for 'admin'.
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS sessions (
+			token_hash   TEXT PRIMARY KEY,
+			account_type TEXT NOT NULL,
+			account_id   TEXT NOT NULL,
+			ip           TEXT NOT NULL DEFAULT '',
+			user_agent   TEXT NOT NULL DEFAULT '',
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			expires_at   TIMESTAMPTZ NOT NULL
+		)`,
+		// Early builds named account_id "email"; such sessions are dropped.
+		`DO $$ BEGIN
+			IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'sessions' AND column_name = 'email') THEN
+				DELETE FROM sessions;
+				DROP INDEX IF EXISTS idx_sessions_account;
+				ALTER TABLE sessions RENAME COLUMN email TO account_id;
+			END IF;
+		END $$`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions (account_type, account_id)`,
+	} {
+		if _, err := conn.Exec(stmt); err != nil {
+			log.Printf("[migrate] sessions: %v", err)
+		}
+	}
 	// Migrate new_tools primary key from (did, organization_id) → did.
 	conn.Exec(`DELETE FROM new_tools WHERE ctid NOT IN (SELECT MIN(ctid) FROM new_tools GROUP BY did)`)
 	conn.Exec(`ALTER TABLE new_tools DROP CONSTRAINT IF EXISTS new_tools_pkey`)

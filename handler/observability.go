@@ -463,12 +463,28 @@ func obsIntentApps(agentAppHops []*db.ObsHop) map[string]map[string]bool {
 	return out
 }
 
-// obsUserIntents returns the distinct intent IDs initiated by userDID that
-// have at least one classified hop (i.e. appear in the participants index).
-func obsUserIntents(octx *obsContext, userDID string, participants map[string]map[string]bool) []string {
+// userDIDSet expands did to every DID its user holds, so a user's intents
+// match whichever of their DIDs started them. A DID with no user_dids row
+// stands for itself.
+func (h *Handler) userDIDSet(did string) (map[string]bool, error) {
+	dids, err := h.db.GetUserDIDsByDID(did)
+	if err != nil {
+		return nil, err
+	}
+	set := map[string]bool{did: true}
+	for _, d := range dids {
+		set[d] = true
+	}
+	return set, nil
+}
+
+// obsUserIntents returns the distinct intent IDs initiated by any of the
+// user's DIDs that have at least one classified hop (i.e. appear in the
+// participants index).
+func obsUserIntents(octx *obsContext, userDIDs map[string]bool, participants map[string]map[string]bool) []string {
 	var out []string
 	for intentID := range participants {
-		if octx.intentInitiator[intentID] == userDID {
+		if userDIDs[octx.intentInitiator[intentID]] {
 			out = append(out, intentID)
 		}
 	}
@@ -759,7 +775,7 @@ func (h *Handler) ObservabilityUserFlow(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "userDID is required"})
 		return
 	}
-	if !isAdmin && userDID != callerDID {
+	if !isAdmin && !h.db.SameUserDID(userDID, callerDID) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "forbidden"})
 		return
 	}
@@ -778,16 +794,21 @@ func (h *Handler) ObservabilityUserFlow(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to load observability data: %v", err)})
 		return
 	}
+	userDIDs, err := h.userDIDSet(userDID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to look up user DIDs: %v", err)})
+		return
+	}
 
 	var userAgentForUser []*db.ObsHop
 	for _, hop := range octx.userAgentHops {
-		if hop.From == userDID {
+		if userDIDs[hop.From] {
 			userAgentForUser = append(userAgentForUser, hop)
 		}
 	}
 	var agentAppForUser []*db.ObsHop
 	for _, hop := range octx.agentAppHops {
-		if octx.intentInitiator[hop.IntentID] == userDID {
+		if userDIDs[octx.intentInitiator[hop.IntentID]] {
 			agentAppForUser = append(agentAppForUser, hop)
 		}
 	}
@@ -799,7 +820,7 @@ func (h *Handler) ObservabilityUserFlow(c *gin.Context) {
 	byIntentAA := obsGroupHopsByIntent(octx.agentAgentHops)
 	byIntentAP := obsGroupHopsByIntent(octx.agentAppHops)
 	participants := obsIntentParticipants(octx.userAgentHops, octx.agentAppHops, octx.agentAgentHops)
-	userIntents := obsUserIntents(octx, userDID, participants)
+	userIntents := obsUserIntents(octx, userDIDs, participants)
 
 	agentHops := map[string][]*db.ObsHop{}
 	agentIntents := map[string]map[string]bool{}
@@ -856,7 +877,7 @@ func (h *Handler) ObservabilityAgentFlow(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "userDID and agentDID are required"})
 		return
 	}
-	if !isAdmin && userDID != callerDID {
+	if !isAdmin && !h.db.SameUserDID(userDID, callerDID) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "forbidden"})
 		return
 	}
@@ -894,7 +915,12 @@ func (h *Handler) ObservabilityAgentFlow(c *gin.Context) {
 
 	// U's intents where A took part.
 	var aIntents []string
-	for _, intentID := range obsUserIntents(octx, userDID, participants) {
+	userDIDs, err := h.userDIDSet(userDID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to look up user DIDs: %v", err)})
+		return
+	}
+	for _, intentID := range obsUserIntents(octx, userDIDs, participants) {
 		if participants[intentID][agentDID] {
 			aIntents = append(aIntents, intentID)
 		}
@@ -1295,7 +1321,7 @@ func (h *Handler) ObservabilityIntents(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "userDID and agentDID are required"})
 		return
 	}
-	if !isAdmin && userDID != callerDID {
+	if !isAdmin && !h.db.SameUserDID(userDID, callerDID) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "forbidden"})
 		return
 	}
@@ -1316,7 +1342,12 @@ func (h *Handler) ObservabilityIntents(c *gin.Context) {
 	// hop kind — agentDID need not be someone the user messaged directly),
 	// and, if given, where peerDID also took part.
 	var intentIDs []string
-	for _, intentID := range obsUserIntents(octx, userDID, participants) {
+	userDIDs, err := h.userDIDSet(userDID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to look up user DIDs: %v", err)})
+		return
+	}
+	for _, intentID := range obsUserIntents(octx, userDIDs, participants) {
 		if !participants[intentID][agentDID] {
 			continue
 		}
@@ -1539,9 +1570,18 @@ func (h *Handler) ObservabilityPaths(c *gin.Context) {
 	fApp := c.Query("appDID")
 	fIntent := c.Query("intentID")
 
-	if !isAdmin && fUser != "" && fUser != callerDID {
+	if !isAdmin && fUser != "" && !h.db.SameUserDID(fUser, callerDID) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "forbidden"})
 		return
+	}
+	// The userDID filter matches intents started from any of that user's DIDs.
+	var fUserDIDs map[string]bool
+	if fUser != "" {
+		var err error
+		if fUserDIDs, err = h.userDIDSet(fUser); err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to look up user DIDs: %v", err)})
+			return
+		}
 	}
 
 	octx, err := h.loadObsContext(c, obsScopeDID(isAdmin, callerDID))
@@ -1560,7 +1600,7 @@ func (h *Handler) ObservabilityPaths(c *gin.Context) {
 	uaGroups := map[uaKey][]*db.ObsHop{}
 	for _, hop := range octx.userAgentHops {
 		uid := octx.intentInitiator[hop.IntentID]
-		if fUser != "" && uid != fUser {
+		if fUser != "" && !fUserDIDs[uid] {
 			continue
 		}
 		key := uaKey{hop.IntentID, hop.To}
@@ -1575,7 +1615,7 @@ func (h *Handler) ObservabilityPaths(c *gin.Context) {
 	aaGroups := map[aaKey][]*db.ObsHop{}
 	for _, hop := range octx.agentAppHops {
 		uid := octx.intentInitiator[hop.IntentID]
-		if fUser != "" && uid != fUser {
+		if fUser != "" && !fUserDIDs[uid] {
 			continue
 		}
 		key := aaKey{hop.IntentID, hop.To}

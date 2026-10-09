@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -224,7 +225,7 @@ func (d *DB) GetAllRequestsByUser(creatorDID string, limit, offset int) ([]*Requ
 		       COALESCE(agent_did,''), COALESCE(agent_name,''),
 		       COALESCE(request_info,''), COALESCE(organization_id,''), status, created_at
 		FROM new_requests
-		WHERE creator_did = $1
+		WHERE creator_did IN (SELECT user_did_set($1))
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3`,
 		creatorDID, limit, offset,
@@ -239,7 +240,7 @@ func (d *DB) GetAllRequestsByUser(creatorDID string, limit, offset int) ([]*Requ
 func (d *DB) CountAllRequestsByUser(creatorDID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(
-		`SELECT COUNT(*) FROM new_requests WHERE creator_did = $1`,
+		`SELECT COUNT(*) FROM new_requests WHERE creator_did IN (SELECT user_did_set($1))`,
 		creatorDID,
 	).Scan(&total)
 	return total, err
@@ -251,7 +252,7 @@ func (d *DB) GetRequestsByUser(creatorDID, requestType string, limit, offset int
 		       COALESCE(agent_did,''), COALESCE(agent_name,''),
 		       COALESCE(request_info,''), COALESCE(organization_id,''), status, created_at
 		FROM new_requests
-		WHERE creator_did = $1 AND request_type = $2
+		WHERE creator_did IN (SELECT user_did_set($1)) AND request_type = $2
 		ORDER BY created_at DESC
 		LIMIT $3 OFFSET $4`,
 		creatorDID, requestType, limit, offset,
@@ -266,7 +267,7 @@ func (d *DB) GetRequestsByUser(creatorDID, requestType string, limit, offset int
 func (d *DB) CountRequestsByUser(creatorDID, requestType string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(
-		`SELECT COUNT(*) FROM new_requests WHERE creator_did = $1 AND request_type = $2`,
+		`SELECT COUNT(*) FROM new_requests WHERE creator_did IN (SELECT user_did_set($1)) AND request_type = $2`,
 		creatorDID, requestType,
 	).Scan(&total)
 	return total, err
@@ -296,7 +297,7 @@ func (d *DB) UpdateAgentInfo(did, agentName, policy string) error {
 func (d *DB) AddAgentToUserAccessList(userDID, agentDID string) error {
 	// Read current list, append if not present, write back as JSON
 	var raw string
-	err := d.conn.QueryRow(`SELECT COALESCE(agent_access_list, '[]') FROM new_org_users WHERE did = $1`, userDID).Scan(&raw)
+	err := d.conn.QueryRow(`SELECT COALESCE(agent_access_list, '[]') FROM new_org_users WHERE email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$1::text])`, userDID).Scan(&raw)
 	if err != nil {
 		return err
 	}
@@ -314,7 +315,7 @@ func (d *DB) AddAgentToUserAccessList(userDID, agentDID string) error {
 	if err != nil {
 		return err
 	}
-	_, err = d.conn.Exec(`UPDATE new_org_users SET agent_access_list = $1 WHERE did = $2`, string(updated), userDID)
+	_, err = d.conn.Exec(`UPDATE new_org_users SET agent_access_list = $1 WHERE email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$2::text])`, string(updated), userDID)
 	return err
 }
 
@@ -323,7 +324,7 @@ func (d *DB) CountAgentsByOrg(orgID string) (int, error) {
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM new_agents
 		WHERE organization_id = $1
-			AND did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did != 'none')`,
+			AND did NOT IN (SELECT unnest(ud.dids) FROM user_dids ud JOIN new_org_users u ON u.email = ud.email WHERE u.organization_id = $1)`,
 		orgID,
 	).Scan(&total)
 	return total, err
@@ -348,7 +349,7 @@ func (d *DB) GetAgentsByOrg(orgID string, limit, offset int) ([]*AgentDetailReco
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did != 'none')
+			AND a.did NOT IN (SELECT unnest(ud.dids) FROM user_dids ud JOIN new_org_users u ON u.email = ud.email WHERE u.organization_id = $1)
 		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy
 		ORDER BY a.did
 		LIMIT $2 OFFSET $3`,
@@ -375,7 +376,7 @@ func (d *DB) CountAgentsByUser(userDID, orgID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM new_agents a
-		WHERE a.deployer_did = $1`,
+		WHERE a.deployer_did IN (SELECT user_did_set($1))`,
 		userDID,
 	).Scan(&total)
 	return total, err
@@ -399,7 +400,7 @@ func (d *DB) GetAgentsByUser(userDID, orgID string, limit, offset int) ([]*Agent
 			END                                                                  AS score
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
-		WHERE a.deployer_did = $1
+		WHERE a.deployer_did IN (SELECT user_did_set($1))
 		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy
 		ORDER BY a.did
 		LIMIT $2 OFFSET $3`,
@@ -430,14 +431,14 @@ WITH user_agents AS (
     FROM new_agents a
     WHERE a.organization_id = $2
       AND (
-          a.deployer_did = $1
+          a.deployer_did IN (SELECT user_did_set($1))
           OR a.did IN (
               SELECT agent_did FROM new_requests
-              WHERE creator_did = $1 AND request_type = 'deploy_agent' AND status = 'approved'
+              WHERE creator_did IN (SELECT user_did_set($1)) AND request_type = 'deploy_agent' AND status = 'approved'
           )
           OR a.did IN (
               SELECT json_array_elements_text(COALESCE(u.agent_access_list,'[]')::json)
-              FROM new_org_users u WHERE u.did = $1
+              FROM new_org_users u WHERE u.email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$1::text])
           )
       )
 ),
@@ -447,8 +448,8 @@ user_intents AS (
     LEFT JOIN new_interactions ix ON ix.intent_id = ni.intent_id
     WHERE ni.organization_id = $2
       AND (
-          ni.initiator_did = $1
-          OR ix.initiator_did = $1
+          ni.initiator_did IN (SELECT user_did_set($1))
+          OR ix.initiator_did IN (SELECT user_did_set($1))
           OR ix.initiator_did    IN (SELECT did FROM user_agents)
           OR ix.interacted_to_did IN (SELECT did FROM user_agents)
       )
@@ -461,7 +462,7 @@ func (d *DB) GetUserMetrics(userDID, orgID string) (*OrgMetrics, error) {
 
 	err := d.conn.QueryRow(userScopeIntentsCTE+`
 		SELECT
-			(SELECT COUNT(*) FROM new_agents WHERE deployer_did = $1),
+			(SELECT COUNT(*) FROM new_agents WHERE deployer_did IN (SELECT user_did_set($1))),
 			(SELECT COUNT(*) FROM user_intents),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents)),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents)),
@@ -470,7 +471,7 @@ func (d *DB) GetUserMetrics(userDID, orgID string) (*OrgMetrics, error) {
 			         ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
 			        AND i.organization_id = $2
 			 WHERE i.intent_id IN (SELECT intent_id FROM user_intents)),
-			(SELECT COUNT(*) FROM new_agents WHERE deployer_did = $1 AND created_at >= $3),
+			(SELECT COUNT(*) FROM new_agents WHERE deployer_did IN (SELECT user_did_set($1)) AND created_at >= $3),
 			(SELECT COUNT(*) FROM user_intents WHERE started_at >= $3),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents) AND time >= $3),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents) AND time >= $3),
@@ -542,7 +543,8 @@ func (d *DB) GetIntentsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		       COALESCE((SELECT message FROM new_interactions
 		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
-		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		LEFT JOIN user_dids ud ON ud.dids @> ARRAY[ni.initiator_did]
+		LEFT JOIN new_org_users u ON u.email = ud.email
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
 		LEFT JOIN new_interactions i ON i.intent_id = ni.intent_id
 		LEFT JOIN new_agents a ON a.did = i.interacted_to_did
@@ -669,7 +671,7 @@ func (d *DB) GetUsersByOrg(orgID string, limit, offset int) ([]*UserDetailRecord
 			COUNT(DISTINCT CASE WHEN i.threat = 1 THEN i.interaction_id END)            AS total_threats,
 			(SELECT COUNT(*) FROM json_array_elements_text(COALESCE(u.agent_access_list, '[]')::json)) AS access_agent_count
 		FROM new_org_users u
-		LEFT JOIN new_intents ni ON ni.initiator_did = u.did
+		LEFT JOIN new_intents ni ON ni.initiator_did IN (SELECT unnest(dids) FROM user_dids WHERE email = u.email)
 		LEFT JOIN new_interactions i ON i.intent_id = ni.intent_id
 		WHERE u.organization_id = $1
 		GROUP BY u.did, u.email, u.created_at, u.agent_access_list
@@ -789,7 +791,7 @@ func (d *DB) CountTopThreatAgentsByOrg(orgID string) (int, error) {
 		JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
 			AND i.threat = 1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did != 'none')`,
+			AND a.did NOT IN (SELECT unnest(ud.dids) FROM user_dids ud JOIN new_org_users u ON u.email = ud.email WHERE u.organization_id = $1)`,
 		orgID,
 	).Scan(&total)
 	return total, err
@@ -806,7 +808,7 @@ func (d *DB) GetTopThreatAgentsByOrg(orgID string, limit, offset int) ([]*AgentV
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did != 'none')
+			AND a.did NOT IN (SELECT unnest(ud.dids) FROM user_dids ud JOIN new_org_users u ON u.email = ud.email WHERE u.organization_id = $1)
 		GROUP BY a.did, a.nft_id, a.name
 		ORDER BY total_threats DESC
 		LIMIT $2 OFFSET $3`,
@@ -985,7 +987,7 @@ func (d *DB) GetTopAgentsByOrg(orgID string, limit, offset int) ([]*AgentVolumeR
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
 		WHERE a.organization_id = $1
-			AND a.did NOT IN (SELECT did FROM new_org_users WHERE organization_id = $1 AND did != 'none')
+			AND a.did NOT IN (SELECT unnest(ud.dids) FROM user_dids ud JOIN new_org_users u ON u.email = ud.email WHERE u.organization_id = $1)
 		GROUP BY a.did, a.nft_id, a.name
 		ORDER BY total_interactions DESC
 		LIMIT $2 OFFSET $3`,
@@ -1008,13 +1010,13 @@ func (d *DB) GetTopAgentsByOrg(orgID string, limit, offset int) ([]*AgentVolumeR
 }
 
 type UserProfile struct {
-	Name           string `json:"name"`
-	Email          string `json:"email"`
-	DID            string `json:"did"`
-	APIKey         string `json:"apiKey"`
-	OrganizationID string `json:"organizationID"`
-	CreatedAt      string `json:"createdAt"`
-	AdminEmail     string `json:"adminEmail"`
+	Name           string   `json:"name"`
+	Email          string   `json:"email"`
+	DIDs           []string `json:"dids"` // every DID the user has held, oldest first
+	APIKey         string   `json:"apiKey"`
+	OrganizationID string   `json:"organizationID"`
+	CreatedAt      string   `json:"createdAt"`
+	AdminEmail     string   `json:"adminEmail"`
 }
 
 func (d *DB) GetUserProfile(email string) (*UserProfile, error) {
@@ -1023,7 +1025,7 @@ func (d *DB) GetUserProfile(email string) (*UserProfile, error) {
 		SELECT
 			COALESCE(u.name, ''),
 			u.email,
-			COALESCE(u.did, ''),
+			COALESCE((SELECT dids FROM user_dids WHERE email = u.email), '{}'),
 			COALESCE(u.api_key, ''),
 			COALESCE(u.organization_id, ''),
 			COALESCE(u.created_at::TEXT, ''),
@@ -1032,7 +1034,7 @@ func (d *DB) GetUserProfile(email string) (*UserProfile, error) {
 		LEFT JOIN new_admins a ON a.organization_id = u.organization_id
 		WHERE u.email = $1`,
 		email,
-	).Scan(&p.Name, &p.Email, &p.DID, &p.APIKey, &p.OrganizationID, &p.CreatedAt, &p.AdminEmail)
+	).Scan(&p.Name, &p.Email, pq.Array(&p.DIDs), &p.APIKey, &p.OrganizationID, &p.CreatedAt, &p.AdminEmail)
 	if err != nil {
 		return nil, err
 	}
@@ -1166,25 +1168,81 @@ func (d *DB) UpdateUserEmail(currentEmail, newEmail string) error {
 	return tx.Commit()
 }
 
-func (d *DB) UpdateUserDIDByAPIKey(apiKey, did string) error {
-	_, err := d.conn.Exec(
-		`UPDATE new_org_users SET did = $1 WHERE api_key = $2`,
-		did, apiKey,
-	)
-	return err
+// ErrDIDTaken is returned by AddUserDIDByAPIKey when the DID already belongs
+// to a different user.
+var ErrDIDTaken = errors.New("did already registered to another user")
+
+// AddUserDIDByAPIKey appends did to the user's DID list (user_dids.dids) and
+// makes it their primary DID (new_org_users.did). Previously held DIDs are
+// kept. Re-adding a DID the user already holds is a no-op apart from making
+// it primary; a DID held by another user fails with ErrDIDTaken.
+func (d *DB) AddUserDIDByAPIKey(apiKey, did string) error {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var email string
+	if err := tx.QueryRow(`SELECT email FROM new_org_users WHERE api_key = $1`, apiKey).Scan(&email); err != nil {
+		return err
+	}
+
+	// The user_dids_normalize trigger dedupes the list and raises
+	// unique_violation (race-safe, under an advisory lock) when another user
+	// already holds the DID.
+	if _, err := tx.Exec(`
+		INSERT INTO user_dids (email, dids) VALUES ($1, ARRAY[$2::text])
+		ON CONFLICT (email) DO UPDATE SET dids = user_dids.dids || EXCLUDED.dids`,
+		email, did,
+	); err != nil {
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+			return ErrDIDTaken
+		}
+		return err
+	}
+
+	if _, err := tx.Exec(`UPDATE new_org_users SET did = $1 WHERE email = $2`, did, email); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// GetUserDIDsByDID returns every DID held by the user who owns did, oldest
+// first. An unknown DID yields an empty slice.
+func (d *DB) GetUserDIDsByDID(did string) ([]string, error) {
+	dids := []string{}
+	err := d.conn.QueryRow(`SELECT dids FROM user_dids WHERE dids @> ARRAY[$1::text]`, did).Scan(pq.Array(&dids))
+	if err == sql.ErrNoRows {
+		return []string{}, nil
+	}
+	return dids, err
+}
+
+// SameUserDID reports whether DIDs a and b belong to the same user (or are
+// identical). Used by ownership checks that used to compare DIDs with ==.
+func (d *DB) SameUserDID(a, b string) bool {
+	if a == b {
+		return true
+	}
+	var same bool
+	d.conn.QueryRow(`
+		SELECT EXISTS(SELECT 1 FROM user_dids WHERE dids @> ARRAY[$1::text, $2::text])`, a, b).Scan(&same)
+	return same
 }
 
 func (d *DB) GetUserPolicy(did string) (string, error) {
 	var policy string
 	err := d.conn.QueryRow(
-		`SELECT COALESCE(policy, '') FROM new_org_users WHERE did = $1`, did,
+		`SELECT COALESCE(policy, '') FROM new_org_users WHERE email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$1::text])`, did,
 	).Scan(&policy)
 	return policy, err
 }
 
 func (d *DB) UpdateUserPolicy(did, policy string) error {
 	_, err := d.conn.Exec(
-		`UPDATE new_org_users SET policy = $1 WHERE did = $2`, policy, did,
+		`UPDATE new_org_users SET policy = $1 WHERE email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$2::text])`, policy, did,
 	)
 	return err
 }
@@ -1206,7 +1264,7 @@ func (d *DB) UpdateAgentPolicy(did, policy string) error {
 
 func (d *DB) GetOrgUserNameByDID(did string) (string, error) {
 	var name string
-	err := d.conn.QueryRow(`SELECT COALESCE(name, '') FROM new_org_users WHERE did = $1`, did).Scan(&name)
+	err := d.conn.QueryRow(`SELECT COALESCE(name, '') FROM new_org_users WHERE email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$1::text])`, did).Scan(&name)
 	return name, err
 }
 
@@ -1259,7 +1317,7 @@ func (d *DB) RegisterOrgUser(apiKey, orgID, name, email, passwordHash string) er
 
 func (d *DB) SetUserKey(did, key string) error {
 	_, err := d.conn.Exec(
-		`UPDATE new_org_users SET key = $1 WHERE did = $2`,
+		`UPDATE new_org_users SET key = $1 WHERE email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$2::text])`,
 		key, did,
 	)
 	return err
@@ -1369,7 +1427,7 @@ func (d *DB) GetAgentOrgID(agentDID string) (string, error) {
 	err := d.conn.QueryRow(`
 		SELECT organization_id FROM new_agents WHERE did = $1
 		UNION ALL
-		SELECT organization_id FROM new_org_users WHERE did = $1
+		SELECT organization_id FROM new_org_users WHERE email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$1::text])
 		UNION ALL
 		SELECT organization_id FROM new_admins WHERE did = $1
 		LIMIT 1`, agentDID).Scan(&orgID)
@@ -1871,7 +1929,8 @@ func (d *DB) GetIntentsByOrg(orgID string, limit, offset int) ([]*IntentRecord, 
 		       COALESCE((SELECT message FROM new_interactions
 		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
-		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		LEFT JOIN user_dids ud ON ud.dids @> ARRAY[ni.initiator_did]
+		LEFT JOIN new_org_users u ON u.email = ud.email
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
 		LEFT JOIN new_interactions i ON i.intent_id = ni.intent_id
 		LEFT JOIN new_agents a ON a.did = i.interacted_to_did
@@ -1939,7 +1998,8 @@ func (d *DB) GetAgentIntents(agentDID, orgID string, limit, offset int) ([]*Inte
 		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		JOIN new_interactions i ON i.intent_id = ni.intent_id
-		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		LEFT JOIN user_dids ud ON ud.dids @> ARRAY[ni.initiator_did]
+		LEFT JOIN new_org_users u ON u.email = ud.email
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
 		WHERE i.initiator_did = $1 AND ni.organization_id = $2
 		GROUP BY ni.intent_id, u.name, ag_init.name
@@ -2085,7 +2145,8 @@ func (d *DB) GetIntentInfo(intentID string) (*IntentRecord, error) {
 		       MIN(i.time)                                                             AS first_interaction_at,
 		       MAX(i.time)                                                             AS last_interaction_at
 		FROM new_intents ni
-		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		LEFT JOIN user_dids ud ON ud.dids @> ARRAY[ni.initiator_did]
+		LEFT JOIN new_org_users u ON u.email = ud.email
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
 		LEFT JOIN new_interactions i ON i.intent_id = ni.intent_id
 		LEFT JOIN new_agents a ON a.did = i.interacted_to_did
@@ -2284,7 +2345,8 @@ func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*Inte
 		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
 		JOIN new_interactions tool_ix ON tool_ix.intent_id = ni.intent_id AND tool_ix.interacted_to_did = $1
-		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
+		LEFT JOIN user_dids ud ON ud.dids @> ARRAY[ni.initiator_did]
+		LEFT JOIN new_org_users u ON u.email = ud.email
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
 		LEFT JOIN new_interactions ix ON ix.intent_id = ni.intent_id
 		LEFT JOIN new_agents a ON a.did = ix.interacted_to_did
@@ -2694,7 +2756,7 @@ func (d *DB) GetAgentsAppsMetricsByUser(userDID, orgID string) (*AgentsAppsMetri
 		SELECT COUNT(*) FROM new_interactions i
 		WHERE i.organization_id = $2
 		  AND (
-		      i.initiator_did = $1
+		      i.initiator_did IN (SELECT user_did_set($1))
 		      OR i.initiator_did IN (SELECT did FROM user_agents)
 		      OR i.interacted_to_did IN (SELECT did FROM user_agents)
 		  )`,
@@ -2706,7 +2768,7 @@ func (d *DB) GetAgentsAppsMetricsByUser(userDID, orgID string) (*AgentsAppsMetri
 		SELECT COUNT(*) FROM new_interactions i
 		WHERE i.organization_id = $2 AND i.threat = 1
 		  AND (
-		      i.initiator_did = $1
+		      i.initiator_did IN (SELECT user_did_set($1))
 		      OR i.initiator_did IN (SELECT did FROM user_agents)
 		      OR i.interacted_to_did IN (SELECT did FROM user_agents)
 		  )`,
@@ -2715,7 +2777,7 @@ func (d *DB) GetAgentsAppsMetricsByUser(userDID, orgID string) (*AgentsAppsMetri
 		return nil, err
 	}
 	if err := d.conn.QueryRow(
-		`SELECT COUNT(*) FROM new_agents WHERE deployer_did = $1`, userDID,
+		`SELECT COUNT(*) FROM new_agents WHERE deployer_did IN (SELECT user_did_set($1))`, userDID,
 	).Scan(&out.TotalAgents); err != nil {
 		return nil, err
 	}
@@ -2725,7 +2787,7 @@ func (d *DB) GetAgentsAppsMetricsByUser(userDID, orgID string) (*AgentsAppsMetri
 		        ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
 		       AND i.organization_id = $2
 		WHERE (
-		    i.initiator_did = $1
+		    i.initiator_did IN (SELECT user_did_set($1))
 		    OR i.initiator_did IN (SELECT did FROM user_agents)
 		    OR i.interacted_to_did IN (SELECT did FROM user_agents)
 		)`,
@@ -2749,7 +2811,7 @@ func (d *DB) GetAgentsAppsMetricsByUser(userDID, orgID string) (*AgentsAppsMetri
 			FROM new_agents a
 			LEFT JOIN new_interactions i
 			       ON i.initiator_did = a.did AND i.organization_id = $2
-			WHERE a.deployer_did = $1
+			WHERE a.deployer_did IN (SELECT user_did_set($1))
 			GROUP BY a.did
 		) agent_stats`,
 		userDID, orgID,
@@ -2785,7 +2847,7 @@ func (d *DB) getToolsByUser(userDID, orgID string, limit, offset int) ([]*ToolRe
 		LEFT JOIN new_agents a
 		       ON a.did = CASE WHEN i.interacted_to_did = t.did THEN i.initiator_did ELSE i.interacted_to_did END
 		WHERE (
-		    i.initiator_did = $1
+		    i.initiator_did IN (SELECT user_did_set($1))
 		    OR i.initiator_did IN (SELECT did FROM user_agents)
 		    OR i.interacted_to_did IN (SELECT did FROM user_agents)
 		)
@@ -2884,10 +2946,10 @@ func (d *DB) Search(q, orgID string) (*SearchResults, error) {
 const ownerAgentFilter = `
     a.organization_id = $2
     AND (
-        a.deployer_did = $1
+        a.deployer_did IN (SELECT user_did_set($1))
         OR a.did IN (
             SELECT agent_did FROM new_requests
-            WHERE creator_did = $1 AND request_type = 'deploy_agent' AND status = 'approved'
+            WHERE creator_did IN (SELECT user_did_set($1)) AND request_type = 'deploy_agent' AND status = 'approved'
         )
     )`
 
@@ -2897,25 +2959,26 @@ func (d *DB) GetUserDetail(userDID, orgID string) (*UserInfoRecord, error) {
 	err := d.conn.QueryRow(`
 		SELECT
 			COALESCE(u.did, ''),
+			COALESCE((SELECT dids FROM user_dids WHERE email = u.email), '{}'),
 			COALESCE(u.email, ''),
 			COALESCE(u.name, ''),
 			COALESCE(u.created_at, NOW()),
 			(SELECT COUNT(*) FROM json_array_elements_text(COALESCE(u.agent_access_list,'[]')::json)) AS access_agent_count,
-			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND initiator_did = $1) AS total_interactions,
-			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND initiator_did = $1 AND threat = 1) AS total_threats,
-			(SELECT COUNT(*) FROM new_intents WHERE organization_id = $2 AND initiator_did = $1) AS total_intents,
+			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND initiator_did IN (SELECT user_did_set($1))) AS total_interactions,
+			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND initiator_did IN (SELECT user_did_set($1)) AND threat = 1) AS total_threats,
+			(SELECT COUNT(*) FROM new_intents WHERE organization_id = $2 AND initiator_did IN (SELECT user_did_set($1))) AS total_intents,
 			(SELECT COUNT(DISTINCT a.did) FROM new_agents a
 			 WHERE a.organization_id = $2
-			   AND (a.deployer_did = $1
+			   AND (a.deployer_did IN (SELECT user_did_set($1))
 			        OR a.did IN (SELECT agent_did FROM new_requests
-			                     WHERE creator_did = $1 AND request_type = 'deploy_agent' AND status = 'approved'))
+			                     WHERE creator_did IN (SELECT user_did_set($1)) AND request_type = 'deploy_agent' AND status = 'approved'))
 			) AS total_agents_owned,
-			(SELECT MAX(i.time) FROM new_interactions i WHERE i.organization_id = $2 AND i.initiator_did = $1) AS last_active
+			(SELECT MAX(i.time) FROM new_interactions i WHERE i.organization_id = $2 AND i.initiator_did IN (SELECT user_did_set($1))) AS last_active
 		FROM new_org_users u
-		WHERE u.did = $1`,
+		WHERE u.email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$1::text])`,
 		userDID, orgID,
 	).Scan(
-		&r.UserDID, &r.UserName, &r.DisplayName, &r.CreatedAt,
+		&r.UserDID, pq.Array(&r.DIDs), &r.UserName, &r.DisplayName, &r.CreatedAt,
 		&r.AccessAgentCount, &r.TotalInteractions, &r.TotalThreats, &r.TotalIntents,
 		&r.TotalAgentsOwned, &lastAt,
 	)

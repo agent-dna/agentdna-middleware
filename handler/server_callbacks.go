@@ -1,12 +1,14 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
 
+	"agentdna-ratelimit-auth/db"
 	"agentdna-ratelimit-auth/email"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -45,8 +47,9 @@ type userFromAPIKeyResult struct {
 	Email  string
 }
 
-// CoreRegisterUser is called by the external server to set the DID for a user
-// identified by their API key.
+// CoreRegisterUser is called by the external server to add a DID to the user
+// identified by their API key. A user may hold several DIDs; the newest one
+// becomes their primary DID. A DID already held by another user returns 409.
 // POST /core/v1/register-user
 // Header: X-API-Key: <api_key>
 // Body:   {"user_id": "did:rubix:xyz"}
@@ -64,8 +67,12 @@ func (h *Handler) CoreRegisterUser(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.UpdateUserDIDByAPIKey(user.APIKey, req.UserID); err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to update user DID: %v", err)})
+	if err := h.db.AddUserDIDByAPIKey(user.APIKey, req.UserID); err != nil {
+		if errors.Is(err, db.ErrDIDTaken) {
+			c.JSON(http.StatusConflict, Response{Status: false, Message: "this DID is already registered to another user"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to add user DID: %v", err)})
 		return
 	}
 

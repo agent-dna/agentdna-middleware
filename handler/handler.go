@@ -2662,6 +2662,7 @@ func (h *Handler) UserInfo(c *gin.Context) {
 		Data: gin.H{
 			"user": gin.H{
 				"userID":              user.UserDID,
+				"dids":                user.DIDs,
 				"userName":            user.UserName,
 				"displayName":         user.DisplayName,
 				"createdAt":           user.CreatedAt.UTC().Format(time.RFC3339),
@@ -3443,7 +3444,7 @@ func (h *Handler) AgentsCreationRequestsEdit(c *gin.Context) {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "request not found"})
 		return
 	}
-	if existing.CreatorDID != creatorDID {
+	if !h.db.SameUserDID(existing.CreatorDID, creatorDID) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized to edit this request"})
 		return
 	}

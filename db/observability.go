@@ -35,7 +35,7 @@ func (d *DB) GetObservabilityHops(orgID string, since time.Time, onlyInitiatorDI
 		WHERE ni.time >= $1`
 	args := []any{since}
 	if onlyInitiatorDID != "" {
-		query += ` AND ni.intent_id IN (SELECT intent_id FROM new_intents WHERE initiator_did = $2)`
+		query += ` AND ni.intent_id IN (SELECT intent_id FROM new_intents WHERE initiator_did IN (SELECT user_did_set($2)))`
 		args = append(args, onlyInitiatorDID)
 	}
 	query += ` ORDER BY ni.time ASC`
@@ -69,8 +69,8 @@ type ObsUser struct {
 
 func (d *DB) GetOrgUserRegistry(orgID string) (map[string]*ObsUser, error) {
 	rows, err := d.conn.Query(
-		`SELECT did, COALESCE(name,''), email FROM new_org_users
-		 WHERE did IS NOT NULL AND did <> '' AND did <> 'none'`,
+		`SELECT unnest(ud.dids), COALESCE(u.name,''), u.email
+		 FROM user_dids ud JOIN new_org_users u ON u.email = ud.email`,
 	)
 	if err != nil {
 		return nil, err
@@ -206,7 +206,7 @@ func (d *DB) GetObsIntentInfo(orgID string, intentIDs []string) (map[string]*Obs
 func (d *DB) OrgUserExists(orgID, did string) (bool, error) {
 	var exists bool
 	err := d.conn.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM new_org_users WHERE did = $1)`,
+		`SELECT EXISTS(SELECT 1 FROM user_dids WHERE dids @> ARRAY[$1::text])`,
 		did,
 	).Scan(&exists)
 	return exists, err
