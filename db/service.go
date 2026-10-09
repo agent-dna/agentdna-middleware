@@ -10,11 +10,11 @@ import (
 	"github.com/lib/pq"
 )
 
-func (d *DB) StoreAdmin(did, orgID, apiKey, email, passwordHash string) error {
+func (d *DB) StoreAdmin(did, orgID, apiKey, email string) error {
 	_, err := d.conn.Exec(
-		`INSERT INTO new_admins (did, organization_id, api_key, email, password)
-		 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (did) DO NOTHING`,
-		did, orgID, apiKey, email, passwordHash,
+		`INSERT INTO new_admins (did, organization_id, api_key, email)
+		 VALUES ($1, $2, $3, $4) ON CONFLICT (did) DO NOTHING`,
+		did, orgID, apiKey, email,
 	)
 	return err
 }
@@ -23,8 +23,8 @@ func (d *DB) GetAdminByEmail(email string) (*AdminRecord, error) {
 	var a AdminRecord
 	var orgID, apiKey sql.NullString
 	err := d.conn.QueryRow(
-		`SELECT did, organization_id, api_key, email, COALESCE(name,''), password FROM new_admins WHERE email = $1`, email,
-	).Scan(&a.DID, &orgID, &apiKey, &a.Email, &a.Name, &a.PasswordHash)
+		`SELECT did, organization_id, api_key, COALESCE(email,''), COALESCE(name,'') FROM new_admins WHERE email = $1`, email,
+	).Scan(&a.DID, &orgID, &apiKey, &a.Email, &a.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +62,7 @@ func (d *DB) GetAllAdminEmailsByOrgID(orgID string) ([]string, error) {
 
 func (d *DB) GetOrgUserEmailByDID(did string) (name, email string, err error) {
 	err = d.conn.QueryRow(
-		`SELECT COALESCE(name,''), COALESCE(email,'') FROM new_org_users WHERE did = $1`,
+		`SELECT COALESCE(name,''), COALESCE(email,'') FROM new_org_users WHERE email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$1::text])`,
 		did,
 	).Scan(&name, &email)
 	return
@@ -72,8 +72,8 @@ func (d *DB) GetAdminByDID(did string) (*AdminRecord, error) {
 	var a AdminRecord
 	var orgID, apiKey sql.NullString
 	err := d.conn.QueryRow(
-		`SELECT did, organization_id, api_key, email, password FROM new_admins WHERE did = $1`, did,
-	).Scan(&a.DID, &orgID, &apiKey, &a.Email, &a.PasswordHash)
+		`SELECT did, organization_id, api_key, COALESCE(email,''), COALESCE(name,'') FROM new_admins WHERE did = $1`, did,
+	).Scan(&a.DID, &orgID, &apiKey, &a.Email, &a.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -86,8 +86,8 @@ func (d *DB) GetAdminByOrgID(orgID string) (*AdminRecord, error) {
 	var a AdminRecord
 	var apiKey sql.NullString
 	err := d.conn.QueryRow(
-		`SELECT did, organization_id, api_key, email, password FROM new_admins WHERE organization_id = $1 LIMIT 1`, orgID,
-	).Scan(&a.DID, &a.OrganizationID, &apiKey, &a.Email, &a.PasswordHash)
+		`SELECT did, organization_id, api_key, COALESCE(email,'') FROM new_admins WHERE organization_id = $1 LIMIT 1`, orgID,
+	).Scan(&a.DID, &a.OrganizationID, &apiKey, &a.Email)
 	if err != nil {
 		return nil, err
 	}
@@ -1058,7 +1058,7 @@ func (d *DB) GetAdminProfile(username string) (*AdminProfile, error) {
 	err := d.conn.QueryRow(`
 		SELECT
 			COALESCE(name, ''),
-			email,
+			COALESCE(email, ''),
 			COALESCE(did, ''),
 			COALESCE(organization_id, ''),
 			COALESCE(api_key, ''),
@@ -1147,7 +1147,12 @@ func (d *DB) UpdateUserEmail(currentEmail, newEmail string) error {
 	if exists {
 		return fmt.Errorf("email already in use")
 	}
-	res, err := d.conn.Exec(`UPDATE new_org_users SET email = $1 WHERE email = $2`, newEmail, currentEmail)
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE new_org_users SET email = $1 WHERE email = $2`, newEmail, currentEmail)
 	if err != nil {
 		return err
 	}
@@ -1155,7 +1160,10 @@ func (d *DB) UpdateUserEmail(currentEmail, newEmail string) error {
 	if n == 0 {
 		return fmt.Errorf("user not found")
 	}
-	return nil
+	if err := renameUserSessions(tx, currentEmail, newEmail); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *DB) UpdateUserDIDByAPIKey(apiKey, did string) error {
@@ -2495,45 +2503,21 @@ func (d *DB) UpdateUserPassword(email, passwordHash string) error {
 	return nil
 }
 
-func (d *DB) UpdateAdminName(email, name string) error {
-	res, err := d.conn.Exec(`UPDATE new_admins SET name = $1 WHERE email = $2`, name, email)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("user not found")
-	}
-	return nil
-}
-
-func (d *DB) UpdateAdminEmail(currentEmail, newEmail string) error {
+// UpdateAdminEmail changes the email of the admin identified by did (admin
+// rows may have an empty email, so email can't identify them).
+func (d *DB) UpdateAdminEmail(did, newEmail string) error {
 	var exists bool
 	d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM new_admins WHERE email = $1)`, newEmail).Scan(&exists)
 	if exists {
 		return fmt.Errorf("email already in use")
 	}
-	res, err := d.conn.Exec(`UPDATE new_admins SET email = $1 WHERE email = $2`, newEmail, currentEmail)
+	res, err := d.conn.Exec(`UPDATE new_admins SET email = $1 WHERE did = $2`, newEmail, did)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return fmt.Errorf("user not found")
-	}
-	return nil
-}
-
-func (d *DB) UpdateAdminPassword(email, passwordHash string) error {
-	res, err := d.conn.Exec(
-		`UPDATE new_admins SET password = $1 WHERE email = $2`, passwordHash, email,
-	)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("no admin found with email %s", email)
 	}
 	return nil
 }

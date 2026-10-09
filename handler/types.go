@@ -2,8 +2,6 @@ package handler
 
 import (
 	"encoding/json"
-
-	"github.com/golang-jwt/jwt/v5"
 )
 
 type Response struct {
@@ -75,15 +73,6 @@ type signatureResponse struct {
 		} `json:"mintedNFTChildren"`
 		TransactionID string `json:"transactionID"`
 	} `json:"result"`
-}
-
-type JWTClaims struct {
-	DID    string `json:"did"`
-	Email  string `json:"email"`
-	OrgID  string `json:"org_id"`
-	NFTID  string `json:"nft_id"`
-	APIKey string `json:"api_key"`
-	jwt.RegisteredClaims
 }
 
 const (

@@ -7,7 +7,6 @@ type Admin struct {
 	OrganizationID  string `json:"organizationID" db:"organization_id"`
 	APIKey		  string `json:"apiKey" db:"api_key"`
 	Email          string `json:"email" db:"email"`
-	Password       string `json:"password" db:"password"`
 	AgentCount     int    `json:"agentCount" db:"agent_count"`
 	IntentCount    int    `json:"intentCount" db:"intent_count"`
 	ThreatCount    int    `json:"threatCount" db:"threat_count"`

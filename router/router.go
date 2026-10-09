@@ -13,7 +13,8 @@ func Register(r *gin.Engine, h *handler.Handler) {
 
 	// Dashboard — public
 	public := r.Group("/dashboard/v1")
-	public.POST("/login", h.Login)
+	public.POST("/login", h.Login)            // org users
+	public.POST("/admin-login", h.AdminLogin) // admins, verified by the admin server
 	public.POST("/send-otp", h.SendOTP)
 	public.POST("/forgot-password", h.ForgotPassword)
 	public.POST("/reset-password", h.ResetPassword)
@@ -27,8 +28,11 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	public.POST("/authorize-action", h.AuthorizeAction)
 	public.GET("/global-stats", h.GlobalStats)
 
-	// Dashboard — JWT protected
-	dashboard := r.Group("/dashboard/v1", h.JWTAuthMiddleware())
+	// Dashboard — session protected (HttpOnly session cookie set by /login)
+	dashboard := r.Group("/dashboard/v1", h.SessionAuthMiddleware())
+	dashboard.GET("/session", h.Session)
+	dashboard.POST("/logout", h.Logout)
+	dashboard.POST("/logout-all", h.LogoutAll)
 	dashboard.GET("/user-profile", h.UserProfile)
 	dashboard.GET("/admin-profile", h.AdminProfile)
 

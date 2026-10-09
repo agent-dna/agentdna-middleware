@@ -29,7 +29,6 @@ type AdminRecord struct {
 	APIKey         string
 	Email          string
 	Name           string
-	PasswordHash   string
 }
 
 type RequestRecord struct {
@@ -269,7 +268,6 @@ func New(dsn string) *DB {
 			organization_id TEXT,
 			api_key         TEXT,
 			email           TEXT,
-			password        TEXT,
 			agent_count     INTEGER DEFAULT 0,
 			intent_count    INTEGER DEFAULT 0,
 			threat_count    INTEGER DEFAULT 0,
@@ -420,6 +418,8 @@ func New(dsn string) *DB {
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS message TEXT DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
+	// Admin passwords live only on the admin server; drop the old local copies.
+	conn.Exec(`ALTER TABLE new_admins DROP COLUMN IF EXISTS password`)
 	conn.Exec(`ALTER TABLE new_org_users ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_org_users ADD COLUMN IF NOT EXISTS key TEXT DEFAULT ''`)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_org_users_key ON new_org_users (key)`)

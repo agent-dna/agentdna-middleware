@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 
 	"agentdna-ratelimit-auth/db"
 	"agentdna-ratelimit-auth/handler"
@@ -14,11 +15,11 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 )
 
-func initConfig() (string, *url.URL, string, string, string, string, string, string, string) {
+func initConfig() (string, *url.URL, string, handler.SessionConfig, string, string, string, string, string) {
 	dsn := os.Getenv("DATABASE_URL")
 	backendURLStr := os.Getenv("RUBIX_NODE_URL")
 	serverPort := os.Getenv("SERVER_PORT")
-	jwtSecret := os.Getenv("JWT_SECRET")
+	session := sessionConfigFromEnv()
 	orgID := os.Getenv("ORG_ID")
 	adminServiceURL := os.Getenv("ADMIN_SERVICE_URL")
 	cbacServiceURL := os.Getenv("CBAC_SERVICE_URL")
@@ -34,9 +35,6 @@ func initConfig() (string, *url.URL, string, string, string, string, string, str
 	if serverPort == "" {
 		log.Fatal("SERVER_PORT environment variable is required")
 	}
-	if jwtSecret == "" {
-		log.Fatal("JWT_SECRET environment variable is required")
-	}
 	if orgID == "" {
 		log.Fatal("ORG_ID environment variable is required")
 	}
@@ -46,30 +44,54 @@ func initConfig() (string, *url.URL, string, string, string, string, string, str
 		log.Fatalf("RUBIX_NODE_URL invalid format: %s", backendURLStr)
 	}
 
-	return dsn, parsedURL, serverPort, jwtSecret, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint
+	return dsn, parsedURL, serverPort, session, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint
+}
+
+// sessionConfigFromEnv reads the dashboard session cookie settings:
+//
+//	CORS_ALLOWED_ORIGINS     comma-separated dashboard origins, e.g.
+//	                         "https://app.agentdna.io,http://localhost:3000"
+//	SESSION_COOKIE_SAMESITE  lax (default) | strict | none — use none only when
+//	                         the dashboard and API are on different sites
+//	SESSION_COOKIE_SECURE    true (default) | false — false only for plain-http dev
+//	SESSION_COOKIE_DOMAIN    optional cookie Domain attribute
+func sessionConfigFromEnv() handler.SessionConfig {
+	cfg := handler.SessionConfig{
+		CookieSecure:   os.Getenv("SESSION_COOKIE_SECURE") != "false",
+		CookieSameSite: http.SameSiteLaxMode,
+		CookieDomain:   os.Getenv("SESSION_COOKIE_DOMAIN"),
+		AllowedOrigins: handler.TrimOrigins(os.Getenv("CORS_ALLOWED_ORIGINS")),
+	}
+	switch strings.ToLower(os.Getenv("SESSION_COOKIE_SAMESITE")) {
+	case "", "lax":
+	case "strict":
+		cfg.CookieSameSite = http.SameSiteStrictMode
+	case "none":
+		cfg.CookieSameSite = http.SameSiteNoneMode
+		if !cfg.CookieSecure {
+			log.Fatal("SESSION_COOKIE_SAMESITE=none requires SESSION_COOKIE_SECURE=true (browsers drop the cookie otherwise)")
+		}
+	default:
+		log.Fatalf("SESSION_COOKIE_SAMESITE must be lax, strict or none, got %q", os.Getenv("SESSION_COOKIE_SAMESITE"))
+	}
+	if len(cfg.AllowedOrigins) == 0 {
+		log.Printf("[session] CORS_ALLOWED_ORIGINS is empty — only a dashboard served from the API's own origin can log in")
+	}
+	return cfg
 }
 
 func main() {
-	dsn, backendURL, serverPort, jwtSecret, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint := initConfig()
+	dsn, backendURL, serverPort, session, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint := initConfig()
 
 	database := db.New(dsn)
 	defer database.Close()
 
-	h := handler.New(database, backendURL, jwtSecret, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint)
+	h := handler.New(database, backendURL, session, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(gin.Logger())
-	r.Use(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
-		c.Header("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization, X-API-Key, X-Agent-Description, X-Agent-Repo")
-		if c.Request.Method == http.MethodOptions {
-			c.AbortWithStatus(http.StatusNoContent)
-			return
-		}
-		c.Next()
-	})
+	r.Use(h.CORSMiddleware())
 
 	router.Register(r, h)
 

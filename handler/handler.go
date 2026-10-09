@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 	"io"
@@ -27,12 +26,6 @@ import (
 	"sync"
 	"time"
 )
-
-func enableCors(w *http.ResponseWriter) {
-	(*w).Header().Set("Access-Control-Allow-Origin", "*")
-	(*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-	(*w).Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization")
-}
 
 type otpEntry struct {
 	code      string
@@ -85,7 +78,7 @@ type Handler struct {
 	db                  *db.DB
 	proxy               *httputil.ReverseProxy
 	baseURL             *url.URL
-	jwtSecret           string
+	session             SessionConfig
 	orgID               string
 	adminServiceURL     string
 	cbacServiceURL      string
@@ -96,13 +89,13 @@ type Handler struct {
 	emailQueue          chan email.Message
 }
 
-func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
+func New(database *db.DB, backendURL *url.URL, session SessionConfig, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
 	h := &Handler{
 		db:                  database,
 		proxy:               proxy,
 		baseURL:             backendURL,
-		jwtSecret:           jwtSecret,
+		session:             session,
 		orgID:               orgID,
 		adminServiceURL:     adminServiceURL,
 		cbacServiceURL:      cbacServiceURL,
@@ -242,18 +235,30 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 		return
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
-		return
-	}
-
-	// Try user first, then admin.
-	if err := h.db.UpdateUserPassword(req.Email, string(hash)); err != nil {
-		if err := h.db.UpdateAdminPassword(req.Email, string(hash)); err != nil {
-			c.JSON(http.StatusNotFound, Response{Status: false, Message: "no account found with that email"})
+	// Try user first, then admin. Org user passwords are stored here; admin
+	// passwords live only on the admin server. A reset means the old password
+	// may be compromised, so every existing session of that account is ended.
+	if _, err := h.db.GetOrgUserByEmail(req.Email); err == nil {
+		hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
 			return
 		}
+		if err := h.db.UpdateUserPassword(req.Email, string(hash)); err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to update password"})
+			return
+		}
+		h.endOtherSessions(db.SessionAccountUser, req.Email, "")
+	} else if admin, err := h.db.GetAdminByEmail(req.Email); err == nil {
+		if code, err := h.setAdminServerPassword(admin.Name, req.NewPassword); err != nil {
+			log.Printf("[ResetPassword] admin server update failed email=%q err=%v", req.Email, err)
+			c.JSON(code, Response{Status: false, Message: err.Error()})
+			return
+		}
+		h.endOtherSessions(db.SessionAccountAdmin, admin.DID, "")
+	} else {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "no account found with that email"})
+		return
 	}
 
 	log.Printf("[ResetPassword] password updated for email=%q", req.Email)
@@ -274,39 +279,19 @@ func (h *Handler) UpdatePassword(c *gin.Context) {
 	}
 
 	email := c.GetString(CtxEmail)
-	isAdmin := c.GetBool(CtxIsAdmin)
+	isAdmin := c.GetString(CtxAccountType) == db.SessionAccountAdmin
 
 	if isAdmin {
-		admin, err := h.db.GetAdminByEmail(email)
+		// Admin passwords live on the admin server, addressed by username.
+		admin, err := h.db.GetAdminByDID(c.GetString(CtxAccountID))
 		if err != nil {
 			c.JSON(http.StatusNotFound, Response{Status: false, Message: "account not found"})
 			return
 		}
 
-		// Call admin server to update password there.
-		endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/update-password"
-		b, _ := json.Marshal(map[string]string{"username": admin.Name, "new_password": req.NewPassword})
-		resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
-		if err != nil {
-			log.Printf("[UpdatePassword] admin server http error email=%s err=%v", email, err)
-			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to reach admin server: %v", err)})
-			return
-		}
-		defer resp.Body.Close()
-
-		var adminResp struct {
-			Status  bool   `json:"status"`
-			Message string `json:"message"`
-		}
-		rawBody, _ := io.ReadAll(resp.Body)
-		if err := json.Unmarshal(rawBody, &adminResp); err != nil {
-			log.Printf("[UpdatePassword] failed to parse admin server response email=%s body=%s", email, string(rawBody))
-			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "invalid response from admin server"})
-			return
-		}
-		if !adminResp.Status {
-			log.Printf("[UpdatePassword] admin server rejected update email=%s message=%s", email, adminResp.Message)
-			c.JSON(http.StatusBadRequest, Response{Status: false, Message: adminResp.Message})
+		if code, err := h.setAdminServerPassword(admin.Name, req.NewPassword); err != nil {
+			log.Printf("[UpdatePassword] admin server update failed did=%s err=%v", admin.DID, err)
+			c.JSON(code, Response{Status: false, Message: err.Error()})
 			return
 		}
 
@@ -322,8 +307,42 @@ func (h *Handler) UpdatePassword(c *gin.Context) {
 		}
 	}
 
+	// Log out every other device; the session making this change stays.
+	h.endOtherSessions(c.GetString(CtxAccountType), c.GetString(CtxAccountID), c.GetString(CtxSessionHash))
+
 	log.Printf("[UpdatePassword] password updated email=%q isAdmin=%v", email, isAdmin)
 	c.JSON(http.StatusOK, Response{Status: true, Message: "password updated successfully"})
+}
+
+// setAdminServerPassword changes an admin's password on the admin server —
+// the only place admin passwords are kept — addressed by their admin server
+// username. On failure it returns the HTTP status to answer with and an error
+// whose message is safe to show the caller.
+func (h *Handler) setAdminServerPassword(username, newPassword string) (int, error) {
+	if username == "" {
+		// Rows made by scripts/add_admin.py get their username on first login.
+		return http.StatusConflict, errors.New("this admin has no admin server username yet; log in once, then try again")
+	}
+	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/update-password"
+	b, _ := json.Marshal(map[string]string{"username": username, "new_password": newPassword})
+	resp, err := adminHTTP.Post(endpoint, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return http.StatusBadGateway, fmt.Errorf("failed to reach admin server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var adminResp struct {
+		Status  bool   `json:"status"`
+		Message string `json:"message"`
+	}
+	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err := json.Unmarshal(rawBody, &adminResp); err != nil {
+		return http.StatusBadGateway, errors.New("invalid response from admin server")
+	}
+	if !adminResp.Status {
+		return http.StatusBadRequest, errors.New(adminResp.Message)
+	}
+	return 0, nil
 }
 
 // sendMail enqueues an email for the worker pool. Never blocks the request path.
@@ -349,8 +368,6 @@ func (h *Handler) sendMail(msg email.Message, err error) {
 }
 
 func (h *Handler) Healthz(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
@@ -907,18 +924,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (*branchWriteResult, err
 	return branch, nil
 }
 
-func (h *Handler) issueToken(claims JWTClaims) (string, error) {
-	claims.RegisteredClaims = jwt.RegisteredClaims{
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(7 * 24 * time.Hour)),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
-	}
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(h.jwtSecret))
-}
-
 func (h *Handler) Login(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	var req struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
@@ -928,29 +934,24 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	// Try org user first
 	user, err := h.db.GetOrgUserByEmail(req.Email)
 	log.Printf("[Login] GetOrgUserByEmail email=%q found=%v err=%v", req.Email, err == nil, err)
 	if err == nil {
 		log.Printf("[Login] user did=%q orgID=%q hasPasswordHash=%v", user.DID, user.OrganizationID, user.PasswordHash != "")
 		if user.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
 			log.Printf("[Login] password mismatch for user email=%q", req.Email)
-			c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
+			c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid credentials"})
 			return
 		}
 		log.Printf("[Login] user login success email=%q did=%q", req.Email, user.DID)
-		tokenStr, err := h.issueToken(JWTClaims{
-			DID: user.DID, Email: user.Email, OrgID: user.OrganizationID,
-			NFTID: user.NFTID, APIKey: user.APIKey,
-		})
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate token"})
+		if err := h.startSession(c, db.SessionAccountUser, user.Email); err != nil {
+			log.Printf("[Login] create session failed email=%q err=%v", req.Email, err)
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to create session"})
 			return
 		}
 		c.JSON(http.StatusOK, Response{
 			Status: true,
 			Data: gin.H{
-				"token":             tokenStr,
 				"did":               user.DID,
 				"email":             user.Email,
 				"org_id":            user.OrganizationID,
@@ -963,39 +964,11 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	// Try admin
-	admin, err := h.db.GetAdminByEmail(req.Email)
-	log.Printf("[Login] GetAdminByEmail email=%q found=%v err=%v", req.Email, err == nil, err)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
-		return
-	}
-	log.Printf("[Login] admin did=%q orgID=%q hasPasswordHash=%v", admin.DID, admin.OrganizationID, admin.PasswordHash != "")
-	if admin.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(admin.PasswordHash), []byte(req.Password)) != nil {
-		log.Printf("[Login] password mismatch for admin email=%q", req.Email)
-		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
-		return
-	}
-	log.Printf("[Login] admin login success email=%q did=%q", req.Email, admin.DID)
-	tokenStr, err := h.issueToken(JWTClaims{
-		DID: admin.DID, Email: admin.Email, OrgID: admin.OrganizationID,
-		APIKey: admin.APIKey,
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate token"})
-		return
-	}
-	c.JSON(http.StatusOK, Response{
-		Status: true,
-		Data: gin.H{
-			"token":    tokenStr,
-			"did":      admin.DID,
-			"email":    admin.Email,
-			"org_id":   admin.OrganizationID,
-			"api_key":  admin.APIKey,
-			"is_admin": true,
-		},
-	})
+	// Org users only. Admin passwords live on the admin server, so admins
+	// sign in through /admin-login; the new_admins.password copy is stale.
+	// Wrong credentials are 400, not 401: the dashboard reads 401 as
+	// "session expired" and would hide this message.
+	c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid credentials"})
 }
 
 func (h *Handler) Signup(c *gin.Context) {
@@ -1049,7 +1022,7 @@ func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.StoreAdmin(req.DID, req.OrgID, "", "", ""); err != nil {
+	if err := h.db.StoreAdmin(req.DID, req.OrgID, "", ""); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register admin: %v", err)})
 		return
 	}
@@ -1058,9 +1031,6 @@ func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
 }
 
 func (h *Handler) CreateUser(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return
@@ -1133,14 +1103,9 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 	}
 	log.Printf("[CreateAdmin] agent service returned did=%q", did)
 
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
-		return
-	}
-
+	// The password went to the admin server only; no local copy is kept.
 	apiKey := uuid.New().String()
-	if err := h.db.StoreAdmin(did, req.OrgID, apiKey, req.Email, string(passwordHash)); err != nil {
+	if err := h.db.StoreAdmin(did, req.OrgID, apiKey, req.Email); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to store admin: %v", err)})
 		return
 	}
@@ -1191,9 +1156,6 @@ func (h *Handler) GlobalStats(c *gin.Context) {
 }
 
 func (h *Handler) HomeMetrics(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1270,9 +1232,6 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 }
 
 func (h *Handler) InteractionsList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1354,9 +1313,6 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 }
 
 func (h *Handler) ThreatsList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1431,9 +1387,6 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 }
 
 func (h *Handler) AgentsAppsMetrics(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1500,9 +1453,6 @@ func (h *Handler) AgentsAppsMetrics(c *gin.Context) {
 }
 
 func (h *Handler) Search(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	q := strings.TrimSpace(c.Query("q"))
 	if q == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "q is required"})
@@ -1593,9 +1543,6 @@ func (h *Handler) InteractionSeries(c *gin.Context) {
 }
 
 func (h *Handler) TopThreatAgents(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1644,9 +1591,6 @@ func (h *Handler) TopThreatAgents(c *gin.Context) {
 }
 
 func (h *Handler) IntentList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1706,9 +1650,6 @@ func (h *Handler) IntentList(c *gin.Context) {
 }
 
 func (h *Handler) AgentMetrics(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1773,9 +1714,6 @@ func (h *Handler) AgentMetrics(c *gin.Context) {
 }
 
 func (h *Handler) AgentsList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1852,9 +1790,6 @@ func (h *Handler) AgentsList(c *gin.Context) {
 }
 
 func (h *Handler) UsersList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1906,9 +1841,6 @@ func (h *Handler) UsersList(c *gin.Context) {
 
 func (h *Handler) AgentInteractions(c *gin.Context) {
 	agentDID := c.Query("agentDID")
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if agentDID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
@@ -1972,9 +1904,6 @@ func (h *Handler) AgentInteractions(c *gin.Context) {
 
 func (h *Handler) AgentIntents(c *gin.Context) {
 	agentDID := c.Query("agentDID")
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if agentDID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
@@ -2019,9 +1948,6 @@ func (h *Handler) AgentIntents(c *gin.Context) {
 }
 
 func (h *Handler) UserIntents(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	userDID := c.GetString(CtxDID)
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
@@ -2104,9 +2030,6 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 
 func (h *Handler) IntentDiagram(c *gin.Context) {
 	intentID := c.Query("intentID")
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if intentID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intentID is required"})
@@ -2202,16 +2125,17 @@ func (h *Handler) UpdateProfile(c *gin.Context) {
 	}
 
 	callerEmail := c.GetString(CtxEmail)
-	isAdmin := c.GetBool(CtxIsAdmin)
+	isAdmin := c.GetString(CtxAccountType) == db.SessionAccountAdmin
+
+	// An admin's name is their admin server username, which /admin-login and
+	// /update-password depend on — it can't be changed from the dashboard.
+	if isAdmin && req.Name != nil {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "admin username is managed by the admin server and cannot be changed here"})
+		return
+	}
 
 	if req.Name != nil {
-		var err error
-		if isAdmin {
-			err = h.db.UpdateAdminName(callerEmail, *req.Name)
-		} else {
-			err = h.db.UpdateUserName(callerEmail, *req.Name)
-		}
-		if err != nil {
+		if err := h.db.UpdateUserName(callerEmail, *req.Name); err != nil {
 			log.Printf("[UpdateProfile] update name email=%s err=%v", callerEmail, err)
 			c.JSON(http.StatusBadRequest, Response{Status: false, Message: err.Error()})
 			return
@@ -2225,7 +2149,7 @@ func (h *Handler) UpdateProfile(c *gin.Context) {
 		}
 		var err error
 		if isAdmin {
-			err = h.db.UpdateAdminEmail(callerEmail, *req.Email)
+			err = h.db.UpdateAdminEmail(c.GetString(CtxAccountID), *req.Email)
 		} else {
 			err = h.db.UpdateUserEmail(callerEmail, *req.Email)
 		}
@@ -2370,9 +2294,6 @@ func (h *Handler) UnrevokeAgent(c *gin.Context) {
 
 func (h *Handler) AgentInfo(c *gin.Context) {
 	agentDID := c.Query("agentDID")
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if agentDID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
@@ -2424,9 +2345,6 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 
 func (h *Handler) IntentInfo(c *gin.Context) {
 	intentID := c.Query("intentID")
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if intentID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intentID is required"})
@@ -2523,9 +2441,6 @@ var validIntentReviewStatuses = map[string]bool{
 // POST /dashboard/v1/update-intent-status
 // Body: {"intentID": "...", "status": "Acknowledged" | "Flagged" | "Unreviewed"}
 func (h *Handler) UpdateIntentStatus(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -2565,9 +2480,6 @@ func (h *Handler) UpdateIntentStatus(c *gin.Context) {
 }
 
 func (h *Handler) ToolsList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -2631,9 +2543,6 @@ func agentStatus(score float64, totalInteractions int) string {
 }
 
 func (h *Handler) UserInfo(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 
 	userID := c.Query("userID")
@@ -2797,9 +2706,6 @@ func (h *Handler) UserInfo(c *gin.Context) {
 }
 
 func (h *Handler) ToolInfo(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 
 	// Accept either ?toolDID= or ?name= — whichever is provided.
@@ -3302,9 +3208,6 @@ func readPolicyFile(c *gin.Context) (string, bool) {
 // deploy_agent, agent_access, ...), scoped to the whole org for an admin
 // caller or to just the caller's own requests otherwise.
 func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -3371,9 +3274,6 @@ func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
 }
 
 func (h *Handler) AgentsCreationRequestsListUser(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	creatorDID := c.GetString(CtxDID)
 	email := c.GetString(CtxEmail)
 	log.Printf("[AgentsCreationRequestsListUser] ctx did=%q email=%q org_id=%q", creatorDID, email, c.GetString(CtxOrgID))
@@ -3431,9 +3331,6 @@ func (h *Handler) AgentsCreationRequestsListUser(c *gin.Context) {
 }
 
 func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	creatorDID := c.GetString(CtxDID)
 	orgID := c.GetString(CtxOrgID)
 	if creatorDID == "" || orgID == "" {
@@ -3524,9 +3421,6 @@ func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
 }
 
 func (h *Handler) AgentsCreationRequestsEdit(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	creatorDID := c.GetString(CtxDID)
 	if creatorDID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
@@ -3567,9 +3461,6 @@ func (h *Handler) AgentsCreationRequestsEdit(c *gin.Context) {
 }
 
 func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return
@@ -3639,9 +3530,6 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 }
 
 func (h *Handler) AgentInfoEdit(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return
@@ -3674,9 +3562,6 @@ func (h *Handler) AgentInfoEdit(c *gin.Context) {
 }
 
 func (h *Handler) AgentAccessRequestsListOrg(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return
@@ -3720,9 +3605,6 @@ func (h *Handler) AgentAccessRequestsListOrg(c *gin.Context) {
 }
 
 func (h *Handler) AgentAccessRequestsListUser(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	userDID := c.GetString(CtxDID)
 	if userDID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
@@ -3761,9 +3643,6 @@ func (h *Handler) AgentAccessRequestsListUser(c *gin.Context) {
 }
 
 func (h *Handler) AgentAccessRequestSubmit(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return

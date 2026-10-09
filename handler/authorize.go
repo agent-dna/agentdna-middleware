@@ -46,9 +46,6 @@ type authorizeActionRequest struct {
 //   - allow, no app_request supplied     -> 200, status:true, data.authorized:true
 //   - allow, app_request supplied        -> the App's status code and body are relayed verbatim
 func (h *Handler) AuthorizeAction(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	var req authorizeActionRequest
 	if err := c.ShouldBindJSON(&req); err != nil || req.AgentID == "" || req.ActionIntent == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agent_id and action_intent are required"})
