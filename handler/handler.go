@@ -62,9 +62,10 @@ const (
 // under its eventual /tx response id (for a possible /signature rollback) or
 // roll it back immediately if /tx itself reports failure.
 type branchWriteResult struct {
-	IntentID    string
-	InsertedIDs []string
-	Renamed     []db.RenamedInteractionID
+	IntentID     string
+	InsertedIDs  []string
+	InsertedKeys []db.HopKey // the same hops by identity, which survives relabeling
+	Renamed      []db.RenamedInteractionID
 }
 
 // isEmpty reports whether this call inserted or relabeled nothing at all —
@@ -105,6 +106,7 @@ func New(database *db.DB, backendURL *url.URL, session SessionConfig, orgID, adm
 	}
 	// Capture blockchain transaction provenance from the upstream responses.
 	proxy.ModifyResponse = h.captureRubixResponse
+	proxy.ErrorHandler = h.proxyError
 	if cfg, err := email.LoadConfigFromEnv(); err == nil {
 		h.mailer = email.New(cfg)
 	} else {
@@ -503,49 +505,63 @@ func (h *Handler) captureTxResponse(resp *http.Response) {
 	}
 	intentID := branch.IntentID
 
+	// Only status=true with a result.id can ever be signed. Anything else —
+	// status=false, an HTTP error, a body that isn't JSON (e.g. an HTML error
+	// page), no result.id — means this txn will never be confirmed, so what it
+	// wrote is rolled back now instead of lingering as a finished workflow.
 	body, err := readAndRestoreBody(resp)
 	if err != nil {
-		log.Printf("[provenance] tx: read body failed intent_id=%s: %v", intentID, err)
+		h.rollbackTxBranch(branch, fmt.Sprintf("read body failed: %v", err))
 		return
 	}
-
 	var txResp txResponse
 	if err := json.Unmarshal(body, &txResp); err != nil {
-		log.Printf("[provenance] tx: parse failed intent_id=%s: %v", intentID, err)
+		h.rollbackTxBranch(branch, fmt.Sprintf("HTTP %d, body is not JSON: %v", resp.StatusCode, err))
 		return
 	}
-
-	// status=false → the transaction failed to initiate; remove exactly the
-	// rows this call inserted/relabeled (not the whole intent, which may
-	// already carry other branches from earlier successful txns).
 	if !txResp.Status {
-		if branch.isEmpty() {
-			log.Printf("[provenance] tx: status=false intent_id=%s but this txn was a fully duplicate replay — nothing to roll back", intentID)
-			return
-		}
-		interactionsDeleted, intentsDeleted, err := h.db.RollbackBranch(intentID, branch.InsertedIDs, branch.Renamed)
-		if err != nil {
-			log.Printf("[provenance] tx: rollback failed intent_id=%s: %v", intentID, err)
-		} else {
-			log.Printf("[provenance] tx: status=false, rolled back intent_id=%s interactions_deleted=%d intents_deleted=%d",
-				intentID, interactionsDeleted, intentsDeleted)
-		}
+		h.rollbackTxBranch(branch, fmt.Sprintf("HTTP %d, status=false: %s", resp.StatusCode, txResp.Message))
 		return
 	}
-
 	if txResp.Result.ID == "" {
-		log.Printf("[provenance] tx: empty result.id intent_id=%s", intentID)
+		h.rollbackTxBranch(branch, fmt.Sprintf("HTTP %d, status=true but no result.id", resp.StatusCode))
 		return
 	}
 	if branch.isEmpty() {
 		log.Printf("[provenance] tx: intent_id=%s fully duplicate replay, not tracking req_id=%s", intentID, txResp.Result.ID)
 		return
 	}
-	if err := h.db.InsertPendingBranch(txResp.Result.ID, intentID, branch.InsertedIDs, branch.Renamed); err != nil {
+	if err := h.db.InsertPendingBranch(txResp.Result.ID, intentID, branch.InsertedIDs, branch.InsertedKeys, branch.Renamed); err != nil {
 		log.Printf("[provenance] tx: track pending branch failed intent_id=%s req_id=%s: %v", intentID, txResp.Result.ID, err)
 		return
 	}
 	log.Printf("[provenance] tx: pending branch tracked ok intent_id=%s req_id=%s", intentID, txResp.Result.ID)
+}
+
+// rollbackTxBranch removes what an intent txn wrote when its /tx call failed.
+func (h *Handler) rollbackTxBranch(branch *branchWriteResult, reason string) {
+	if branch.isEmpty() {
+		log.Printf("[provenance] tx: failed (%s) intent_id=%s but it was a fully duplicate replay — nothing to roll back", reason, branch.IntentID)
+		return
+	}
+	interactionsDeleted, intentsDeleted, err := h.db.RollbackBranch(branch.IntentID, branch.InsertedKeys, branch.InsertedIDs)
+	if err != nil {
+		log.Printf("[provenance] tx: failed (%s), rollback failed intent_id=%s: %v", reason, branch.IntentID, err)
+		return
+	}
+	log.Printf("[provenance] tx: failed (%s), rolled back intent_id=%s interactions_deleted=%d intents_deleted=%d",
+		reason, branch.IntentID, interactionsDeleted, intentsDeleted)
+}
+
+// proxyError answers a request the Rubix node never responded to (connection
+// refused or dropped). An intent txn's rows are rolled back first: with no
+// result.id it can never be signed.
+func (h *Handler) proxyError(w http.ResponseWriter, r *http.Request, err error) {
+	log.Printf("[proxy] %s %s: node error: %v", r.Method, r.URL.Path, err)
+	if branch, _ := r.Context().Value(ctxIntentIDKey).(*branchWriteResult); branch != nil && r.URL.Path == rubixTxPath {
+		h.rollbackTxBranch(branch, fmt.Sprintf("node unreachable: %v", err))
+	}
+	w.WriteHeader(http.StatusBadGateway)
 }
 
 // captureSignatureResponse handles POST /rubix/v1/signature: success just
@@ -596,8 +612,19 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 		return
 	}
 
-	if err := h.db.DeletePendingBranch(reqID); err != nil {
-		log.Printf("[provenance] signature: clearing pending branch failed req_id=%s: %v", reqID, err)
+	// Confirmed: stop tracking the txn. A pending row left behind would later
+	// be handed hops by other branches' rollbacks and never be resolved, so a
+	// transient DB error gets a couple of retries.
+	var err2 error
+	for attempt, wait := range []time.Duration{0, 50 * time.Millisecond, 250 * time.Millisecond} {
+		time.Sleep(wait)
+		if err2 = h.db.DeletePendingBranch(reqID); err2 == nil {
+			break
+		}
+		log.Printf("[provenance] signature: clearing pending branch failed req_id=%s attempt=%d: %v", reqID, attempt+1, err2)
+	}
+	if err2 != nil {
+		log.Printf("[provenance] signature: confirmed req_id=%s transactionID=%s but its pending_branches row could not be cleared and is left stale: %v", reqID, transactionID, err2)
 		return
 	}
 	log.Printf("[provenance] signature: confirmed ok req_id=%s transactionID=%s childNFTId=%s", reqID, transactionID, childNFTId)
@@ -871,6 +898,10 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo, data *intentWorkflowData
 		}
 
 		branch = &branchWriteResult{IntentID: intentID, InsertedIDs: assignment.InsertIDs, Renamed: assignment.Renamed}
+		for i := range assignment.InsertIDs {
+			ix := interactions[assignment.FirstNew+i]
+			branch.InsertedKeys = append(branch.InsertedKeys, db.HopKey{Signature: ix.Signature, To: ix.ToDID})
+		}
 		if branch.isEmpty() {
 			return nil
 		}

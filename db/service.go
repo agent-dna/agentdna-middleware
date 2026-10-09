@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1502,11 +1503,9 @@ func lockIntent(tx *sql.Tx, intentID string) error {
 	return err
 }
 
-
 type IntentTx struct {
 	tx *sql.Tx
 }
-
 
 func (d *DB) WithIntentLock(intentID string, fn func(t *IntentTx) error) error {
 	tx, err := d.conn.Begin()
@@ -1647,17 +1646,26 @@ type RenamedInteractionID struct {
 
 // pendingBranchPayload is the JSON blob stored in pending_branches.payload.
 type pendingBranchPayload struct {
-	InsertedIDs []string               `json:"insertedIds"`
-	Renamed     []RenamedInteractionID `json:"renamed"`
+	InsertedIDs  []string               `json:"insertedIds"`
+	InsertedKeys []HopKey               `json:"insertedKeys,omitempty"`
+	Renamed      []RenamedInteractionID `json:"renamed"`
+}
+
+// HopKey identifies a stored hop independently of its interaction_id, which a
+// later fork may relabel: the envelope's signature plus the receiver — the
+// same identity resolveBranchIDs matches hops on.
+type HopKey struct {
+	Signature string `json:"signature"`
+	To        string `json:"to"`
 }
 
 // InsertPendingBranch records, keyed by the /rubix/v1/tx response's result.id,
-// exactly which interaction rows this call just inserted (and which existing
-// rows it relabeled into a branch) — the only way to find those rows again
-// once the /rubix/v1/signature response/request arrives as a separate HTTP
-// call, since intent_id is now the nftId and is no longer unique per txn.
-func (d *DB) InsertPendingBranch(reqID, intentID string, insertedIDs []string, renamed []RenamedInteractionID) error {
-	payload, err := json.Marshal(pendingBranchPayload{InsertedIDs: insertedIDs, Renamed: renamed})
+// which hops this call inserted (and which existing rows it relabeled into a
+// branch) — the only way to find those rows again once the /rubix/v1/signature
+// call arrives as a separate HTTP request. Hops are recorded by HopKey, so a
+// fork relabeling them in between doesn't lose them.
+func (d *DB) InsertPendingBranch(reqID, intentID string, insertedIDs []string, insertedKeys []HopKey, renamed []RenamedInteractionID) error {
+	payload, err := json.Marshal(pendingBranchPayload{InsertedIDs: insertedIDs, InsertedKeys: insertedKeys, Renamed: renamed})
 	if err != nil {
 		return err
 	}
@@ -1707,18 +1715,18 @@ func collectToolAgentPairsByIDs(tx *sql.Tx, ids []string) ([]toolAgentPair, erro
 	return pairs, rows.Err()
 }
 
-// RollbackBranch undoes exactly one txn's contribution to an intent: deletes
-// the rows it inserted, reverses any trunk-row relabeling that only happened
-// because this (now-failing) branch revealed a fork, and — if the intent has
-// no rows left at all afterward — deletes the intent row too. Otherwise the
-// intent's interaction_ids list is recomputed from what's actually left, so a
-// failed later branch never leaves stale references behind.
-//
-// Used both when /rubix/v1/tx itself reports status=false (called directly,
-// synchronously, with the ids/renames handleIntentWorkflow just produced) and
-// when /rubix/v1/signature fails (called via RollbackPendingBranch, which
-// looks the same ids/renames up from the pending_branches row).
-func (d *DB) RollbackBranch(intentID string, insertedIDs []string, renamed []RenamedInteractionID) (int64, int64, error) {
+// RollbackBranch undoes one txn's contribution to an intent, under the
+// intent's lock. The txn's hops are found by HopKey (legacyIDs only for
+// pending rows recorded before keys existed), so rows a later fork relabeled
+// are still found. Then:
+//   - a hop that a surviving hop builds on (the trunk prefix before a fork, or
+//     earlier hops of the same branch) is kept, and handed to the intent's
+//     other pending txns so it still goes if they fail too;
+//   - if a single branch is left at the fork, it is relabeled back to trunk;
+//   - threat rows only the deleted hops pointed to are deleted, and the
+//     intent's interaction_ids and threat_detected are recomputed — or the
+//     intent row is deleted when no hop is left.
+func (d *DB) RollbackBranch(intentID string, keys []HopKey, legacyIDs []string) (int64, int64, error) {
 	tx, err := d.conn.Begin()
 	if err != nil {
 		return 0, 0, err
@@ -1731,65 +1739,118 @@ func (d *DB) RollbackBranch(intentID string, insertedIDs []string, renamed []Ren
 		return 0, 0, err
 	}
 
-	pairs, err := collectToolAgentPairsByIDs(tx, insertedIDs)
+	rows, err := tx.Query(`SELECT interaction_id, signature, interacted_to_did, COALESCE(threat_id, '')
+		FROM new_interactions WHERE intent_id = $1`, intentID)
+	if err != nil {
+		return 0, 0, err
+	}
+	type hopRow struct {
+		id, threatID string
+		key          HopKey
+	}
+	var all []hopRow
+	for rows.Next() {
+		var r hopRow
+		if err := rows.Scan(&r.id, &r.key.Signature, &r.key.To, &r.threatID); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		all = append(all, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+
+	wantKey := map[HopKey]bool{}
+	for _, k := range keys {
+		if k.Signature != "" {
+			wantKey[k] = true
+		}
+	}
+	wantID := map[string]bool{}
+	for _, id := range legacyIDs {
+		wantID[id] = true
+	}
+	var drop, keep []hopRow
+	for _, r := range all {
+		if (len(keys) > 0 && wantKey[r.key]) || (len(keys) == 0 && wantID[r.id]) {
+			drop = append(drop, r)
+		} else {
+			keep = append(keep, r)
+		}
+	}
+
+	needed := map[string]bool{}
+	for _, r := range keep {
+		for _, a := range hopAncestors(intentID, r.id) {
+			needed[a] = true
+		}
+	}
+	var delIDs, threatIDs []string
+	var protected []HopKey
+	survivors := make([]string, 0, len(keep)+len(drop))
+	for _, r := range keep {
+		survivors = append(survivors, r.id)
+	}
+	for _, r := range drop {
+		if needed[r.id] {
+			protected = append(protected, r.key)
+			survivors = append(survivors, r.id)
+			continue
+		}
+		delIDs = append(delIDs, r.id)
+		if r.threatID != "" {
+			threatIDs = append(threatIDs, r.threatID)
+		}
+	}
+
+	pairs, err := collectToolAgentPairsByIDs(tx, delIDs)
 	if err != nil {
 		return 0, 0, err
 	}
 
 	var interactionsDeleted int64
-	if len(insertedIDs) > 0 {
-		res, err := tx.Exec(`DELETE FROM new_interactions WHERE interaction_id = ANY($1)`, pq.Array(insertedIDs))
+	if len(delIDs) > 0 {
+		res, err := tx.Exec(`DELETE FROM new_interactions WHERE interaction_id = ANY($1)`, pq.Array(delIDs))
 		if err != nil {
 			return 0, 0, err
 		}
 		interactionsDeleted, _ = res.RowsAffected()
 	}
-
-	for _, r := range renamed {
-		if _, err := tx.Exec(`UPDATE new_interactions SET interaction_id = $1 WHERE interaction_id = $2`, r.From, r.To); err != nil {
+	if len(threatIDs) > 0 {
+		if _, err := tx.Exec(`DELETE FROM threats WHERE id = ANY($1)
+			AND NOT EXISTS (SELECT 1 FROM new_interactions ni WHERE ni.threat_id = threats.id)`, pq.Array(threatIDs)); err != nil {
 			return 0, 0, err
 		}
 	}
-
-	var remaining int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM new_interactions WHERE intent_id = $1`, intentID).Scan(&remaining); err != nil {
-		return 0, 0, err
+	for _, r := range collapseLoneBranch(intentID, survivors) {
+		if _, err := tx.Exec(`UPDATE new_interactions SET interaction_id = $1 WHERE interaction_id = $2`, r.To, r.From); err != nil {
+			return 0, 0, err
+		}
 	}
 
 	var intentsDeleted int64
-	if remaining == 0 {
-		res2, err := tx.Exec(`DELETE FROM new_intents WHERE intent_id = $1`, intentID)
+	if len(survivors) == 0 {
+		res, err := tx.Exec(`DELETE FROM new_intents WHERE intent_id = $1`, intentID)
 		if err != nil {
 			return 0, 0, err
 		}
-		intentsDeleted, _ = res2.RowsAffected()
-	} else {
-		rows, err := tx.Query(`SELECT interaction_id FROM new_interactions WHERE intent_id = $1`, intentID)
-		if err != nil {
-			return 0, 0, err
-		}
-		var remainingIDs []string
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return 0, 0, err
-			}
-			remainingIDs = append(remainingIDs, id)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return 0, 0, err
-		}
-		remainingIDsJSON, err := json.Marshal(remainingIDs)
-		if err != nil {
-			return 0, 0, err
-		}
-		if _, err := tx.Exec(`UPDATE new_intents SET interaction_ids = $2 WHERE intent_id = $1`, intentID, string(remainingIDsJSON)); err != nil {
+		intentsDeleted, _ = res.RowsAffected()
+	} else if _, err := tx.Exec(`
+		UPDATE new_intents SET
+			interaction_ids = (SELECT COALESCE(json_agg(interaction_id ORDER BY time, interaction_id), '[]')::text
+			                   FROM new_interactions WHERE intent_id = $1),
+			threat_detected = CASE WHEN EXISTS (SELECT 1 FROM new_interactions WHERE intent_id = $1 AND threat = 1) THEN 1 ELSE 0 END
+		WHERE intent_id = $1`, intentID); err != nil {
+		return 0, 0, err
+	}
+
+	if len(protected) > 0 {
+		if err := addPendingKeys(tx, intentID, protected); err != nil {
 			return 0, 0, err
 		}
 	}
-
 	if err := pruneToolAgentsList(tx, pairs); err != nil {
 		return 0, 0, err
 	}
@@ -1797,11 +1858,121 @@ func (d *DB) RollbackBranch(intentID string, insertedIDs []string, renamed []Ren
 	return interactionsDeleted, intentsDeleted, tx.Commit()
 }
 
+// addPendingKeys hands hops kept by a rollback (only because another branch
+// builds on them) to the intent's other pending txns, so they are removed
+// after all if those txns fail too.
+func addPendingKeys(tx *sql.Tx, intentID string, keys []HopKey) error {
+	rows, err := tx.Query(`SELECT req_id, payload FROM pending_branches WHERE intent_id = $1`, intentID)
+	if err != nil {
+		return err
+	}
+	updated := map[string]string{}
+	for rows.Next() {
+		var reqID, raw string
+		if err := rows.Scan(&reqID, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		var p pendingBranchPayload
+		if json.Unmarshal([]byte(raw), &p) != nil || len(p.InsertedKeys) == 0 {
+			continue // legacy ID-only payloads can't be extended safely
+		}
+		p.InsertedKeys = append(p.InsertedKeys, keys...)
+		b, err := json.Marshal(p)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		updated[reqID] = string(b)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for reqID, payload := range updated {
+		if _, err := tx.Exec(`UPDATE pending_branches SET payload = $2 WHERE req_id = $1`, reqID, payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hopPos is a parsed interaction id: trunk "<intent>-N" or branch
+// "<intent>-P-L-O" (fork position P, letter L, offset O).
+type hopPos struct {
+	trunk  bool
+	n, off int
+	letter string
+}
+
+func parseHopPos(intentID, id string) (hopPos, bool) {
+	rest, ok := strings.CutPrefix(id, intentID+"-")
+	if !ok {
+		return hopPos{}, false
+	}
+	parts := strings.Split(rest, "-")
+	switch len(parts) {
+	case 1:
+		n, err := strconv.Atoi(parts[0])
+		return hopPos{trunk: true, n: n}, err == nil
+	case 3:
+		n, e1 := strconv.Atoi(parts[0])
+		o, e2 := strconv.Atoi(parts[2])
+		return hopPos{n: n, letter: parts[1], off: o}, e1 == nil && e2 == nil
+	}
+	return hopPos{}, false
+}
+
+// hopAncestors lists the ids of the hops id builds on: the trunk before it
+// and, for a branch hop, the earlier hops of its branch.
+func hopAncestors(intentID, id string) []string {
+	p, ok := parseHopPos(intentID, id)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for i := 1; i < p.n; i++ {
+		out = append(out, fmt.Sprintf("%s-%d", intentID, i))
+	}
+	if !p.trunk {
+		for o := 1; o < p.off; o++ {
+			out = append(out, fmt.Sprintf("%s-%d-%s-%d", intentID, p.n, p.letter, o))
+		}
+	}
+	return out
+}
+
+// collapseLoneBranch returns the relabels that turn the only branch left at a
+// fork back into trunk ("<intent>-P-L-O" -> "<intent>-(P+O-1)"), so a
+// workflow with one path is always stored as plain trunk.
+func collapseLoneBranch(intentID string, ids []string) []RenamedInteractionID {
+	letters := map[string]bool{}
+	var branch []hopPos
+	for _, id := range ids {
+		p, ok := parseHopPos(intentID, id)
+		if !ok || p.trunk {
+			continue
+		}
+		letters[fmt.Sprintf("%d-%s", p.n, p.letter)] = true
+		branch = append(branch, p)
+	}
+	if len(letters) != 1 {
+		return nil
+	}
+	out := make([]RenamedInteractionID, 0, len(branch))
+	for _, p := range branch {
+		out = append(out, RenamedInteractionID{
+			From: fmt.Sprintf("%s-%d-%s-%d", intentID, p.n, p.letter, p.off),
+			To:   fmt.Sprintf("%s-%d", intentID, p.n+p.off-1),
+		})
+	}
+	return out
+}
+
 // RollbackPendingBranch is RollbackBranch for the /rubix/v1/signature failure
-// path: it looks up which rows belong to reqID (since that call is a separate
-// HTTP request from the /tx call that inserted them), rolls them back, and
-// removes the tracking row. found=false means nothing was ever tagged with
-// this reqID (e.g. InsertPendingBranch never ran).
+// path: it looks up which hops belong to reqID (that call is a separate HTTP
+// request from the /tx call that inserted them), rolls them back, and removes
+// the tracking row. found=false means nothing was ever tracked under reqID.
 func (d *DB) RollbackPendingBranch(reqID string) (interactionsDeleted, intentsDeleted int64, found bool, err error) {
 	var intentID, payloadJSON string
 	err = d.conn.QueryRow(`SELECT intent_id, payload FROM pending_branches WHERE req_id = $1`, reqID).Scan(&intentID, &payloadJSON)
@@ -1815,7 +1986,7 @@ func (d *DB) RollbackPendingBranch(reqID string) (interactionsDeleted, intentsDe
 	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
 		return 0, 0, false, err
 	}
-	interactionsDeleted, intentsDeleted, err = d.RollbackBranch(intentID, payload.InsertedIDs, payload.Renamed)
+	interactionsDeleted, intentsDeleted, err = d.RollbackBranch(intentID, payload.InsertedKeys, payload.InsertedIDs)
 	if err != nil {
 		return 0, 0, false, err
 	}
