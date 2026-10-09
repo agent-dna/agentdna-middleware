@@ -2602,6 +2602,10 @@ func (h *Handler) UserInfo(c *gin.Context) {
 	if p, err := strconv.Atoi(c.Query("agentsPage")); err == nil && p > 0 {
 		agentsPage = p
 	}
+	appsPage := 1
+	if p, err := strconv.Atoi(c.Query("appsPage")); err == nil && p > 0 {
+		appsPage = p
+	}
 
 	user, err := h.db.GetUserDetail(userID, orgID)
 	if err != nil {
@@ -2634,9 +2638,10 @@ func (h *Handler) UserInfo(c *gin.Context) {
 		})
 	}
 
-	// Intents
-	totalIntents, _ := h.db.CountUserIntents(userID, orgID)
-	intents, err := h.db.GetUserIntents(userID, orgID, pageSize, (intentsPage-1)*pageSize)
+	// Intents — same scope and per-intent stats as /user-intents, so the
+	// interactions and threats below belong to exactly these intents.
+	totalIntents, _ := h.db.CountIntentsByUser(userID, orgID)
+	intents, err := h.db.GetIntentsByUser(userID, orgID, pageSize, (intentsPage-1)*pageSize)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("intents: %v", err)})
 		return
@@ -2685,6 +2690,25 @@ func (h *Handler) UserInfo(c *gin.Context) {
 		})
 	}
 
+	// Apps reached in the user's intents, from any of their DIDs.
+	totalApps, _ := h.db.CountAppsByUser(userID, orgID)
+	apps, err := h.db.GetAppsByUser(userID, orgID, pageSize, (appsPage-1)*pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("apps: %v", err)})
+		return
+	}
+	appList := make([]gin.H, 0, len(apps))
+	for _, a := range apps {
+		appList = append(appList, gin.H{
+			"appDID":            a.AppDID,
+			"appName":           a.AppName,
+			"totalInteractions": a.TotalInteractions,
+			"totalThreats":      a.TotalThreats,
+			"intentsCount":      a.IntentsCount,
+			"lastUsed":          a.LastUsed.UTC().Format(time.RFC3339),
+		})
+	}
+
 	var lastActive interface{}
 	if user.LastActive != nil {
 		lastActive = user.LastActive.UTC().Format(time.RFC3339)
@@ -2704,7 +2728,7 @@ func (h *Handler) UserInfo(c *gin.Context) {
 				"accessAgentCount":    user.AccessAgentCount,
 				"totalInteractions":   totalInteractions,
 				"totalThreats":        totalThreats,
-				"totalIntents":        user.TotalIntents,
+				"totalIntents":        totalIntents,
 				"totalAgentsDeployed": user.TotalAgentsOwned,
 			},
 			"interactions": gin.H{
@@ -2734,6 +2758,13 @@ func (h *Handler) UserInfo(c *gin.Context) {
 				"page":       agentsPage,
 				"pageSize":   pageSize,
 				"totalPages": (totalAgents + pageSize - 1) / pageSize,
+			},
+			"apps": gin.H{
+				"list":       appList,
+				"total":      totalApps,
+				"page":       appsPage,
+				"pageSize":   pageSize,
+				"totalPages": (totalApps + pageSize - 1) / pageSize,
 			},
 		},
 	})

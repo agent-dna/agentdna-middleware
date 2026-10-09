@@ -2219,37 +2219,6 @@ func (d *DB) GetAgentIntents(agentDID, orgID string, limit, offset int) ([]*Inte
 	return scanIntentRows(rows)
 }
 
-func (d *DB) CountUserIntents(userDID, orgID string) (int, error) {
-	var total int
-	err := d.conn.QueryRow(`
-		SELECT COUNT(*) FROM new_intents WHERE initiator_did = $1 AND organization_id = $2`,
-		userDID, orgID,
-	).Scan(&total)
-	return total, err
-}
-
-func (d *DB) GetUserIntents(userDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
-	rows, err := d.conn.Query(`
-		SELECT ni.intent_id, ni.initiator_did, COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), NULLIF(ni.initiator_name, ''), ''), ni.started_at, ni.ended_at,
-		       ni.status, ni.threat_detected,
-		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
-		       COALESCE((SELECT message FROM new_interactions
-		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
-		FROM new_intents ni
-		LEFT JOIN new_org_users u ON u.did = ni.initiator_did
-		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
-		WHERE ni.initiator_did = $1 AND ni.organization_id = $2
-		ORDER BY ni.started_at DESC
-		LIMIT $3 OFFSET $4`,
-		userDID, orgID, limit, offset,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanIntentRows(rows)
-}
-
 func scanIntentRows(rows *sql.Rows) ([]*IntentRecord, error) {
 	var result []*IntentRecord
 	for rows.Next() {
@@ -3241,6 +3210,49 @@ func (d *DB) GetAgentsByOwner(userDID, orgID string, limit, offset int) ([]*User
 		result = append(result, r)
 	}
 	return result, nil
+}
+
+// userAppsFrom joins the apps reached in the user's intents (userScopeIntentsCTE,
+// so every DID the user holds) with the hops that involve them.
+const userAppsFrom = `
+		FROM new_tools t
+		JOIN new_interactions i ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
+		WHERE t.did <> '' AND i.organization_id = $2
+		  AND i.intent_id IN (SELECT intent_id FROM user_intents)`
+
+func (d *DB) CountAppsByUser(userDID, orgID string) (int, error) {
+	var total int
+	err := d.conn.QueryRow(userScopeIntentsCTE+`SELECT COUNT(DISTINCT t.did)`+userAppsFrom,
+		userDID, orgID,
+	).Scan(&total)
+	return total, err
+}
+
+func (d *DB) GetAppsByUser(userDID, orgID string, limit, offset int) ([]*UserAppRecord, error) {
+	rows, err := d.conn.Query(userScopeIntentsCTE+`
+		SELECT t.did, COALESCE(t.name, ''),
+		       COUNT(i.interaction_id) AS total_interactions,
+		       SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END),
+		       COUNT(DISTINCT i.intent_id),
+		       MAX(i.time)`+userAppsFrom+`
+		GROUP BY t.did, t.name
+		ORDER BY total_interactions DESC, t.did
+		LIMIT $3 OFFSET $4`,
+		userDID, orgID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*UserAppRecord
+	for rows.Next() {
+		r := &UserAppRecord{}
+		if err := rows.Scan(&r.AppDID, &r.AppName, &r.TotalInteractions, &r.TotalThreats, &r.IntentsCount, &r.LastUsed); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, rows.Err()
 }
 
 func (d *DB) GetThreats(orgID string, limit, offset int) ([]*ThreatRecord, int, error) {

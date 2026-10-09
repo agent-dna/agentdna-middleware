@@ -200,6 +200,16 @@ type UserAgentRecord struct {
 	Score             float64
 }
 
+// UserAppRecord is one app (tool) reached in a user's intents.
+type UserAppRecord struct {
+	AppDID            string
+	AppName           string
+	TotalInteractions int
+	TotalThreats      int
+	IntentsCount      int
+	LastUsed          time.Time
+}
+
 type SearchAgentResult struct {
 	DID   string
 	Name  string
