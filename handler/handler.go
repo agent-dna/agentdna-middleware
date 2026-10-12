@@ -891,7 +891,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo, data *intentWorkflowData
 			log.Printf("[intentWorkflow] interaction id=%s from=%s to=%s type=%s threat=%v", iid, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
 
 			// If this interaction's target is a registered tool, record (afte
-	
+
 			if h.db.IsNewTool(ix.ToDID) && !h.db.IsNewTool(ix.FromDID) {
 				toolContacts = append(toolContacts, [2]string{ix.ToDID, ix.FromDID})
 			}
@@ -2405,6 +2405,10 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		return
 	}
 
+	// How each request authenticated, and what the run shows as a whole.
+	// Derived on every read from the stored evidence, never cached as a verdict.
+	hopEvidence, continuity := h.authEvidenceForIntent(intentID, interactions)
+
 	// new_intents.threat_detected is written once by handleIntentWorkflow at
 	// intent-creation time and never recomputed, so it can drift stale
 	// relative to the interactions' own threat flags (the same bug fixed in
@@ -2421,6 +2425,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 			raw = json.RawMessage("{}")
 		}
 		txns = append(txns, gin.H{
+			"authEvidence":  hopEvidence[i.InteractionID],
 			"interactionID": i.InteractionID,
 			"from":          i.From,
 			"fromName":      i.FromName,
@@ -2456,6 +2461,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"firstInteractionAt": intent.FirstInteractionAt,
 		"lastInteractionAt":  intent.LastInteractionAt,
 		"runtimeSeconds":     intent.RuntimeSeconds,
+		"continuity":         continuity,
 		"interactions":       txns,
 	}
 	if intent.EndedAt != nil {
