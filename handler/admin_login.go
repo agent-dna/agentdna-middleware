@@ -43,7 +43,12 @@ func (h *Handler) AdminLogin(c *gin.Context) {
 	}
 
 	b, _ := json.Marshal(map[string]string{"username": req.Username, "password": req.Password})
-	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/login"
+	endpoint, err := joinURL(h.adminServiceURL, "agent-admin", "v1", "login")
+	if err != nil {
+		log.Printf("[AdminLogin] admin server url error username=%q err=%v", req.Username, err)
+		c.JSON(http.StatusBadGateway, Response{Status: false, Message: "Admin server unavailable"})
+		return
+	}
 	resp, err := adminHTTP.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
 		var ne net.Error

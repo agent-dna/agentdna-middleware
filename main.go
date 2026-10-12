@@ -86,6 +86,17 @@ func main() {
 	database := db.New(dsn)
 	defer database.Close()
 
+	for name, raw := range map[string]string{
+		"ADMIN_SERVICE_URL":     adminServiceURL,
+		"CBAC_SERVICE_URL":      cbacServiceURL,
+		"CREATE_AGENT_ENDPOINT": createAgentEndpoint,
+		"UPDATE_AGENT_ENDPOINT": updateAgentEndpoint,
+	} {
+		if err := handler.CheckServiceURL(name, raw); err != nil {
+			log.Printf("[config] WARNING %v — calls to this service will fail", err)
+		}
+	}
+
 	h := handler.New(database, backendURL, session, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint)
 
 	r := gin.New()

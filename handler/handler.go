@@ -325,7 +325,10 @@ func (h *Handler) setAdminServerPassword(username, newPassword string) (int, err
 		// Rows made by scripts/add_admin.py get their username on first login.
 		return http.StatusConflict, errors.New("this admin has no admin server username yet; log in once, then try again")
 	}
-	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/update-password"
+	endpoint, err := joinURL(h.adminServiceURL, "agent-admin", "v1", "update-password")
+	if err != nil {
+		return http.StatusBadGateway, fmt.Errorf("failed to reach admin server: %v", err)
+	}
 	b, _ := json.Marshal(map[string]string{"username": username, "new_password": newPassword})
 	resp, err := adminHTTP.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
@@ -2232,7 +2235,12 @@ func (h *Handler) RevokeAgent(c *gin.Context) {
 	// Call admin server first to flip is_active = false on the agent — the local DB
 	// is only written once we know the admin server (the real enforcement point)
 	// actually accepted the revocation, so the two never disagree.
-	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/revoke-agent"
+	endpoint, err := joinURL(h.adminServiceURL, "agent-admin", "v1", "revoke-agent")
+	if err != nil {
+		log.Printf("[RevokeAgent] admin server url error agent_did=%s err=%v", req.AgentDID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to reach admin server: %v", err)})
+		return
+	}
 	b, _ := json.Marshal(map[string]string{"agent_id": req.AgentDID})
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
@@ -2288,7 +2296,12 @@ func (h *Handler) UnrevokeAgent(c *gin.Context) {
 	// Call admin server first to flip is_active = true on the agent — the local DB
 	// is only written once we know the admin server (the real enforcement point)
 	// actually accepted the whitelist, so the two never disagree.
-	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/whitelist"
+	endpoint, err := joinURL(h.adminServiceURL, "agent-admin", "v1", "whitelist")
+	if err != nil {
+		log.Printf("[UnrevokeAgent] admin server url error agent_did=%s err=%v", req.AgentDID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to reach admin server: %v", err)})
+		return
+	}
 	b, _ := json.Marshal(map[string]string{"agent_id": req.AgentDID})
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
@@ -2878,7 +2891,10 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 
 // callRegisterAdmin calls the external agent service to register an admin and get their DID.
 func (h *Handler) callRegisterAdmin(username, org, email, password string) (string, error) {
-	endpoint := h.createAgentEndpoint + "agent-admin/v1/register-admin"
+	endpoint, err := h.agentServiceURL(h.createAgentEndpoint, "CREATE_AGENT_ENDPOINT", "agent-admin", "v1", "register-admin")
+	if err != nil {
+		return "", fmt.Errorf("callRegisterAdmin: %v", err)
+	}
 	log.Printf("[callRegisterAdmin] POST %s username=%q org=%q email=%q", endpoint, username, org, email)
 
 	b, _ := json.Marshal(map[string]string{"username": username, "org": org, "email": email, "password": password})
@@ -2930,7 +2946,10 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 	}
 	mw.Close()
 
-	endpoint := h.createAgentEndpoint + "agent-admin/v1/create-agent"
+	endpoint, err := h.agentServiceURL(h.createAgentEndpoint, "CREATE_AGENT_ENDPOINT", "agent-admin", "v1", "create-agent")
+	if err != nil {
+		return "", fmt.Errorf("callCreateAgent: %v", err)
+	}
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
 	if err != nil {
 		return "", fmt.Errorf("callCreateAgent: http post: %v", err)
@@ -2973,7 +2992,10 @@ func (h *Handler) callUpdateAgent(agentName, agentID, policy, adminDID, orgID st
 	}
 	mw.Close()
 
-	endpoint := h.updateAgentEndpoint + "agent-admin/v1/update-agent-policies"
+	endpoint, err := h.agentServiceURL(h.updateAgentEndpoint, "UPDATE_AGENT_ENDPOINT", "agent-admin", "v1", "update-agent-policies")
+	if err != nil {
+		return fmt.Errorf("callUpdateAgent: %v", err)
+	}
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
 	if err != nil {
 		return fmt.Errorf("callUpdateAgent: http post: %v", err)
@@ -3858,7 +3880,11 @@ func (h *Handler) fetchCbacDecisionReason(hash string) string {
 		log.Printf("[cbac] skipping lookup — cbacServiceURL=%q hash=%q", h.cbacServiceURL, hash)
 		return ""
 	}
-	url := strings.TrimRight(h.cbacServiceURL, "/") + "/decisions/by-hash/" + hash
+	url, err := joinURL(h.cbacServiceURL, "decisions", "by-hash", hash)
+	if err != nil {
+		log.Printf("[cbac] decision reason: %v", err)
+		return ""
+	}
 	log.Printf("[cbac] GET %s", url)
 	resp, err := http.Get(url)
 	if err != nil {
@@ -3920,7 +3946,10 @@ func (h *Handler) fetchAgentLHIScores(agentIDs []string) (map[string][]LHIScoreE
 		return nil, fmt.Errorf("marshal request: %v", err)
 	}
 
-	url := strings.TrimRight(h.cbacServiceURL, "/") + "/lhi-scores"
+	url, err := joinURL(h.cbacServiceURL, "lhi-scores")
+	if err != nil {
+		return nil, err
+	}
 	log.Printf("[cbac] POST %s agent_ids=%v", url, agentIDs)
 	resp, err := http.Post(url, "application/json", bytes.NewReader(reqBody))
 	if err != nil {

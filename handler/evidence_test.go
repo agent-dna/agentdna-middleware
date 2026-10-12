@@ -93,3 +93,42 @@ func TestTheDbRecordKeepsIdentityNullable(t *testing.T) {
 		t.Error("an unobserved identity must be nil, not an empty string")
 	}
 }
+
+func TestBuildIntentAuthEvidence_OrderAndFilter(t *testing.T) {
+	ts := func(f float64) *float64 { return &f }
+	interactions := []*db.InteractionRecord{
+		{IntentID: "nft", InteractionID: "nft-10", Signature: "sigC"},
+		{IntentID: "nft", InteractionID: "nft-2", Signature: "sigB"},
+		{IntentID: "nft", InteractionID: "nft-1", Signature: "sigA"},
+		{IntentID: "nft", InteractionID: "nft-3", Signature: ""},
+	}
+	byRequest := map[string][]*db.AuthEvidenceRecord{
+		"sigA": {
+			{RequestID: "sigA", Source: "server_out", Destination: "db", ObservedAt: ts(200)},
+			{RequestID: "sigA", Source: "server_in", ObservedAt: ts(100)},
+		},
+		"sigC": {{RequestID: "sigC", Source: "server_in"}},
+	}
+
+	got := buildIntentAuthEvidence(interactions, byRequest)
+
+	if len(got) != 2 {
+		t.Fatalf("want 2 interactions with evidence, got %d", len(got))
+	}
+	if got[0].InteractionID != "nft-1" || got[1].InteractionID != "nft-10" {
+		t.Errorf("want hop order nft-1, nft-10; got %s, %s", got[0].InteractionID, got[1].InteractionID)
+	}
+	if got[0].Sequence != 1 || got[1].Sequence != 2 {
+		t.Errorf("want sequences 1, 2; got %d, %d", got[0].Sequence, got[1].Sequence)
+	}
+	if got[0].Position != 1 || got[1].Position != 10 {
+		t.Errorf("want positions 1, 10; got %d, %d", got[0].Position, got[1].Position)
+	}
+	ev := got[0].Evidence
+	if len(ev) != 2 || ev[0].Source != "server_in" || ev[1].Source != "server_out" {
+		t.Errorf("want evidence ordered by observed time, got %+v", ev)
+	}
+	if ev[0].ObservedAt == nil || ev[0].ObservedAt.Unix() != 100 {
+		t.Errorf("want observedAt 100, got %v", ev[0].ObservedAt)
+	}
+}

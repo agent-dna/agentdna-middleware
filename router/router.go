@@ -55,6 +55,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.POST("/revoke-agent", h.RevokeAgent)
 	dashboard.POST("/unrevoke-agent", h.UnrevokeAgent)
 	dashboard.GET("/intent-info", h.IntentInfo)
+	dashboard.GET("/intent-auth-evidence", h.IntentAuthEvidence)
 	dashboard.POST("/update-intent-status", h.UpdateIntentStatus)
 	dashboard.GET("/intent-diagram", h.IntentDiagram)
 	dashboard.POST("/update-password", h.UpdatePassword)

@@ -3502,7 +3502,8 @@ func (d *DB) GetAuthEvidenceByIntent(intentID string) (map[string][]*AuthEvidenc
 	rows, err := d.conn.Query(`
 		SELECT DISTINCT e.request_id, e.source, COALESCE(e.run_id, ''),
 		       COALESCE(e.auth_method, ''), COALESCE(e.credential_id, ''), e.identity_id,
-		       COALESCE(e.auth_status, ''), COALESCE(e.key_version, ''), COALESCE(e.destination, '')
+		       COALESCE(e.auth_status, ''), COALESCE(e.key_version, ''), COALESCE(e.destination, ''),
+		       EXTRACT(EPOCH FROM e.observed_at)::float8
 		FROM auth_evidence e
 		JOIN new_interactions i
 		  ON i.signature = e.request_id
@@ -3519,7 +3520,7 @@ func (d *DB) GetAuthEvidenceByIntent(intentID string) (map[string][]*AuthEvidenc
 	for rows.Next() {
 		r := &AuthEvidenceRecord{}
 		if err := rows.Scan(&r.RequestID, &r.Source, &r.RunID, &r.AuthMethod,
-			&r.CredentialID, &r.IdentityID, &r.AuthStatus, &r.KeyVersion, &r.Destination); err != nil {
+			&r.CredentialID, &r.IdentityID, &r.AuthStatus, &r.KeyVersion, &r.Destination, &r.ObservedAt); err != nil {
 			return nil, err
 		}
 		out[r.RequestID] = append(out[r.RequestID], r)

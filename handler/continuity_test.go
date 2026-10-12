@@ -147,9 +147,9 @@ func TestHopsWithoutCredentialsAreSkipped(t *testing.T) {
 // 1, 10, 11, 2 - which walks the run in the wrong order.
 func TestOrderingUsesTheNumericSuffix(t *testing.T) {
 	interactions := []*db.InteractionRecord{
-		{InteractionID: "intent-abc-10", Signature: "sig-10"},
-		{InteractionID: "intent-abc-2", Signature: "sig-2"},
-		{InteractionID: "intent-abc-1", Signature: "sig-1"},
+		{IntentID: "intent-abc", InteractionID: "intent-abc-10", Signature: "sig-10"},
+		{IntentID: "intent-abc", InteractionID: "intent-abc-2", Signature: "sig-2"},
+		{IntentID: "intent-abc", InteractionID: "intent-abc-1", Signature: "sig-1"},
 	}
 
 	got := interactionOrder(interactions)
@@ -160,8 +160,43 @@ func TestOrderingUsesTheNumericSuffix(t *testing.T) {
 			t.Errorf("position %d: want %s, got %s", i, expected, got[i].InteractionID)
 		}
 	}
-	if suffixIndex("no-suffix-here") != 0 {
-		t.Error("an unparseable suffix falls back to 0 rather than panicking")
+}
+
+// A fork's branches are "<intentID>-<forkPos>-<letter>-<offset>". Each branch
+// must follow the trunk as one contiguous path, at its real depth, rather than
+// every branch's first hop collapsing onto position 1.
+func TestOrderingKeepsBranchesTogether(t *testing.T) {
+	in := func(id string) *db.InteractionRecord {
+		return &db.InteractionRecord{IntentID: "nft", InteractionID: id, Signature: "sig-" + id}
+	}
+	// Time order, as GetInteractionsByIntent returns it: branches interleave.
+	interactions := []*db.InteractionRecord{
+		in("nft-1"), in("nft-2-a-1"), in("nft-2-a-2"), in("nft-2-b-1"), in("nft-2-b-2"), in("legacy-uuid"),
+	}
+	interactions[1], interactions[3] = interactions[3], interactions[1]
+
+	got := interactionOrder(interactions)
+
+	want := []struct {
+		id       string
+		position int
+		branch   string
+	}{
+		{"nft-1", 1, ""},
+		{"nft-2-a-1", 2, "a"},
+		{"nft-2-a-2", 3, "a"},
+		{"nft-2-b-1", 2, "b"},
+		{"nft-2-b-2", 3, "b"},
+		{"legacy-uuid", 0, ""},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("want %d refs, got %d", len(want), len(got))
+	}
+	for i, w := range want {
+		if got[i].InteractionID != w.id || got[i].Position != w.position || got[i].Branch != w.branch {
+			t.Errorf("%d: want %s pos=%d branch=%q, got %s pos=%d branch=%q",
+				i, w.id, w.position, w.branch, got[i].InteractionID, got[i].Position, got[i].Branch)
+		}
 	}
 }
 

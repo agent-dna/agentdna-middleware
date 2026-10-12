@@ -2,8 +2,6 @@ package handler
 
 import (
 	"sort"
-	"strconv"
-	"strings"
 
 	"agentdna-ratelimit-auth/db"
 )
@@ -79,6 +77,16 @@ type Continuity struct {
 type hopRef struct {
 	InteractionID string
 	Signature     string
+
+	// Where the hop sits in the run, filled by interactionOrder. Position is
+	// 1-based depth (a branch hop's fork position plus its offset, minus one);
+	// Branch is "" on the trunk, else the branch letter.
+	Position int
+	Branch   string
+
+	parsed bool
+	anchor int // trunk n, or fork position for a branch hop
+	offset int
 }
 
 // evidenceForHop collapses every record for one request into a single view.
@@ -224,32 +232,52 @@ func analyseContinuity(order []hopRef, evidence map[string]HopEvidence) Continui
 }
 
 // interactionOrder returns a run's hops in the order the chain walk created
-// them. Interactions are named "<intentID>-<n>", so the numeric suffix is that
-// order - sorting the ids as text would give 1, 10, 11, 2.
+// them, using the middleware's own interaction_id scheme (see parseHopID):
 //
-// This reuses the middleware's own ordering rather than deriving another one.
-// If the two ever disagreed, nobody could tell which was right.
+//	trunk hop   <intentID>-<n>
+//	branch hop  <intentID>-<forkPos>-<letter>-<offset>
+//
+// Trunk hops come first by n. A fork's branches follow at their fork position,
+// each branch kept together (a-1, a-2, ..., then b-1, ...), so every branch
+// reads as one path. Sorting the ids as text would give 1, 10, 11, 2, and
+// taking only the last number would put every branch's first hop at 1.
+//
+// Ids that match neither shape (rows from before this scheme) go last, in the
+// order they were given, which is time order from GetInteractionsByIntent.
 func interactionOrder(interactions []*db.InteractionRecord) []hopRef {
 	refs := make([]hopRef, 0, len(interactions))
 	for _, i := range interactions {
-		refs = append(refs, hopRef{InteractionID: i.InteractionID, Signature: i.Signature})
+		ref := hopRef{InteractionID: i.InteractionID, Signature: i.Signature}
+		if p, ok := parseHopID(i.IntentID, i.InteractionID); ok {
+			ref.parsed = true
+			ref.anchor = p.n
+			ref.Position = p.n
+			if p.kind == hopKindBranch {
+				ref.Branch = p.letter
+				ref.offset = p.offset
+				ref.Position = p.n + p.offset - 1
+			}
+		}
+		refs = append(refs, ref)
 	}
 	sort.SliceStable(refs, func(a, b int) bool {
-		return suffixIndex(refs[a].InteractionID) < suffixIndex(refs[b].InteractionID)
+		ra, rb := refs[a], refs[b]
+		if ra.parsed != rb.parsed {
+			return ra.parsed
+		}
+		if !ra.parsed {
+			return false
+		}
+		if ra.anchor != rb.anchor {
+			return ra.anchor < rb.anchor
+		}
+		// At the same position the trunk hop ("") sorts before any branch.
+		if ra.Branch != rb.Branch {
+			return ra.Branch < rb.Branch
+		}
+		return ra.offset < rb.offset
 	})
 	return refs
-}
-
-func suffixIndex(interactionID string) int {
-	idx := strings.LastIndex(interactionID, "-")
-	if idx < 0 {
-		return 0
-	}
-	n, err := strconv.Atoi(interactionID[idx+1:])
-	if err != nil {
-		return 0
-	}
-	return n
 }
 
 // authEvidenceForIntent returns the per-interaction evidence and what the run
