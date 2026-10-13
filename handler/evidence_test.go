@@ -118,9 +118,6 @@ func TestBuildIntentAuthEvidence_OrderAndFilter(t *testing.T) {
 	if got[0].InteractionID != "nft-1" || got[1].InteractionID != "nft-10" {
 		t.Errorf("want hop order nft-1, nft-10; got %s, %s", got[0].InteractionID, got[1].InteractionID)
 	}
-	if got[0].Sequence != 1 || got[1].Sequence != 2 {
-		t.Errorf("want sequences 1, 2; got %d, %d", got[0].Sequence, got[1].Sequence)
-	}
 	if got[0].Position != 1 || got[1].Position != 10 {
 		t.Errorf("want positions 1, 10; got %d, %d", got[0].Position, got[1].Position)
 	}

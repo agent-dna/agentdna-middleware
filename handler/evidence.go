@@ -112,10 +112,9 @@ type authEvidenceRow struct {
 // interactionAuthEvidence is one interaction of the intent with the evidence
 // rows whose request_id matches its signature.
 type interactionAuthEvidence struct {
-	// Sequence is the 1-based place in the response; Position is the hop's
-	// depth in the run and Branch its branch letter ("" on the trunk), so two
-	// branches can share a Position but never a Sequence.
-	Sequence      int               `json:"sequence"`
+	// Position is the hop's depth in the run and Branch its branch letter
+	// ("" on the trunk), so two branches can share a Position. The order of
+	// the list itself is the walk order (see interactionOrder).
 	Position      int               `json:"position"`
 	Branch        string            `json:"branch"`
 	InteractionID string            `json:"interactionID"`
@@ -181,7 +180,6 @@ func buildIntentAuthEvidence(
 
 		i := byID[ref.InteractionID]
 		out = append(out, interactionAuthEvidence{
-			Sequence:      len(out) + 1,
 			Position:      ref.Position,
 			Branch:        ref.Branch,
 			InteractionID: i.InteractionID,
