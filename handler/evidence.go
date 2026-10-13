@@ -2,6 +2,7 @@ package handler
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"time"
@@ -43,6 +44,7 @@ type authEvidenceInput struct {
 func (h *Handler) StoreAuthEvidence(c *gin.Context) {
 	user, ok := h.userFromAPIKey(c)
 	if !ok {
+		log.Printf("[auth-evidence] store: rejected, API key check failed status=%d", c.Writer.Status())
 		return
 	}
 
@@ -50,13 +52,19 @@ func (h *Handler) StoreAuthEvidence(c *gin.Context) {
 		Records []authEvidenceInput `json:"records"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
+		log.Printf("[auth-evidence] store: invalid body org=%s err=%v", user.OrgID, err)
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid body"})
 		return
 	}
+	log.Printf("[auth-evidence] store: received %d record(s) org=%s", len(body.Records), user.OrgID)
 
 	stored := 0
-	for _, in := range body.Records {
+	for idx, in := range body.Records {
+		log.Printf("[auth-evidence] store: record[%d] request_id=%q source=%q run_id=%q auth_method=%q credential_id=%q identity_id=%s auth_status=%q key_version=%q destination=%q observed_at=%s",
+			idx, in.RequestID, in.Source, in.RunID, in.AuthMethod, in.CredentialID, logStrPtr(in.IdentityID),
+			in.AuthStatus, in.KeyVersion, in.Destination, logFloatPtr(in.ObservedAt))
 		if in.RequestID == "" || in.Source == "" {
+			log.Printf("[auth-evidence] store: record[%d] SKIPPED: request_id and source are required", idx)
 			continue
 		}
 		record := &db.AuthEvidenceRecord{
@@ -71,10 +79,18 @@ func (h *Handler) StoreAuthEvidence(c *gin.Context) {
 			Destination:  in.Destination,
 			ObservedAt:   in.ObservedAt,
 		}
-		if err := h.db.StoreAuthEvidence(record, user.OrgID); err == nil {
+		inserted, err := h.db.StoreAuthEvidence(record, user.OrgID)
+		switch {
+		case err != nil:
+			log.Printf("[auth-evidence] store: record[%d] request_id=%q FAILED: %v", idx, in.RequestID, err)
+		case !inserted:
+			log.Printf("[auth-evidence] store: record[%d] request_id=%q source=%q destination=%q already stored, ignored", idx, in.RequestID, in.Source, in.Destination)
+		default:
+			log.Printf("[auth-evidence] store: record[%d] request_id=%q stored", idx, in.RequestID)
 			stored++
 		}
 	}
+	log.Printf("[auth-evidence] store: stored %d of %d record(s) org=%s", stored, len(body.Records), user.OrgID)
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"stored": stored}})
 }
@@ -212,15 +228,63 @@ func (h *Handler) IntentAuthEvidence(c *gin.Context) {
 	}
 	byRequest, err := h.db.GetAuthEvidenceByIntent(intentID)
 	if err != nil {
+		log.Printf("[auth-evidence] serve: intent=%s fetch FAILED: %v", intentID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch auth evidence: %v", err)})
 		return
 	}
+	logEvidenceForIntent("serve", intentID, interactions, byRequest)
 
 	hops := buildIntentAuthEvidence(interactions, byRequest)
+	log.Printf("[auth-evidence] serve: intent=%s responding with %d of %d interaction(s)", intentID, len(hops), len(interactions))
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
 		"intentID":          intentID,
 		"totalInteractions": len(interactions),
 		"count":             len(hops),
 		"interactions":      hops,
 	}})
+}
+
+// logEvidenceForIntent logs, per interaction, which evidence rows matched its
+// signature and the credential fields each row carries, so a null in a
+// response can be traced to the row (or the missing row) behind it.
+func logEvidenceForIntent(tag, intentID string, interactions []*db.InteractionRecord, byRequest map[string][]*db.AuthEvidenceRecord) {
+	rows := 0
+	for _, recs := range byRequest {
+		rows += len(recs)
+	}
+	log.Printf("[auth-evidence] %s: intent=%s interactions=%d matched_requests=%d evidence_rows=%d",
+		tag, intentID, len(interactions), len(byRequest), rows)
+
+	for _, i := range interactions {
+		recs := byRequest[i.Signature]
+		if i.Signature == "" {
+			log.Printf("[auth-evidence] %s: intent=%s interaction=%s has NO signature, nothing can match", tag, intentID, i.InteractionID)
+			continue
+		}
+		if len(recs) == 0 {
+			log.Printf("[auth-evidence] %s: intent=%s interaction=%s signature=%s no evidence rows", tag, intentID, i.InteractionID, i.Signature)
+			continue
+		}
+		for _, r := range recs {
+			log.Printf("[auth-evidence] %s: intent=%s interaction=%s source=%q auth_method=%q credential_id=%q identity_id=%s auth_status=%q key_version=%q destination=%q observed_at=%s",
+				tag, intentID, i.InteractionID, r.Source, r.AuthMethod, r.CredentialID, logStrPtr(r.IdentityID),
+				r.AuthStatus, r.KeyVersion, r.Destination, logFloatPtr(r.ObservedAt))
+		}
+	}
+}
+
+// logStrPtr and logFloatPtr print a nil pointer as NULL, so a stored NULL is
+// told apart from an empty value in the logs.
+func logStrPtr(p *string) string {
+	if p == nil {
+		return "NULL"
+	}
+	return fmt.Sprintf("%q", *p)
+}
+
+func logFloatPtr(p *float64) string {
+	if p == nil {
+		return "NULL"
+	}
+	return fmt.Sprintf("%f", *p)
 }

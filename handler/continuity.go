@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"log"
 	"sort"
 
 	"agentdna-ratelimit-auth/db"
@@ -291,8 +292,10 @@ func (h *Handler) authEvidenceForIntent(
 ) (map[string]HopEvidence, Continuity) {
 	byRequest, err := h.db.GetAuthEvidenceByIntent(intentID)
 	if err != nil {
+		log.Printf("[auth-evidence] intent-info: intent=%s fetch FAILED, showing not_observed: %v", intentID, err)
 		byRequest = map[string][]*db.AuthEvidenceRecord{}
 	}
+	logEvidenceForIntent("intent-info", intentID, interactions, byRequest)
 
 	perHop := make(map[string]HopEvidence, len(interactions))
 	for _, i := range interactions {
