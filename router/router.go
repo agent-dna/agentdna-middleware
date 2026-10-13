@@ -63,6 +63,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/tools-list", h.ToolsList)
 	dashboard.GET("/tool-info", h.ToolInfo)
 	dashboard.GET("/user-info", h.UserInfo)
+	dashboard.GET("/admins/:id", h.AdminInfo)
 	dashboard.GET("/intent-list", h.IntentList)
 	dashboard.GET("/threats-list", h.ThreatsList)
 	dashboard.GET("/threat-events", h.ThreatEvents)

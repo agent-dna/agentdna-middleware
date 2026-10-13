@@ -2603,6 +2603,36 @@ func (h *Handler) UserInfo(c *gin.Context) {
 		return
 	}
 
+	user, err := h.db.GetUserDetail(userID, orgID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "user not found"})
+		return
+	}
+	h.writeAccountInfo(c, orgID, userID, user)
+}
+
+// AdminInfo is UserInfo for an admin, addressed by DID in the path. The
+// response has the same shape as /user-info so the profile page can share it.
+func (h *Handler) AdminInfo(c *gin.Context) {
+	orgID := c.GetString(CtxOrgID)
+
+	adminID := c.Param("id")
+	if adminID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "id is required"})
+		return
+	}
+
+	admin, err := h.db.GetAdminDetail(adminID, orgID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "admin not found"})
+		return
+	}
+	h.writeAccountInfo(c, orgID, adminID, admin)
+}
+
+// writeAccountInfo renders an account's detail record plus its paginated
+// interactions, intents, threats, agents and apps.
+func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *db.UserInfoRecord) {
 	const pageSize = 10
 
 	interactionsPage := 1
@@ -2624,12 +2654,6 @@ func (h *Handler) UserInfo(c *gin.Context) {
 	appsPage := 1
 	if p, err := strconv.Atoi(c.Query("appsPage")); err == nil && p > 0 {
 		appsPage = p
-	}
-
-	user, err := h.db.GetUserDetail(userID, orgID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, Response{Status: false, Message: "user not found"})
-		return
 	}
 
 	// Interactions
