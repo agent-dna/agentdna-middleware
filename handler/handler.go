@@ -2623,8 +2623,14 @@ func (h *Handler) AdminInfo(c *gin.Context) {
 	}
 
 	admin, err := h.db.GetAdminDetail(adminID, orgID)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
+		log.Printf("[AdminInfo] no admin did=%q in org=%q", adminID, orgID)
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "admin not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("[AdminInfo] loading admin did=%q org=%q failed: %v", adminID, orgID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to load admin"})
 		return
 	}
 	h.writeAccountInfo(c, orgID, adminID, admin)

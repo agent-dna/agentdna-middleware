@@ -3178,7 +3178,7 @@ func (d *DB) GetAdminDetail(adminDID, orgID string) (*UserInfoRecord, error) {
 			SELECT did, COALESCE(email, '') AS email, COALESCE(name, '') AS name,
 			       COALESCE(created_at, NOW()) AS created_at
 			FROM new_admins
-			WHERE organization_id = $2 AND did IN (SELECT user_did_set($1))
+			WHERE LOWER(TRIM(organization_id)) = LOWER(TRIM($2)) AND did IN (SELECT user_did_set($1))
 		)
 		SELECT
 			(SELECT did FROM admin_rows ORDER BY created_at DESC, did DESC LIMIT 1),
