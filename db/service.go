@@ -426,11 +426,12 @@ func (d *DB) GetAgentsByUser(userDID, orgID string, limit, offset int) ([]*Agent
 
 // userScopeIntentsCTE returns a CTE block that defines user_agents and user_intents
 // for the given userDID ($1) and orgID ($2). Used across all user-scoped queries.
+// An empty orgID applies no org filter (admin profiles).
 const userScopeIntentsCTE = `
 WITH user_agents AS (
     SELECT a.did
     FROM new_agents a
-    WHERE a.organization_id = $2
+    WHERE ($2 = '' OR a.organization_id = $2)
       AND (
           a.deployer_did IN (SELECT user_did_set($1))
           OR a.did IN (
@@ -447,7 +448,7 @@ user_intents AS (
     SELECT DISTINCT ni.intent_id, ni.started_at
     FROM new_intents ni
     LEFT JOIN new_interactions ix ON ix.intent_id = ni.intent_id
-    WHERE ni.organization_id = $2
+    WHERE ($2 = '' OR ni.organization_id = $2)
       AND (
           ni.initiator_did IN (SELECT user_did_set($1))
           OR ix.initiator_did IN (SELECT user_did_set($1))
@@ -596,7 +597,7 @@ func (d *DB) CountInteractionsByUser(userDID, orgID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(userScopeIntentsCTE+`
 		SELECT COUNT(*) FROM new_interactions
-		WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents)`,
+		WHERE ($2 = '' OR organization_id = $2) AND intent_id IN (SELECT intent_id FROM user_intents)`,
 		userDID, orgID,
 	).Scan(&total)
 	return total, err
@@ -610,7 +611,7 @@ func (d *DB) GetInteractionsByUser(userDID, orgID string, limit, offset int) ([]
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
 		       COALESCE(signature, ''), COALESCE(threat_id, '')
 		FROM new_interactions
-		WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents)
+		WHERE ($2 = '' OR organization_id = $2) AND intent_id IN (SELECT intent_id FROM user_intents)
 		ORDER BY time DESC
 		LIMIT $3 OFFSET $4`,
 		userDID, orgID, limit, offset,
@@ -3116,9 +3117,9 @@ func (d *DB) Search(q, orgID string) (*SearchResults, error) {
 }
 
 // ownerAgentFilter is the SQL fragment that resolves which agents a user "owns".
-// Bind: $1 = userDID, $2 = orgID.
+// Bind: $1 = userDID, $2 = orgID (empty: any org).
 const ownerAgentFilter = `
-    a.organization_id = $2
+    ($2 = '' OR a.organization_id = $2)
     AND (
         a.deployer_did IN (SELECT user_did_set($1))
         OR a.did IN (
@@ -3167,10 +3168,11 @@ func (d *DB) GetUserDetail(userDID, orgID string) (*UserInfoRecord, error) {
 }
 
 // GetAdminDetail is GetUserDetail for an admin, read from new_admins. An
-// admin's DIDs are every new_admins row in the org sharing their admin-server
-// username (see user_did_set), oldest first; the newest is their primary DID.
-// Admins have no agent access list.
-func (d *DB) GetAdminDetail(adminDID, orgID string) (*UserInfoRecord, error) {
+// admin's DIDs are every new_admins row sharing their admin-server username
+// (see user_did_set), oldest first; the newest is their primary DID. Nothing
+// is org-scoped: like GetAdminByDID, organization_id may be unset, and the
+// totals cover every org. Admins have no agent access list.
+func (d *DB) GetAdminDetail(adminDID string) (*UserInfoRecord, error) {
 	r := &UserInfoRecord{}
 	var lastAt sql.NullTime
 	err := d.conn.QueryRow(`
@@ -3178,7 +3180,7 @@ func (d *DB) GetAdminDetail(adminDID, orgID string) (*UserInfoRecord, error) {
 			SELECT did, COALESCE(email, '') AS email, COALESCE(name, '') AS name,
 			       COALESCE(created_at, NOW()) AS created_at
 			FROM new_admins
-			WHERE LOWER(TRIM(organization_id)) = LOWER(TRIM($2)) AND did IN (SELECT user_did_set($1))
+			WHERE did IN (SELECT user_did_set($1))
 		)
 		SELECT
 			(SELECT did FROM admin_rows ORDER BY created_at DESC, did DESC LIMIT 1),
@@ -3186,13 +3188,13 @@ func (d *DB) GetAdminDetail(adminDID, orgID string) (*UserInfoRecord, error) {
 			COALESCE((SELECT email FROM admin_rows WHERE did = $1), ''),
 			COALESCE((SELECT name FROM admin_rows WHERE did = $1), ''),
 			(SELECT MIN(created_at) FROM admin_rows),
-			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND initiator_did IN (SELECT user_did_set($1))) AS total_interactions,
-			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND initiator_did IN (SELECT user_did_set($1)) AND threat = 1) AS total_threats,
-			(SELECT COUNT(*) FROM new_intents WHERE organization_id = $2 AND initiator_did IN (SELECT user_did_set($1))) AS total_intents,
+			(SELECT COUNT(*) FROM new_interactions WHERE initiator_did IN (SELECT user_did_set($1))) AS total_interactions,
+			(SELECT COUNT(*) FROM new_interactions WHERE initiator_did IN (SELECT user_did_set($1)) AND threat = 1) AS total_threats,
+			(SELECT COUNT(*) FROM new_intents WHERE initiator_did IN (SELECT user_did_set($1))) AS total_intents,
 			(SELECT COUNT(DISTINCT a.did) FROM new_agents a WHERE `+ownerAgentFilter+`) AS total_agents_owned,
-			(SELECT MAX(i.time) FROM new_interactions i WHERE i.organization_id = $2 AND i.initiator_did IN (SELECT user_did_set($1))) AS last_active
+			(SELECT MAX(i.time) FROM new_interactions i WHERE i.initiator_did IN (SELECT user_did_set($1))) AS last_active
 		WHERE EXISTS (SELECT 1 FROM admin_rows WHERE did = $1)`,
-		adminDID, orgID,
+		adminDID, "",
 	).Scan(
 		&r.UserDID, pq.Array(&r.DIDs), &r.UserName, &r.DisplayName, &r.CreatedAt,
 		&r.TotalInteractions, &r.TotalThreats, &r.TotalIntents,
@@ -3259,7 +3261,7 @@ func (d *DB) GetAgentsByOwner(userDID, orgID string, limit, offset int) ([]*User
 const userAppsFrom = `
 		FROM new_tools t
 		JOIN new_interactions i ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
-		WHERE t.did <> '' AND i.organization_id = $2
+		WHERE t.did <> '' AND ($2 = '' OR i.organization_id = $2)
 		  AND i.intent_id IN (SELECT intent_id FROM user_intents)`
 
 func (d *DB) CountAppsByUser(userDID, orgID string) (int, error) {

@@ -542,7 +542,7 @@ func New(dsn string) *DB {
 		 ON CONFLICT (email) DO UPDATE SET dids = user_dids.dids || EXCLUDED.dids`,
 		// user_did_set(did) expands any one DID to every DID its user holds.
 		// An admin's DIDs are the new_admins rows sharing their admin-server
-		// username in the same org. The input DID is always included, so agent
+		// username. The input DID is always included, so agent
 		// DIDs passed through user-scoped queries behave exactly as a plain
 		// "= $1" did before.
 		`CREATE OR REPLACE FUNCTION user_did_set(p_did TEXT) RETURNS SETOF TEXT
@@ -550,7 +550,7 @@ func New(dsn string) *DB {
 			SELECT unnest(dids) FROM user_dids WHERE dids @> ARRAY[p_did]
 			UNION
 			SELECT a2.did FROM new_admins a1
-			JOIN new_admins a2 ON a2.name = a1.name AND a2.organization_id = a1.organization_id
+			JOIN new_admins a2 ON a2.name = a1.name
 			WHERE a1.did = p_did AND COALESCE(a1.name, '') <> ''
 			UNION
 			SELECT p_did

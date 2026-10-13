@@ -17,7 +17,7 @@ func TestAdminDetailGroupsDIDsByUsername(t *testing.T) {
 
 	const org = "admin-detail-org"
 	cleanup := func() {
-		d.conn.Exec(`DELETE FROM new_admins WHERE organization_id = $1`, org)
+		d.conn.Exec(`DELETE FROM new_admins WHERE organization_id LIKE $1 || '%'`, org)
 		d.conn.Exec(`DELETE FROM new_intents WHERE organization_id = $1`, org)
 		d.conn.Exec(`DELETE FROM new_interactions WHERE organization_id = $1`, org)
 	}
@@ -27,7 +27,7 @@ func TestAdminDetailGroupsDIDsByUsername(t *testing.T) {
 	for _, stmt := range []string{
 		`INSERT INTO new_admins (did, organization_id, name, email, created_at) VALUES
 			('admin-old', $1, 'alice', 'alice@test.local', NOW() - INTERVAL '2 days'),
-			('admin-new', $1, 'alice', '',                 NOW() - INTERVAL '1 day'),
+			('admin-new', $1 || '-other', 'alice', '',     NOW() - INTERVAL '1 day'),
 			('admin-bob', $1, 'bob',   'bob@test.local',   NOW())`,
 		`INSERT INTO new_intents (intent_id, initiator_did, organization_id) VALUES
 			('intent-old', 'admin-old', $1), ('intent-bob', 'admin-bob', $1)`,
@@ -39,7 +39,7 @@ func TestAdminDetailGroupsDIDsByUsername(t *testing.T) {
 		}
 	}
 
-	r, err := d.GetAdminDetail("admin-old", org)
+	r, err := d.GetAdminDetail("admin-old")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,8 +56,9 @@ func TestAdminDetailGroupsDIDsByUsername(t *testing.T) {
 		t.Errorf("totals = %d/%d/%d, want 1/1/1", r.TotalInteractions, r.TotalThreats, r.TotalIntents)
 	}
 
-	// Looked up by the newer DID, the older DID's activity still counts.
-	n, err := d.CountInteractionsByUser("admin-new", org)
+	// Looked up by the newer DID, the older DID's activity still counts, and
+	// an empty org lists it across every org.
+	n, err := d.CountInteractionsByUser("admin-new", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,22 @@ func TestAdminDetailGroupsDIDsByUsername(t *testing.T) {
 		t.Errorf("CountInteractionsByUser(admin-new) = %d, want 1", n)
 	}
 
-	if _, err := d.GetAdminDetail("admin-old", "other-org"); err == nil {
-		t.Error("GetAdminDetail found an admin outside the org")
+	if _, err := d.GetAdminDetail("no-such-admin"); err == nil {
+		t.Error("GetAdminDetail found an unknown DID")
+	}
+
+	// Rows with no organization_id (as the session middleware accepts) still
+	// resolve and group.
+	if _, err := d.conn.Exec(`INSERT INTO new_admins (did, organization_id, name) VALUES
+		('admin-noorg-1', NULL, 'carol'), ('admin-noorg-2', NULL, 'carol')`); err != nil {
+		t.Fatal(err)
+	}
+	defer d.conn.Exec(`DELETE FROM new_admins WHERE name = 'carol'`)
+	r, err = d.GetAdminDetail("admin-noorg-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.DIDs) != 2 {
+		t.Errorf("no-org DIDs = %v, want both carol rows", r.DIDs)
 	}
 }

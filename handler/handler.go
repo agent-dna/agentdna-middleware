@@ -2613,31 +2613,31 @@ func (h *Handler) UserInfo(c *gin.Context) {
 
 // AdminInfo is UserInfo for an admin, addressed by DID in the path. The
 // response has the same shape as /user-info so the profile page can share it.
-func (h *Handler) AdminInfo(c *gin.Context) {
-	orgID := c.GetString(CtxOrgID)
 
+func (h *Handler) AdminInfo(c *gin.Context) {
 	adminID := c.Param("id")
 	if adminID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "id is required"})
 		return
 	}
 
-	admin, err := h.db.GetAdminDetail(adminID, orgID)
+	admin, err := h.db.GetAdminDetail(adminID)
 	if errors.Is(err, sql.ErrNoRows) {
-		log.Printf("[AdminInfo] no admin did=%q in org=%q", adminID, orgID)
+		log.Printf("[AdminInfo] no admin did=%q", adminID)
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "admin not found"})
 		return
 	}
 	if err != nil {
-		log.Printf("[AdminInfo] loading admin did=%q org=%q failed: %v", adminID, orgID, err)
+		log.Printf("[AdminInfo] loading admin did=%q failed: %v", adminID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to load admin"})
 		return
 	}
-	h.writeAccountInfo(c, orgID, adminID, admin)
+	h.writeAccountInfo(c, "", adminID, admin)
 }
 
 // writeAccountInfo renders an account's detail record plus its paginated
-// interactions, intents, threats, agents and apps.
+// interactions, intents, threats, agents and apps. An empty orgID lists them
+// across every org.
 func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *db.UserInfoRecord) {
 	const pageSize = 10
 
