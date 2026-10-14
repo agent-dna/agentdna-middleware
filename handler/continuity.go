@@ -2,7 +2,9 @@ package handler
 
 import (
 	"log"
+	"math"
 	"sort"
+	"time"
 
 	"agentdna-ratelimit-auth/db"
 )
@@ -281,26 +283,74 @@ func interactionOrder(interactions []*db.InteractionRecord) []hopRef {
 	return refs
 }
 
-// authEvidenceForIntent returns the per-interaction evidence and what the run
-// shows as a whole.
+// AuthEvidenceEntry is one auth_evidence row as the API returns it, flat.
+type AuthEvidenceEntry struct {
+	RequestID    string  `json:"requestID"`
+	Source       string  `json:"source"`
+	RunID        string  `json:"runID"`
+	Destination  string  `json:"destination"`
+	AuthMethod   string  `json:"authMethod"`
+	CredentialID string  `json:"credentialID"`
+	IdentityID   *string `json:"identityID"`
+	AuthStatus   string  `json:"authStatus"`
+	KeyVersion   string  `json:"keyVersion"`
+	ObservedAt   string  `json:"observedAt"`
+}
+
+// authEvidenceEntries returns every row recorded for one request, sorted by
+// source then destination so the same evidence always reads the same way.
+func authEvidenceEntries(records []*db.AuthEvidenceRecord) []AuthEvidenceEntry {
+	out := make([]AuthEvidenceEntry, 0, len(records))
+	for _, r := range records {
+		observedAt := ""
+		if r.ObservedAt != nil {
+			sec, frac := math.Modf(*r.ObservedAt)
+			observedAt = time.Unix(int64(sec), int64(frac*1e9)).UTC().Format(time.RFC3339)
+		}
+		out = append(out, AuthEvidenceEntry{
+			RequestID:    r.RequestID,
+			Source:       r.Source,
+			RunID:        r.RunID,
+			Destination:  r.Destination,
+			AuthMethod:   r.AuthMethod,
+			CredentialID: r.CredentialID,
+			IdentityID:   r.IdentityID,
+			AuthStatus:   r.AuthStatus,
+			KeyVersion:   r.KeyVersion,
+			ObservedAt:   observedAt,
+		})
+	}
+	sort.SliceStable(out, func(a, b int) bool {
+		if out[a].Source != out[b].Source {
+			return out[a].Source < out[b].Source
+		}
+		return out[a].Destination < out[b].Destination
+	})
+	return out
+}
+
+// authEvidenceForIntent returns the raw evidence rows for each interaction and
+// what the run shows as a whole.
 //
 // On any error it returns empty results rather than failing the request:
-// missing evidence must read as "not observed", never as a broken page.
+// missing evidence must read as an empty list, never as a broken page.
 func (h *Handler) authEvidenceForIntent(
 	intentID string,
 	interactions []*db.InteractionRecord,
-) (map[string]HopEvidence, Continuity) {
+) (map[string][]AuthEvidenceEntry, Continuity) {
 	byRequest, err := h.db.GetAuthEvidenceByIntent(intentID)
 	if err != nil {
-		log.Printf("[auth-evidence] intent-info: intent=%s fetch FAILED, showing not_observed: %v", intentID, err)
+		log.Printf("[auth-evidence] intent-info: intent=%s fetch FAILED, showing no evidence: %v", intentID, err)
 		byRequest = map[string][]*db.AuthEvidenceRecord{}
 	}
 	logEvidenceForIntent("intent-info", intentID, interactions, byRequest)
 
+	entries := make(map[string][]AuthEvidenceEntry, len(interactions))
 	perHop := make(map[string]HopEvidence, len(interactions))
 	for _, i := range interactions {
+		entries[i.InteractionID] = authEvidenceEntries(byRequest[i.Signature])
 		perHop[i.InteractionID] = evidenceForHop(byRequest[i.Signature])
 	}
 
-	return perHop, analyseContinuity(interactionOrder(interactions), perHop)
+	return entries, analyseContinuity(interactionOrder(interactions), perHop)
 }

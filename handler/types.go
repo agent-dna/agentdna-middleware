@@ -169,3 +169,4 @@ type interactionExtract struct {
 	Epoch     int64
 	RawData   json.RawMessage
 }
+
