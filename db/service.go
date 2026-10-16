@@ -1408,6 +1408,7 @@ func (d *DB) UnregisteredDIDs(dids []string) ([]string, error) {
 		  AND NOT EXISTS (SELECT 1 FROM new_admins    ad WHERE ad.did = x.did)
 		  AND NOT EXISTS (SELECT 1 FROM new_agents    a WHERE a.did = x.did)
 		  AND NOT EXISTS (SELECT 1 FROM new_tools     t WHERE t.did = x.did)
+		  AND NOT EXISTS (SELECT 1 FROM new_requests  r WHERE r.agent_did = x.did AND r.status IN ('pending', 'approved'))
 		ORDER BY x.pos`,
 		pq.Array(dids),
 	)
@@ -3518,6 +3519,144 @@ type AuthEvidenceRecord struct {
 // lands, so nothing is attached to an interaction here. That happens at read
 // time in GetAuthEvidenceByIntent. Re-sending the same (request_id, source,
 // destination) is a no-op rather than an error; inserted reports which it was.
+// RecordResourceAccess records that the request with this signature reached
+// destination using credentialID, against the intent that request belongs to.
+//
+// Evidence and the signed chain arrive in either order, so this is called from
+// both sides: when a server_out record is stored (StoreAuthEvidence handler) and
+// when interactions are stored (RecordResourcesForRequest). Whichever comes
+// second finds the other and does the write; until the interaction exists there
+// is no intent to record against, and it returns 0.
+//
+// One INSERT ... ON CONFLICT per intent, so concurrent writes to the same
+// resource cannot drop each other. Lists keep first-seen order, and an intent
+// is never added twice, so running it again changes nothing.
+func (d *DB) RecordResourceAccess(requestID, destination, credentialID, authMethod string) (int, error) {
+	if destination == "" {
+		return 0, nil
+	}
+	rows, err := d.conn.Query(
+		`SELECT DISTINCT intent_id FROM new_interactions WHERE signature = $1 AND intent_id <> ''`, requestID)
+	if err != nil {
+		return 0, err
+	}
+	var intents []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		intents = append(intents, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, intentID := range intents {
+		_, err := d.conn.Exec(`
+			INSERT INTO resources AS r (id, name, credentials, intents)
+			VALUES ($1, $1,
+				CASE WHEN $2::text = '' THEN '{}'::jsonb
+				     ELSE jsonb_build_object($2::text, jsonb_build_object('authMethod', $3::text, 'intents', jsonb_build_array($4::text)))
+				END,
+				jsonb_build_array($4::text))
+			ON CONFLICT (id) DO UPDATE SET
+				intents = CASE WHEN r.intents @> jsonb_build_array($4::text) THEN r.intents
+				               ELSE r.intents || jsonb_build_array($4::text) END,
+				credentials = CASE WHEN $2::text = '' THEN r.credentials
+					ELSE jsonb_set(r.credentials, ARRAY[$2::text], jsonb_build_object(
+						'authMethod', $3::text,
+						'intents', CASE
+							WHEN COALESCE(r.credentials->$2::text->'intents', '[]'::jsonb) @> jsonb_build_array($4::text)
+								THEN r.credentials->$2::text->'intents'
+							ELSE COALESCE(r.credentials->$2::text->'intents', '[]'::jsonb) || jsonb_build_array($4::text)
+						END))
+				END`,
+			destination, credentialID, authMethod, intentID,
+		)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return len(intents), nil
+}
+
+// RecordResourcesForRequest records every server_out record already stored for
+// requestID. Called once the request's interaction is stored, for evidence that
+// arrived before it.
+func (d *DB) RecordResourcesForRequest(requestID string) (int, error) {
+	evidence, err := d.serverOutEvidence(`
+		SELECT request_id, destination, COALESCE(credential_id, ''), COALESCE(auth_method, '')
+		FROM auth_evidence
+		WHERE request_id = $1 AND source = 'server_out' AND COALESCE(destination, '') <> ''`, requestID)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, e := range evidence {
+		n, err := d.RecordResourceAccess(e.RequestID, e.Destination, e.CredentialID, e.AuthMethod)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// BackfillResources fills resources from the evidence already stored. It only
+// runs while the table is empty - once both write paths are live they keep it
+// current - so it costs nothing on later starts.
+func (d *DB) BackfillResources() (int, error) {
+	var existing bool
+	if err := d.conn.QueryRow(`SELECT EXISTS (SELECT 1 FROM resources)`).Scan(&existing); err != nil {
+		return 0, err
+	}
+	if existing {
+		return 0, nil
+	}
+	// Oldest first, so lists keep the order intents happened in.
+	evidence, err := d.serverOutEvidence(`
+		SELECT e.request_id, e.destination, COALESCE(e.credential_id, ''), COALESCE(e.auth_method, '')
+		FROM auth_evidence e
+		JOIN new_interactions i ON i.signature = e.request_id
+		WHERE e.source = 'server_out' AND COALESCE(e.destination, '') <> ''
+		GROUP BY e.request_id, e.destination, e.credential_id, e.auth_method
+		ORDER BY MIN(i.time)`)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, e := range evidence {
+		n, err := d.RecordResourceAccess(e.RequestID, e.Destination, e.CredentialID, e.AuthMethod)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// serverOutEvidence runs a query selecting (request_id, destination,
+// credential_id, auth_method) from auth_evidence and returns the rows.
+func (d *DB) serverOutEvidence(query string, args ...any) ([]*AuthEvidenceRecord, error) {
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*AuthEvidenceRecord
+	for rows.Next() {
+		r := &AuthEvidenceRecord{}
+		if err := rows.Scan(&r.RequestID, &r.Destination, &r.CredentialID, &r.AuthMethod); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func (d *DB) StoreAuthEvidence(r *AuthEvidenceRecord, orgID string) (inserted bool, err error) {
 	res, err := d.conn.Exec(`
 		INSERT INTO auth_evidence
