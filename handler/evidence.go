@@ -88,11 +88,31 @@ func (h *Handler) StoreAuthEvidence(c *gin.Context) {
 		default:
 			log.Printf("[auth-evidence] store: record[%d] request_id=%q stored", idx, in.RequestID)
 			stored++
+			if record.Source == SourceServerOut {
+				h.recordResourceAccess(idx, record)
+			}
 		}
 	}
 	log.Printf("[auth-evidence] store: stored %d of %d record(s) org=%s", stored, len(body.Records), user.OrgID)
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"stored": stored}})
+}
+
+// recordResourceAccess adds a stored server_out record to resources. When the
+// request's interaction has not landed yet nothing is written here; the
+// interaction side picks it up (RecordResourcesForRequest).
+//
+// A failure is logged, not returned: the evidence itself is already stored.
+func (h *Handler) recordResourceAccess(idx int, r *db.AuthEvidenceRecord) {
+	n, err := h.db.RecordResourceAccess(r.RequestID, r.Destination, r.CredentialID, r.AuthMethod)
+	switch {
+	case err != nil:
+		log.Printf("[resources] record[%d] request_id=%q destination=%q FAILED: %v", idx, r.RequestID, r.Destination, err)
+	case n == 0:
+		log.Printf("[resources] record[%d] request_id=%q destination=%q no interaction yet, will record when it lands", idx, r.RequestID, r.Destination)
+	default:
+		log.Printf("[resources] record[%d] request_id=%q destination=%q credential_id=%q recorded", idx, r.RequestID, r.Destination, r.CredentialID)
+	}
 }
 
 // authEvidenceRow is one stored auth_evidence row as the dashboard sees it.

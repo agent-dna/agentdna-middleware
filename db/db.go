@@ -659,8 +659,32 @@ func New(dsn string) *DB {
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_interactions_intent_id ON new_interactions (intent_id)`)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_interactions_from_to ON new_interactions (initiator_did, interacted_to_did)`)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_intents_initiator ON new_intents (initiator_did)`)
+	// Auth evidence is matched to its interaction by signature (request_id).
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_interactions_signature ON new_interactions (signature)`)
 
-	return &DB{conn: conn}
+	// resources: every destination a server called while serving a request
+	// (auth_evidence rows with source server_out), keyed by the destination
+	// exactly as recorded.
+	//   credentials  {"<credentialID>": {"authMethod": "...", "intents": ["<intentID>", ...]}}
+	//   intents      ["<intentID>", ...] - every intent it was accessed in,
+	//                including with no credential
+	// Filled from both sides, since evidence and the signed chain arrive in
+	// either order: see RecordResourceAccess.
+	conn.Exec(`CREATE TABLE IF NOT EXISTS resources (
+		id          TEXT PRIMARY KEY,
+		name        TEXT NOT NULL DEFAULT '',
+		credentials JSONB NOT NULL DEFAULT '{}'::jsonb,
+		intents     JSONB NOT NULL DEFAULT '[]'::jsonb
+	)`)
+
+	d := &DB{conn: conn}
+	if n, err := d.BackfillResources(); err != nil {
+		log.Printf("[resources] backfill FAILED: %v", err)
+	} else if n > 0 {
+		log.Printf("[resources] backfilled %d access record(s)", n)
+	}
+
+	return d
 }
 
 func (d *DB) Close() {

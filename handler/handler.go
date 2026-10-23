@@ -951,6 +951,21 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo, data *intentWorkflowData
 		}
 	}
 
+	// Server_out evidence for these hops usually arrived before them, when
+	// there was no intent to record it against. Record it now.
+	if branch != nil {
+		for _, k := range branch.InsertedKeys {
+			if k.Signature == "" {
+				continue
+			}
+			if n, err := h.db.RecordResourcesForRequest(k.Signature); err != nil {
+				log.Printf("[resources] intent=%s signature=%s FAILED: %v", intentID, k.Signature, err)
+			} else if n > 0 {
+				log.Printf("[resources] intent=%s signature=%s recorded %d access(es)", intentID, k.Signature, n)
+			}
+		}
+	}
+
 	if branch.isEmpty() {
 		log.Printf("[intentWorkflow] intent_id=%s: this txn was a fully duplicate replay of hops already stored, nothing new to save", intentID)
 		return branch, nil
