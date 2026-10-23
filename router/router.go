@@ -58,6 +58,8 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/intent-auth-evidence", h.IntentAuthEvidence)
 	dashboard.GET("/resources-list", h.ResourcesList)
 	dashboard.GET("/resource-info", h.ResourceInfo)
+	dashboard.GET("/credentials-list", h.CredentialsList)
+	dashboard.GET("/credential-info", h.CredentialInfo)
 	dashboard.POST("/update-intent-status", h.UpdateIntentStatus)
 	dashboard.GET("/intent-diagram", h.IntentDiagram)
 	dashboard.POST("/update-password", h.UpdatePassword)

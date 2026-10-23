@@ -3778,6 +3778,202 @@ func (d *DB) GetResourceCredentials(id string, limit, offset int) ([]*ResourceCr
 	return out, rows.Err()
 }
 
+// CredentialSummary is one credential as seen across all auth evidence.
+// AuthMethod and IdentityID are the most recently observed values.
+type CredentialSummary struct {
+	CredentialID string
+	AuthMethod   string
+	IdentityID   *string
+	Sources      []string
+	RequestCount int
+	IntentCount  int
+	UserCount    int
+	AgentCount   int
+	ToolCount    int
+	FirstUsedAt  sql.NullTime
+	LastUsedAt   sql.NullTime
+}
+
+// CredentialIntent is one intent a credential was used in.
+type CredentialIntent struct {
+	IntentID       string
+	InitiatorDID   string
+	InitiatorName  string
+	Status         string
+	ReviewStatus   string
+	ThreatDetected bool
+	StartedAt      sql.NullTime
+	RequestCount   int
+	LastUsedAt     sql.NullTime
+}
+
+// CredentialActor is a user, agent or tool that presented a credential.
+type CredentialActor struct {
+	DID          string
+	Name         string
+	Type         string // user | agent | tool | unknown
+	RequestCount int
+	IntentCount  int
+	LastUsedAt   sql.NullTime
+}
+
+// credentialUsesCTE yields uses: one row per auth_evidence row carrying a
+// credential (only credential $1 when $1 is not empty), joined to the
+// interaction it was observed on; and actors: the type of every actor in uses.
+//
+// The actor is whoever presented the credential. At server_out that is the
+// server answering the hop (interacted_to), calling its own backend; at every
+// other source it is the hop's initiator. Evidence whose interaction has not
+// landed yet counts as a request with no intent and no actor.
+const credentialUsesCTE = `
+	WITH uses AS (
+		SELECT e.credential_id, e.auth_method, e.identity_id, e.source, e.request_id,
+		       COALESCE(e.observed_at, i.time) AS used_at,
+		       NULLIF(i.intent_id, '') AS intent_id,
+		       NULLIF(CASE WHEN e.source = 'server_out' THEN i.interacted_to_did ELSE i.initiator_did END, '') AS actor_did,
+		       CASE WHEN e.source = 'server_out' THEN i.interacted_to_name ELSE i.initiator_name END AS actor_name
+		FROM auth_evidence e
+		LEFT JOIN new_interactions i ON i.signature = e.request_id
+		WHERE COALESCE(e.credential_id, '') <> '' AND ($1::text = '' OR e.credential_id = $1::text)
+	), actors AS (
+		SELECT DISTINCT actor_did AS did,
+		       CASE WHEN EXISTS (SELECT 1 FROM new_agents a WHERE a.did = actor_did) THEN 'agent'
+		            WHEN EXISTS (SELECT 1 FROM new_tools t WHERE t.did = actor_did) THEN 'tool'
+		            WHEN EXISTS (SELECT 1 FROM user_dids ud WHERE ud.dids @> ARRAY[actor_did])
+		              OR EXISTS (SELECT 1 FROM new_org_users o WHERE o.did = actor_did) THEN 'user'
+		            ELSE 'unknown' END AS type
+		FROM uses WHERE actor_did IS NOT NULL
+	)`
+
+const credentialSummarySelect = `
+	SELECT u.credential_id,
+	       COALESCE((array_agg(u.auth_method ORDER BY u.used_at DESC NULLS LAST))[1], ''),
+	       (array_agg(u.identity_id ORDER BY u.used_at DESC NULLS LAST) FILTER (WHERE u.identity_id IS NOT NULL))[1],
+	       array_agg(DISTINCT u.source ORDER BY u.source),
+	       COUNT(DISTINCT u.request_id),
+	       COUNT(DISTINCT u.intent_id),
+	       COUNT(DISTINCT u.actor_did) FILTER (WHERE a.type = 'user'),
+	       COUNT(DISTINCT u.actor_did) FILTER (WHERE a.type = 'agent'),
+	       COUNT(DISTINCT u.actor_did) FILTER (WHERE a.type = 'tool'),
+	       MIN(u.used_at), MAX(u.used_at)
+	FROM uses u
+	LEFT JOIN actors a ON a.did = u.actor_did
+	GROUP BY u.credential_id`
+
+func scanCredentialSummary(s interface{ Scan(...any) error }) (*CredentialSummary, error) {
+	c := &CredentialSummary{}
+	err := s.Scan(&c.CredentialID, &c.AuthMethod, &c.IdentityID, pq.Array(&c.Sources),
+		&c.RequestCount, &c.IntentCount, &c.UserCount, &c.AgentCount, &c.ToolCount,
+		&c.FirstUsedAt, &c.LastUsedAt)
+	return c, err
+}
+
+func (d *DB) CountCredentials() (int, error) {
+	var total int
+	err := d.conn.QueryRow(
+		`SELECT COUNT(DISTINCT credential_id) FROM auth_evidence WHERE COALESCE(credential_id, '') <> ''`,
+	).Scan(&total)
+	return total, err
+}
+
+// ListCredentials returns a page of every credential seen in auth evidence,
+// most recently used first.
+func (d *DB) ListCredentials(limit, offset int) ([]*CredentialSummary, error) {
+	rows, err := d.conn.Query(credentialUsesCTE+credentialSummarySelect+`
+		ORDER BY MAX(u.used_at) DESC NULLS LAST, u.credential_id
+		LIMIT $2 OFFSET $3`,
+		"", limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*CredentialSummary{}
+	for rows.Next() {
+		c, err := scanCredentialSummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// GetCredential returns credential id, or nil when it was never observed.
+func (d *DB) GetCredential(id string) (*CredentialSummary, error) {
+	c, err := scanCredentialSummary(d.conn.QueryRow(credentialUsesCTE+credentialSummarySelect, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// GetCredentialIntents returns a page of the intents credential id was used
+// in, most recently used first. The total is GetCredential's IntentCount.
+func (d *DB) GetCredentialIntents(id string, limit, offset int) ([]*CredentialIntent, error) {
+	rows, err := d.conn.Query(credentialUsesCTE+`
+		SELECT u.intent_id, COALESCE(ni.initiator_did, ''), COALESCE(ni.initiator_name, ''),
+		       COALESCE(ni.status, ''), COALESCE(ni.review_status, 'Unreviewed'),
+		       COALESCE(ni.threat_detected, 0) = 1, ni.started_at,
+		       COUNT(DISTINCT u.request_id), MAX(u.used_at)
+		FROM uses u
+		LEFT JOIN new_intents ni ON ni.intent_id = u.intent_id
+		WHERE u.intent_id IS NOT NULL
+		GROUP BY u.intent_id, ni.initiator_did, ni.initiator_name, ni.status, ni.review_status,
+		         ni.threat_detected, ni.started_at
+		ORDER BY MAX(u.used_at) DESC NULLS LAST, u.intent_id
+		LIMIT $2 OFFSET $3`,
+		id, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*CredentialIntent{}
+	for rows.Next() {
+		c := &CredentialIntent{}
+		if err := rows.Scan(&c.IntentID, &c.InitiatorDID, &c.InitiatorName, &c.Status, &c.ReviewStatus,
+			&c.ThreatDetected, &c.StartedAt, &c.RequestCount, &c.LastUsedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// GetCredentialActors returns every user, agent and tool that presented
+// credential id, most recently first. Name is the latest non-empty name the
+// actor was recorded under.
+func (d *DB) GetCredentialActors(id string) ([]*CredentialActor, error) {
+	rows, err := d.conn.Query(credentialUsesCTE+`
+		SELECT u.actor_did, a.type,
+		       COALESCE((array_agg(u.actor_name ORDER BY u.used_at DESC NULLS LAST)
+		                 FILTER (WHERE COALESCE(u.actor_name, '') <> ''))[1], ''),
+		       COUNT(DISTINCT u.request_id), COUNT(DISTINCT u.intent_id), MAX(u.used_at)
+		FROM uses u
+		JOIN actors a ON a.did = u.actor_did
+		GROUP BY u.actor_did, a.type
+		ORDER BY MAX(u.used_at) DESC NULLS LAST, u.actor_did`,
+		id,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*CredentialActor{}
+	for rows.Next() {
+		c := &CredentialActor{}
+		if err := rows.Scan(&c.DID, &c.Type, &c.Name, &c.RequestCount, &c.IntentCount, &c.LastUsedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // serverOutEvidence runs a query selecting (request_id, destination,
 // credential_id, auth_method) from auth_evidence and returns the rows.
 func (d *DB) serverOutEvidence(query string, args ...any) ([]*AuthEvidenceRecord, error) {
