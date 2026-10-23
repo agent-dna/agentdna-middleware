@@ -677,6 +677,16 @@ func New(dsn string) *DB {
 		intents     JSONB NOT NULL DEFAULT '[]'::jsonb
 	)`)
 
+	// credentials: the status an admin gave a credential. Only credentials
+	// someone has set a status on have a row; no row means active.
+	conn.Exec(`CREATE TABLE IF NOT EXISTS credentials (
+		credential_id TEXT PRIMARY KEY,
+		status        TEXT NOT NULL DEFAULT 'active'
+		              CHECK (status IN ('active', 'flagged', 'compromised')),
+		reason        TEXT NOT NULL DEFAULT '',
+		updated_by    TEXT NOT NULL DEFAULT '',
+		updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
 	d := &DB{conn: conn}
 	if n, err := d.BackfillResources(); err != nil {
 		log.Printf("[resources] backfill FAILED: %v", err)

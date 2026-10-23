@@ -3666,6 +3666,7 @@ type ResourceCredential struct {
 	CredentialID string
 	AuthMethod   string
 	IntentCount  int
+	Status       string
 }
 
 const resourceSummaryColumns = `
@@ -3755,9 +3756,11 @@ func (d *DB) GetResourceIntents(id string, limit, offset int) ([]*ResourceIntent
 func (d *DB) GetResourceCredentials(id string, limit, offset int) ([]*ResourceCredential, error) {
 	rows, err := d.conn.Query(`
 		SELECT c.credential_id, COALESCE(c.info->>'authMethod', ''),
-		       jsonb_array_length(COALESCE(c.info->'intents', '[]'::jsonb)) AS intent_count
+		       jsonb_array_length(COALESCE(c.info->'intents', '[]'::jsonb)) AS intent_count,
+		       COALESCE(cs.status, 'active')
 		FROM resources r
 		CROSS JOIN LATERAL jsonb_each(r.credentials) AS c(credential_id, info)
+		LEFT JOIN credentials cs ON cs.credential_id = c.credential_id
 		WHERE r.id = $1
 		ORDER BY intent_count DESC, c.credential_id
 		LIMIT $2 OFFSET $3`,
@@ -3770,7 +3773,7 @@ func (d *DB) GetResourceCredentials(id string, limit, offset int) ([]*ResourceCr
 	out := []*ResourceCredential{}
 	for rows.Next() {
 		r := &ResourceCredential{}
-		if err := rows.Scan(&r.CredentialID, &r.AuthMethod, &r.IntentCount); err != nil {
+		if err := rows.Scan(&r.CredentialID, &r.AuthMethod, &r.IntentCount, &r.Status); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -3792,6 +3795,31 @@ type CredentialSummary struct {
 	ToolCount    int
 	FirstUsedAt  sql.NullTime
 	LastUsedAt   sql.NullTime
+	CredentialStatus
+}
+
+// Credential statuses an admin can set. A credential nobody has set one on is
+// CredentialActive.
+const (
+	CredentialActive      = "active"
+	CredentialFlagged     = "flagged"
+	CredentialCompromised = "compromised"
+)
+
+var ValidCredentialStatuses = map[string]bool{
+	CredentialActive:      true,
+	CredentialFlagged:     true,
+	CredentialCompromised: true,
+}
+
+// CredentialStatus is the status set on a credential and who set it. For a
+// credential nobody has set one on, Status is CredentialActive and the rest
+// is empty.
+type CredentialStatus struct {
+	Status          string
+	StatusReason    string
+	StatusUpdatedBy string
+	StatusUpdatedAt sql.NullTime
 }
 
 // CredentialIntent is one intent a credential was used in.
@@ -3855,34 +3883,45 @@ const credentialSummarySelect = `
 	       COUNT(DISTINCT u.actor_did) FILTER (WHERE a.type = 'user'),
 	       COUNT(DISTINCT u.actor_did) FILTER (WHERE a.type = 'agent'),
 	       COUNT(DISTINCT u.actor_did) FILTER (WHERE a.type = 'tool'),
-	       MIN(u.used_at), MAX(u.used_at)
+	       MIN(u.used_at), MAX(u.used_at),
+	       COALESCE(cs.status, 'active'), COALESCE(cs.reason, ''), COALESCE(cs.updated_by, ''), cs.updated_at
 	FROM uses u
 	LEFT JOIN actors a ON a.did = u.actor_did
-	GROUP BY u.credential_id`
+	LEFT JOIN credentials cs ON cs.credential_id = u.credential_id
+	GROUP BY u.credential_id, cs.status, cs.reason, cs.updated_by, cs.updated_at`
 
 func scanCredentialSummary(s interface{ Scan(...any) error }) (*CredentialSummary, error) {
 	c := &CredentialSummary{}
 	err := s.Scan(&c.CredentialID, &c.AuthMethod, &c.IdentityID, pq.Array(&c.Sources),
 		&c.RequestCount, &c.IntentCount, &c.UserCount, &c.AgentCount, &c.ToolCount,
-		&c.FirstUsedAt, &c.LastUsedAt)
+		&c.FirstUsedAt, &c.LastUsedAt,
+		&c.Status, &c.StatusReason, &c.StatusUpdatedBy, &c.StatusUpdatedAt)
 	return c, err
 }
 
-func (d *DB) CountCredentials() (int, error) {
+// CountCredentials counts the credentials seen in auth evidence; with status
+// not empty, only those with that status.
+func (d *DB) CountCredentials(status string) (int, error) {
 	var total int
-	err := d.conn.QueryRow(
-		`SELECT COUNT(DISTINCT credential_id) FROM auth_evidence WHERE COALESCE(credential_id, '') <> ''`,
+	err := d.conn.QueryRow(`
+		SELECT COUNT(*)
+		FROM (SELECT DISTINCT credential_id FROM auth_evidence WHERE COALESCE(credential_id, '') <> '') e
+		LEFT JOIN credentials cs ON cs.credential_id = e.credential_id
+		WHERE $1::text = '' OR COALESCE(cs.status, 'active') = $1::text`,
+		status,
 	).Scan(&total)
 	return total, err
 }
 
-// ListCredentials returns a page of every credential seen in auth evidence,
-// most recently used first.
-func (d *DB) ListCredentials(limit, offset int) ([]*CredentialSummary, error) {
+// ListCredentials returns a page of the credentials seen in auth evidence,
+// most recently used first; with status not empty, only those with that
+// status.
+func (d *DB) ListCredentials(status string, limit, offset int) ([]*CredentialSummary, error) {
 	rows, err := d.conn.Query(credentialUsesCTE+credentialSummarySelect+`
+		HAVING $2::text = '' OR COALESCE(cs.status, 'active') = $2::text
 		ORDER BY MAX(u.used_at) DESC NULLS LAST, u.credential_id
-		LIMIT $2 OFFSET $3`,
-		"", limit, offset,
+		LIMIT $3 OFFSET $4`,
+		"", status, limit, offset,
 	)
 	if err != nil {
 		return nil, err
@@ -3972,6 +4011,32 @@ func (d *DB) GetCredentialActors(id string) ([]*CredentialActor, error) {
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// CredentialObserved reports whether credential id appears in any auth evidence.
+func (d *DB) CredentialObserved(id string) (bool, error) {
+	var ok bool
+	err := d.conn.QueryRow(`SELECT EXISTS (SELECT 1 FROM auth_evidence WHERE credential_id = $1)`, id).Scan(&ok)
+	return ok, err
+}
+
+// SetCredentialStatus sets credential id's status, replacing any earlier one,
+// and returns what was stored. status must be in ValidCredentialStatuses.
+func (d *DB) SetCredentialStatus(id, status, reason, updatedBy string) (*CredentialStatus, error) {
+	cs := &CredentialStatus{}
+	err := d.conn.QueryRow(`
+		INSERT INTO credentials (credential_id, status, reason, updated_by, updated_at)
+		VALUES ($1, $2, $3, $4, NOW())
+		ON CONFLICT (credential_id) DO UPDATE SET
+			status = EXCLUDED.status, reason = EXCLUDED.reason,
+			updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at
+		RETURNING status, reason, updated_by, updated_at`,
+		id, status, reason, updatedBy,
+	).Scan(&cs.Status, &cs.StatusReason, &cs.StatusUpdatedBy, &cs.StatusUpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return cs, nil
 }
 
 // serverOutEvidence runs a query selecting (request_id, destination,

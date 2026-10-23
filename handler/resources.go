@@ -129,6 +129,7 @@ func (h *Handler) ResourceInfo(c *gin.Context) {
 			"credentialID": cr.CredentialID,
 			"authMethod":   cr.AuthMethod,
 			"intentCount":  cr.IntentCount,
+			"status":       cr.Status,
 		})
 	}
 

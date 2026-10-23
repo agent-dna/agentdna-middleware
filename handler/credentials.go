@@ -3,7 +3,9 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"net/http"
+	"strings"
 
 	"agentdna-ratelimit-auth/db"
 
@@ -35,20 +37,36 @@ func credentialSummaryJSON(c *db.CredentialSummary) gin.H {
 		"toolCount":    c.ToolCount,
 		"firstUsedAt":  timeOrNil(c.FirstUsedAt),
 		"lastUsedAt":   timeOrNil(c.LastUsedAt),
+		"status":       credentialStatusJSON(&c.CredentialStatus),
 	}
 }
 
-// CredentialsList handles GET /dashboard/v1/credentials-list?page=&pageSize=:
-// every credential seen in auth evidence, most recently used first.
+func credentialStatusJSON(cs *db.CredentialStatus) gin.H {
+	return gin.H{
+		"value":     cs.Status,
+		"reason":    cs.StatusReason,
+		"updatedBy": cs.StatusUpdatedBy,
+		"updatedAt": timeOrNil(cs.StatusUpdatedAt),
+	}
+}
+
+// CredentialsList handles GET /dashboard/v1/credentials-list?page=&pageSize=
+// &status=: every credential seen in auth evidence, most recently used first.
+// status (active, flagged, compromised) is optional and narrows the list.
 func (h *Handler) CredentialsList(c *gin.Context) {
+	status := c.Query("status")
+	if status != "" && !db.ValidCredentialStatuses[status] {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "status must be one of active, flagged, compromised"})
+		return
+	}
 	page, pageSize := listPage(c, "page", "pageSize")
 
-	total, err := h.db.CountCredentials()
+	total, err := h.db.CountCredentials(status)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count credentials: %v", err)})
 		return
 	}
-	credentials, err := h.db.ListCredentials(pageSize, (page-1)*pageSize)
+	credentials, err := h.db.ListCredentials(status, pageSize, (page-1)*pageSize)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch credentials: %v", err)})
 		return
@@ -129,4 +147,65 @@ func (h *Handler) CredentialInfo(c *gin.Context) {
 	data["tools"] = byType["tool"]
 	data["unknown"] = byType["unknown"]
 	c.JSON(http.StatusOK, Response{Status: true, Data: data})
+}
+
+const maxCredentialStatusReason = 1000
+
+// UpdateCredentialStatus handles POST /dashboard/v1/update-credential-status
+// {credentialID, status, reason}: sets a credential's status. Admins only.
+func (h *Handler) UpdateCredentialStatus(c *gin.Context) {
+	if !c.GetBool(CtxIsAdmin) {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
+		return
+	}
+
+	var req struct {
+		CredentialID string `json:"credentialID"`
+		Status       string `json:"status"`
+		Reason       string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid request body"})
+		return
+	}
+	req.CredentialID = strings.TrimSpace(req.CredentialID)
+	req.Reason = strings.TrimSpace(req.Reason)
+	if req.CredentialID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "credentialID is required"})
+		return
+	}
+	if !db.ValidCredentialStatuses[req.Status] {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "status must be one of active, flagged, compromised"})
+		return
+	}
+	if len(req.Reason) > maxCredentialStatusReason {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: fmt.Sprintf("reason must be at most %d characters", maxCredentialStatusReason)})
+		return
+	}
+
+	observed, err := h.db.CredentialObserved(req.CredentialID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to look up credential: %v", err)})
+		return
+	}
+	if !observed {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "credential not found"})
+		return
+	}
+
+	updatedBy := c.GetString(CtxEmail)
+	if updatedBy == "" {
+		updatedBy = c.GetString(CtxDID)
+	}
+	cs, err := h.db.SetCredentialStatus(req.CredentialID, req.Status, req.Reason, updatedBy)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to update credential status: %v", err)})
+		return
+	}
+	log.Printf("[credentials] status credential_id=%q status=%s by=%q reason=%q", req.CredentialID, cs.Status, updatedBy, cs.StatusReason)
+
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
+		"credentialID": req.CredentialID,
+		"status":       credentialStatusJSON(cs),
+	}})
 }

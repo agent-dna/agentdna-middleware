@@ -60,6 +60,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/resource-info", h.ResourceInfo)
 	dashboard.GET("/credentials-list", h.CredentialsList)
 	dashboard.GET("/credential-info", h.CredentialInfo)
+	dashboard.POST("/update-credential-status", h.UpdateCredentialStatus)
 	dashboard.POST("/update-intent-status", h.UpdateIntentStatus)
 	dashboard.GET("/intent-diagram", h.IntentDiagram)
 	dashboard.POST("/update-password", h.UpdatePassword)
