@@ -3638,6 +3638,146 @@ func (d *DB) BackfillResources() (int, error) {
 	return total, nil
 }
 
+// ResourceSummary is a resource with its counts.
+type ResourceSummary struct {
+	ID              string
+	Name            string
+	IntentCount     int
+	CredentialCount int
+}
+
+// ResourceIntent is one intent that reached a resource, with the credentials
+// it reached it with (empty when it went without one).
+type ResourceIntent struct {
+	IntentID       string
+	InitiatorDID   string
+	InitiatorName  string
+	Status         string
+	ReviewStatus   string
+	FlowType       string
+	ThreatDetected bool
+	StartedAt      sql.NullTime
+	CredentialIDs  []string
+}
+
+// ResourceCredential is one credential used against a resource, with the
+// number of intents it was used in.
+type ResourceCredential struct {
+	CredentialID string
+	AuthMethod   string
+	IntentCount  int
+}
+
+const resourceSummaryColumns = `
+	id, name, jsonb_array_length(intents),
+	(SELECT COUNT(*) FROM jsonb_object_keys(credentials))`
+
+func (d *DB) CountResources() (int, error) {
+	var total int
+	err := d.conn.QueryRow(`SELECT COUNT(*) FROM resources`).Scan(&total)
+	return total, err
+}
+
+// ListResources returns a page of resources, most-used first.
+func (d *DB) ListResources(limit, offset int) ([]*ResourceSummary, error) {
+	rows, err := d.conn.Query(`SELECT`+resourceSummaryColumns+`
+		FROM resources
+		ORDER BY jsonb_array_length(intents) DESC, id
+		LIMIT $1 OFFSET $2`,
+		limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*ResourceSummary{}
+	for rows.Next() {
+		r := &ResourceSummary{}
+		if err := rows.Scan(&r.ID, &r.Name, &r.IntentCount, &r.CredentialCount); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// GetResource returns resource id, or nil when there is none.
+func (d *DB) GetResource(id string) (*ResourceSummary, error) {
+	r := &ResourceSummary{}
+	err := d.conn.QueryRow(`SELECT`+resourceSummaryColumns+` FROM resources WHERE id = $1`, id).
+		Scan(&r.ID, &r.Name, &r.IntentCount, &r.CredentialCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// GetResourceIntents returns a page of the intents that reached resource id,
+// newest first. The total is GetResource's IntentCount. An intent missing
+// from new_intents is still listed, with only its id and credentials.
+func (d *DB) GetResourceIntents(id string, limit, offset int) ([]*ResourceIntent, error) {
+	rows, err := d.conn.Query(`
+		SELECT ri.intent_id, COALESCE(ni.initiator_did, ''), COALESCE(ni.initiator_name, ''),
+		       COALESCE(ni.status, ''), COALESCE(ni.review_status, 'Unreviewed'), COALESCE(ni.flow_type, ''),
+		       COALESCE(ni.threat_detected, 0) = 1, ni.started_at,
+		       ARRAY(SELECT c.key FROM jsonb_each(r.credentials) AS c
+		             WHERE COALESCE(c.value->'intents', '[]'::jsonb) @> jsonb_build_array(ri.intent_id)
+		             ORDER BY c.key)
+		FROM resources r
+		CROSS JOIN LATERAL jsonb_array_elements_text(r.intents) AS ri(intent_id)
+		LEFT JOIN new_intents ni ON ni.intent_id = ri.intent_id
+		WHERE r.id = $1
+		ORDER BY ni.started_at DESC NULLS LAST, ri.intent_id
+		LIMIT $2 OFFSET $3`,
+		id, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*ResourceIntent{}
+	for rows.Next() {
+		r := &ResourceIntent{}
+		if err := rows.Scan(&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.Status, &r.ReviewStatus,
+			&r.FlowType, &r.ThreatDetected, &r.StartedAt, pq.Array(&r.CredentialIDs)); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// GetResourceCredentials returns a page of the credentials used against
+// resource id, most-used first. The total is GetResource's CredentialCount.
+func (d *DB) GetResourceCredentials(id string, limit, offset int) ([]*ResourceCredential, error) {
+	rows, err := d.conn.Query(`
+		SELECT c.credential_id, COALESCE(c.info->>'authMethod', ''),
+		       jsonb_array_length(COALESCE(c.info->'intents', '[]'::jsonb)) AS intent_count
+		FROM resources r
+		CROSS JOIN LATERAL jsonb_each(r.credentials) AS c(credential_id, info)
+		WHERE r.id = $1
+		ORDER BY intent_count DESC, c.credential_id
+		LIMIT $2 OFFSET $3`,
+		id, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*ResourceCredential{}
+	for rows.Next() {
+		r := &ResourceCredential{}
+		if err := rows.Scan(&r.CredentialID, &r.AuthMethod, &r.IntentCount); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // serverOutEvidence runs a query selecting (request_id, destination,
 // credential_id, auth_method) from auth_evidence and returns the rows.
 func (d *DB) serverOutEvidence(query string, args ...any) ([]*AuthEvidenceRecord, error) {
