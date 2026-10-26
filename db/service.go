@@ -4013,6 +4013,94 @@ func (d *DB) GetCredentialActors(id string) ([]*CredentialActor, error) {
 	return out, rows.Err()
 }
 
+// PresentedCredential is one credential a user or agent presented, with
+// counts over that actor's own uses of it.
+type PresentedCredential struct {
+	CredentialID string
+	AuthMethod   string
+	Sources      []string
+	RequestCount int
+	IntentCount  int
+	FirstUsedAt  sql.NullTime
+	LastUsedAt   sql.NullTime
+	CredentialStatus
+}
+
+// Who presented a credential, as a filter on uses with the actor bound to $2.
+// Both use the same "presented by" rule as GetCredentialActors, so a
+// credential is listed for an actor exactly when that actor is among its
+// users or agents on /credential-info.
+const (
+	presentedByUser  = ` WHERE u.actor_did IN (SELECT user_did_set($2))` // any DID of the user holding $2
+	presentedByAgent = ` WHERE u.actor_did = $2`
+)
+
+func (d *DB) countCredentialsPresented(where, actorDID string) (int, error) {
+	var total int
+	err := d.conn.QueryRow(credentialUsesCTE+`
+		SELECT COUNT(DISTINCT u.credential_id) FROM uses u`+where,
+		"", actorDID,
+	).Scan(&total)
+	return total, err
+}
+
+// listCredentialsPresented returns a page of the credentials matching where,
+// most recently used first.
+func (d *DB) listCredentialsPresented(where, actorDID string, limit, offset int) ([]*PresentedCredential, error) {
+	rows, err := d.conn.Query(credentialUsesCTE+`
+		SELECT u.credential_id,
+		       COALESCE((array_agg(u.auth_method ORDER BY u.used_at DESC NULLS LAST))[1], ''),
+		       array_agg(DISTINCT u.source ORDER BY u.source),
+		       COUNT(DISTINCT u.request_id), COUNT(DISTINCT u.intent_id),
+		       MIN(u.used_at), MAX(u.used_at),
+		       COALESCE(cs.status, 'active'), COALESCE(cs.reason, ''), COALESCE(cs.updated_by, ''), cs.updated_at
+		FROM uses u
+		LEFT JOIN credentials cs ON cs.credential_id = u.credential_id`+where+`
+		GROUP BY u.credential_id, cs.status, cs.reason, cs.updated_by, cs.updated_at
+		ORDER BY MAX(u.used_at) DESC NULLS LAST, u.credential_id
+		LIMIT $3 OFFSET $4`,
+		"", actorDID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*PresentedCredential{}
+	for rows.Next() {
+		c := &PresentedCredential{}
+		if err := rows.Scan(&c.CredentialID, &c.AuthMethod, pq.Array(&c.Sources),
+			&c.RequestCount, &c.IntentCount, &c.FirstUsedAt, &c.LastUsedAt,
+			&c.Status, &c.StatusReason, &c.StatusUpdatedBy, &c.StatusUpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CountCredentialsByUser counts the credentials presented by any DID of the
+// user holding userDID.
+func (d *DB) CountCredentialsByUser(userDID string) (int, error) {
+	return d.countCredentialsPresented(presentedByUser, userDID)
+}
+
+// GetCredentialsByUser returns a page of the credentials presented by any DID
+// of the user holding userDID, most recently used first.
+func (d *DB) GetCredentialsByUser(userDID string, limit, offset int) ([]*PresentedCredential, error) {
+	return d.listCredentialsPresented(presentedByUser, userDID, limit, offset)
+}
+
+// CountCredentialsByAgent counts the credentials agentDID presented.
+func (d *DB) CountCredentialsByAgent(agentDID string) (int, error) {
+	return d.countCredentialsPresented(presentedByAgent, agentDID)
+}
+
+// GetCredentialsByAgent returns a page of the credentials agentDID presented,
+// most recently used first.
+func (d *DB) GetCredentialsByAgent(agentDID string, limit, offset int) ([]*PresentedCredential, error) {
+	return d.listCredentialsPresented(presentedByAgent, agentDID, limit, offset)
+}
+
 // CredentialObserved reports whether credential id appears in any auth evidence.
 func (d *DB) CredentialObserved(id string) (bool, error) {
 	var ok bool

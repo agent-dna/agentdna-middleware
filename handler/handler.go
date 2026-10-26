@@ -2384,6 +2384,20 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 		interactedApps = []string{}
 	}
 
+	// Credentials this agent presented: the same rule as the agents list on
+	// /credential-info, so the two pages agree.
+	credentialsPage, credentialsPageSize := listPage(c, "credentialsPage", "credentialsPageSize")
+	totalCredentials, err := h.db.CountCredentialsByAgent(agentDID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count agent credentials: %v", err)})
+		return
+	}
+	credentials, err := h.db.GetCredentialsByAgent(agentDID, credentialsPageSize, (credentialsPage-1)*credentialsPageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch agent credentials: %v", err)})
+		return
+	}
+
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
@@ -2400,6 +2414,7 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 			"revoked":           agent.Revoked,
 			"appsInteracted":    len(interactedApps),
 			"appsList":          interactedApps,
+			"credentials":       presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
 		},
 	})
 }
@@ -2676,6 +2691,8 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 	if p, err := strconv.Atoi(c.Query("appsPage")); err == nil && p > 0 {
 		appsPage = p
 	}
+	// Credentials page like /agent-info's, so one client component pages both.
+	credentialsPage, credentialsPageSize := listPage(c, "credentialsPage", "credentialsPageSize")
 
 	// Interactions
 	totalInteractions, _ := h.db.CountInteractionsByUser(userID, orgID)
@@ -2773,6 +2790,19 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 		})
 	}
 
+	// Credentials this user presented, from any of their DIDs: the same rule
+	// as the users list on /credential-info, so the two pages agree.
+	totalCredentials, err := h.db.CountCredentialsByUser(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("credentials: %v", err)})
+		return
+	}
+	credentials, err := h.db.GetCredentialsByUser(userID, credentialsPageSize, (credentialsPage-1)*credentialsPageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("credentials: %v", err)})
+		return
+	}
+
 	var lastActive interface{}
 	if user.LastActive != nil {
 		lastActive = user.LastActive.UTC().Format(time.RFC3339)
@@ -2830,6 +2860,7 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 				"pageSize":   pageSize,
 				"totalPages": (totalApps + pageSize - 1) / pageSize,
 			},
+			"credentials": presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
 		},
 	})
 }

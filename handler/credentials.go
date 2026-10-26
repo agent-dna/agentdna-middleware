@@ -41,6 +41,31 @@ func credentialSummaryJSON(c *db.CredentialSummary) gin.H {
 	}
 }
 
+// presentedCredentialsJSON renders a page of the credentials a user or agent
+// presented, in the section shape the account and agent pages use.
+func presentedCredentialsJSON(list []*db.PresentedCredential, total, page, pageSize int) gin.H {
+	items := make([]gin.H, 0, len(list))
+	for _, cr := range list {
+		sources := cr.Sources
+		if sources == nil {
+			sources = []string{}
+		}
+		items = append(items, gin.H{
+			"credentialID": cr.CredentialID,
+			"authMethod":   cr.AuthMethod,
+			"sources":      sources,
+			"requestCount": cr.RequestCount,
+			"intentCount":  cr.IntentCount,
+			"firstUsedAt":  timeOrNil(cr.FirstUsedAt),
+			"lastUsedAt":   timeOrNil(cr.LastUsedAt),
+			"status":       credentialStatusJSON(&cr.CredentialStatus),
+		})
+	}
+	data := pageInfo(total, page, pageSize)
+	data["list"] = items
+	return data
+}
+
 func credentialStatusJSON(cs *db.CredentialStatus) gin.H {
 	return gin.H{
 		"value":     cs.Status,
