@@ -1,12 +1,14 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
 
+	"agentdna-ratelimit-auth/db"
 	"agentdna-ratelimit-auth/email"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -16,14 +18,18 @@ import (
 func (h *Handler) userFromAPIKey(c *gin.Context) (*userFromAPIKeyResult, bool) {
 	apiKey := c.GetHeader("X-API-Key")
 	if apiKey == "" {
+		log.Printf("[userFromAPIKey] rejected — missing X-API-Key header path=%s", c.Request.URL.Path)
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "X-API-Key header is required"})
 		return nil, false
 	}
+	log.Printf("[userFromAPIKey] looking up api_key=%q path=%s", apiKey, c.Request.URL.Path)
 	user, err := h.db.GetOrgUserByAPIKey(apiKey)
 	if err != nil {
+		log.Printf("[userFromAPIKey] no user found for api_key=%q path=%s err=%v", apiKey, c.Request.URL.Path, err)
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid API key"})
 		return nil, false
 	}
+	log.Printf("[userFromAPIKey] resolved api_key=%q -> did=%q email=%q name=%q org_id=%q", apiKey, user.DID, user.Email, user.Name, user.OrganizationID)
 	return &userFromAPIKeyResult{
 		APIKey: apiKey,
 		OrgID:  user.OrganizationID,
@@ -41,8 +47,9 @@ type userFromAPIKeyResult struct {
 	Email  string
 }
 
-// CoreRegisterUser is called by the external server to set the DID for a user
-// identified by their API key.
+// CoreRegisterUser is called by the external server to add a DID to the user
+// identified by their API key. A user may hold several DIDs; the newest one
+// becomes their primary DID. A DID already held by another user returns 409.
 // POST /core/v1/register-user
 // Header: X-API-Key: <api_key>
 // Body:   {"user_id": "did:rubix:xyz"}
@@ -60,12 +67,35 @@ func (h *Handler) CoreRegisterUser(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.UpdateUserDIDByAPIKey(user.APIKey, req.UserID); err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to update user DID: %v", err)})
+	if err := h.db.AddUserDIDByAPIKey(user.APIKey, req.UserID); err != nil {
+		if errors.Is(err, db.ErrDIDTaken) {
+			c.JSON(http.StatusConflict, Response{Status: false, Message: "this DID is already registered to another user"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to add user DID: %v", err)})
 		return
 	}
 
 	c.JSON(http.StatusOK, Response{Status: true, Message: ""})
+}
+
+// CoreDIDByEmail resolves the DID linked to an org user's email. Called by the
+// Identity Binding Service during human login to bind a run to a DID. A missing
+// email, unknown user, or unlinked DID all return an empty did (fail closed) —
+// the caller denies when no DID comes back.
+// GET /core/v1/did-by-email?email=<email>
+func (h *Handler) CoreDIDByEmail(c *gin.Context) {
+	email := strings.TrimSpace(c.Query("email"))
+	if email == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email query parameter is required"})
+		return
+	}
+
+	did := ""
+	if u, err := h.db.GetOrgUserByEmail(email); err == nil && u.DID != "" && u.DID != "none" {
+		did = u.DID
+	}
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"did": did}})
 }
 
 // CoreRegisterAgent is called by the external server to create an agent
@@ -74,15 +104,21 @@ func (h *Handler) CoreRegisterUser(c *gin.Context) {
 // Header: X-API-Key: <api_key>
 // Body:   multipart/form-data — agent_name, agent_id, policy (file)
 func (h *Handler) CoreRegisterAgent(c *gin.Context) {
+	log.Printf("[CoreRegisterAgent] request received api_key=%q", c.GetHeader("X-API-Key"))
+
 	user, ok := h.userFromAPIKey(c)
 	if !ok {
+		log.Printf("[CoreRegisterAgent] aborting — could not resolve user from api_key")
 		return
 	}
+	log.Printf("[CoreRegisterAgent] resolved caller did=%q email=%q org_id=%q", user.DID, user.Email, user.OrgID)
 
 	agentName := c.PostForm("agent_name")
 	agentID := c.PostForm("agent_id")
+	log.Printf("[CoreRegisterAgent] form fields agent_name=%q agent_id=%q did=%q", agentName, agentID, user.DID)
 
 	if agentName == "" {
+		log.Printf("[CoreRegisterAgent] rejected — agent_name is required did=%q", user.DID)
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agent_name is required"})
 		return
 	}
@@ -96,23 +132,26 @@ func (h *Handler) CoreRegisterAgent(c *gin.Context) {
 			policy = string(raw)
 		}
 	}
-	
+	log.Printf("[CoreRegisterAgent] policy file present=%v bytes=%d did=%q", policy != "", len(policy), user.DID)
 
 	if agentID != "" {
 		if exists, err := h.db.ActiveRequestExistsForAgent(agentID); err != nil {
 			log.Printf("[CoreRegisterAgent] ActiveRequestExistsForAgent check failed agentID=%q err=%v", agentID, err)
 		} else if exists {
-			log.Printf("[CoreRegisterAgent] duplicate request blocked agentID=%q", agentID)
+			log.Printf("[CoreRegisterAgent] duplicate request blocked agentID=%q did=%q", agentID, user.DID)
 			c.JSON(http.StatusOK, Response{Status: true, Message: "duplicate id"})
 			return
 		}
 	}
 
 	requestID := uuid.New().String()
+	log.Printf("[CoreRegisterAgent] saving request request_id=%q type=deploy_agent creator_did=%q agent_id=%q agent_name=%q org_id=%q", requestID, user.DID, agentID, agentName, user.OrgID)
 	if err := h.db.CreateRequest(requestID, "deploy_agent", policy, user.DID, agentID, agentName, "", user.OrgID); err != nil {
+		log.Printf("[CoreRegisterAgent] failed to save request request_id=%q creator_did=%q err=%v", requestID, user.DID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to create request: %v", err)})
 		return
 	}
+	log.Printf("[CoreRegisterAgent] request saved request_id=%q creator_did=%q agent_name=%q", requestID, user.DID, agentName)
 
 	// Notify all admins in the org.
 	adminEmails, err := h.db.GetAllAdminEmailsByOrgID(user.OrgID)
@@ -132,3 +171,5 @@ func (h *Handler) CoreRegisterAgent(c *gin.Context) {
 
 	c.JSON(http.StatusOK, Response{Status: true, Message: ""})
 }
+
+

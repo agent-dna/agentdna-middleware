@@ -46,9 +46,6 @@ type authorizeActionRequest struct {
 //   - allow, no app_request supplied     -> 200, status:true, data.authorized:true
 //   - allow, app_request supplied        -> the App's status code and body are relayed verbatim
 func (h *Handler) AuthorizeAction(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	var req authorizeActionRequest
 	if err := c.ShouldBindJSON(&req); err != nil || req.AgentID == "" || req.ActionIntent == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agent_id and action_intent are required"})
@@ -119,7 +116,10 @@ func relayHeaders(c *gin.Context, header http.Header) {
 // callAuthorizeAction POSTs {agent_id, action_intent} to the admin server's
 // authorize-action endpoint and returns its (authorized, message) decision.
 func (h *Handler) callAuthorizeAction(agentID, actionIntent string, agentEnvelope *gin.H) (bool, string, error) {
-	endpoint := h.adminServiceURL + "agent-admin/v1/authorize-action"
+	endpoint, err := joinURL(h.adminServiceURL, "agent-admin", "v1", "authorize-action")
+	if err != nil {
+		return false, "", fmt.Errorf("callAuthorizeAction: %v", err)
+	}
 
 	b, err := json.Marshal(map[string]any{
 		"agent_id": agentID,

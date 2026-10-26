@@ -1,10 +1,13 @@
 package handler
 
-import "github.com/golang-jwt/jwt/v5"
+import (
+	"encoding/json"
+)
 
 type Response struct {
 	Status  bool   `json:"status"`
-	Data    any    `json:"data"`
+	Code    string `json:"code,omitempty"`
+	Data    any    `json:"data,omitempty"`
 	Message string `json:"message"`
 }
 
@@ -30,9 +33,11 @@ type FTInfo struct {
 }
 
 type NFTInfo struct {
-	NFTId string  `json:"nftId"`
-	Value float64 `json:"value"`
-	Data  string  `json:"data"`
+	NFTId       string  `json:"nftId"`
+	Value       float64 `json:"value"`
+	Data        string  `json:"data"`
+	ParentNFTId string  `json:"parentNFTId,omitempty"`
+	Initiator   string  `json:"initiator,omitempty"`
 }
 
 type SmartContractInfo struct {
@@ -62,22 +67,13 @@ type signatureRequest struct {
 // signatureResponse is the response body of POST /rubix/v1/signature. We extract the
 // transactionID and the first mintedNFTChildren[].childNFTId.
 type signatureResponse struct {
-	Status bool   `json:"status"`
+	Status bool `json:"status"`
 	Result struct {
 		MintedNFTChildren []struct {
 			ChildNFTId string `json:"childNFTId"`
 		} `json:"mintedNFTChildren"`
 		TransactionID string `json:"transactionID"`
 	} `json:"result"`
-}
-
-type JWTClaims struct {
-	DID    string `json:"did"`
-	Email  string `json:"email"`
-	OrgID  string `json:"org_id"`
-	NFTID  string `json:"nft_id"`
-	APIKey string `json:"api_key"`
-	jwt.RegisteredClaims
 }
 
 const (
@@ -113,7 +109,12 @@ type agentNFTMetadata struct {
 }
 
 // intentWorkflowData is the top-level structure for the intent_workflow format.
+// Id is the nft/content id (e.g. an IPFS CID) shared by every txn belonging to
+// the same logical intent — it's what intent_id is now derived from, replacing
+// the old scheme of a fresh random UUID rewritten to the on-chain transaction
+// id after /rubix/v1/signature confirmed.
 type intentWorkflowData struct {
+	Id       string            `json:"id"`
 	Type     string            `json:"type"`
 	Version  string            `json:"version"`
 	Remarks  string            `json:"remarks"`
@@ -121,63 +122,36 @@ type intentWorkflowData struct {
 	Envelope *workflowEnvelope `json:"envelope"`
 }
 
-type workflowActor struct {
-	ID       string         `json:"id"`
-	Name     string         `json:"name"`
-	Type     string         `json:"type"` // "human", "agent", "app"
-	Metadata map[string]any `json:"metadata"`
-}
-
-type workflowIssue struct {
-	Depth  int    `json:"depth"`
-	Reason string `json:"reason"`
-}
-
 type workflowEnvelope struct {
-	From           workflowActor     `json:"from_"`
-	To             workflowActor     `json:"to"`
-	Payload        string            `json:"payload"`
-	Epoch          int64             `json:"epoch"`
-	Metadata       map[string]any    `json:"metadata"`
-	Signature      string            `json:"signature"`
-	Issues         []workflowIssue   `json:"issues"`
-	ParentEnvelope *workflowEnvelope `json:"parent_envelope"`
+	From           string              `json:"from"`
+	To             string              `json:"to,omitempty"`
+	Payload        json.RawMessage     `json:"payload"`
+	Epoch          int64               `json:"epoch"`
+	Code           int                 `json:"status_code"`
+	RunID          string              `json:"run_id"`
+	Hash           string              `json:"hash"`
+	Signature      string              `json:"signature"`
+	ParentEnvelope []*workflowEnvelope `json:"parent_envelope"`
+
+	// raw is this envelope's exact bytes as received (including its nested
+	// parent_envelope chain), captured by UnmarshalJSON. Stored verbatim in
+	// new_interactions.raw_data; never re-encoded.
+	raw json.RawMessage
 }
 
-// chainNFTData is the top-level structure of an intent NFT using the chain spec.
-type chainNFTData struct {
-	Type         string            `json:"type"`
-	Comment      string            `json:"comment"`
-	Executor     string            `json:"executor"`
-	DID          string            `json:"did"`
-	Verification chainVerification `json:"verification"`
-	Chain        *chainBlock       `json:"chain"`
-}
-
-type chainVerification struct {
-	Status      string   `json:"status"`
-	ChainDepth  int      `json:"chain_depth"`
-	TrustIssues []string `json:"trust_issues"`
-}
-
-type chainBlock struct {
-	Agent        string               `json:"agent"`
-	Name         string               `json:"name"`
-	Direction    string               `json:"direction"`
-	Type         string               `json:"type"`
-	Envelope     chainEnvelope        `json:"envelope"`
-	Signature    string               `json:"signature"`
-	Verification chainBlockVerification `json:"verification"`
-}
-
-type chainEnvelope struct {
-	Payload     map[string]any `json:"payload"`
-	ParentBlock *chainBlock    `json:"parent_block,omitempty"`
-}
-
-type chainBlockVerification struct {
-	SignatureValid bool     `json:"signature_valid"`
-	TrustIssues   []string `json:"trust_issues"`
+// UnmarshalJSON decodes the envelope as usual and also keeps a copy of the
+// exact input bytes. Nested parent envelopes go through this too, so every
+// node in the DAG carries its own untouched raw bytes.
+func (e *workflowEnvelope) UnmarshalJSON(b []byte) error {
+	type plain workflowEnvelope // drops the method, avoiding recursion
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*e = workflowEnvelope(p)
+	// encoding/json may reuse b after we return, so copy it.
+	e.raw = append(json.RawMessage(nil), b...)
+	return nil
 }
 
 // interactionExtract holds one extracted hop from the chain.
@@ -190,4 +164,9 @@ type interactionExtract struct {
 	Direction string
 	Threat    bool
 	Message   string
+	Signature string
+	Hash      string
+	Epoch     int64
+	RawData   json.RawMessage
 }
+

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"html/template"
+	"net/url"
 	"os"
 	"time"
 )
@@ -176,6 +177,17 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// dashboardURL joins path onto APP_DASHBOARD_URL, falling back to the
+// production dashboard when the variable is unset or not a valid URL.
+func dashboardURL(path string) string {
+	const fallback = "https://dashboard.agentdna.io/"
+	if u, err := url.JoinPath(envOr("APP_DASHBOARD_URL", fallback), path); err == nil {
+		return u
+	}
+	u, _ := url.JoinPath(fallback, path)
+	return u
+}
+
 func render(t *template.Template, data any) (string, error) {
 	var buf bytes.Buffer
 	if err := t.Execute(&buf, data); err != nil {
@@ -197,7 +209,7 @@ func AgentCreationRequestNew(toEmail, agentName, requesterName, requestID string
 		AgentName:     agentName,
 		RequesterName: requesterName,
 		RequestID:     requestID,
-		DashboardURL:  envOr("APP_DASHBOARD_URL", "https://dashboard.agentdna.io/") + "requests",
+		DashboardURL:  dashboardURL("requests"),
 		Year:          time.Now().Year(),
 	}
 	html, err := render(agentRequestNewTmpl, data)

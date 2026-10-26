@@ -3,7 +3,7 @@
 Middleware for the AgentDNA platform. Sits in front of a Rubix blockchain node and does two things:
 
 1. **Proxy** — forwards all `/rubix/*` traffic to the Rubix node, and on the way intercepts NFT payloads to populate the dashboard database.
-2. **Dashboard API** — JWT-protected REST endpoints that serve the AgentDNA web UI (metrics, agents, interactions, intents, tools, requests).
+2. **Dashboard API** — session-protected REST endpoints that serve the AgentDNA web UI (metrics, agents, interactions, intents, tools, requests).
 
 ---
 
@@ -15,7 +15,7 @@ Middleware for the AgentDNA platform. Sits in front of a Rubix blockchain node a
 - [Database Tables](#database-tables)
 - [API Reference](#api-reference)
   - [Public Routes](#public-routes)
-  - [Dashboard — JWT Protected](#dashboard--jwt-protected)
+  - [Dashboard — Session Protected](#dashboard--session-protected)
   - [Rubix Proxy & NFT Ingestion](#rubix-proxy--nft-ingestion)
 - [NFT Payload Formats](#nft-payload-formats)
 
@@ -59,7 +59,10 @@ curl -s -X POST http://localhost:9000/create-admin \
 | `DATABASE_URL` | Yes | PostgreSQL DSN, e.g. `postgres://agentdna:agentdna@localhost:5433/agentdna?sslmode=disable` |
 | `RUBIX_NODE_URL` | Yes | Base URL of the Rubix blockchain node, e.g. `http://localhost:20000` |
 | `SERVER_PORT` | Yes | Port the middleware listens on, e.g. `9000` |
-| `JWT_SECRET` | Yes | Secret used to sign and verify JWT tokens |
+| `CORS_ALLOWED_ORIGINS` | Yes for a separately hosted dashboard | Comma-separated dashboard origins allowed to call the API with the session cookie, e.g. `https://app.agentdna.io,http://localhost:3000` |
+| `SESSION_COOKIE_SAMESITE` | No | `lax` (default), `strict`, or `none` — `none` only when dashboard and API are on different sites |
+| `SESSION_COOKIE_SECURE` | No | `true` (default); set `false` only for plain-http local development |
+| `SESSION_COOKIE_DOMAIN` | No | Optional cookie `Domain` attribute |
 | `AGENT_SERVICE_URL` | No | Base URL of the agent microservice |
 | `CREATE_AGENT_ENDPOINT` | No | Base URL for the create-agent endpoint, e.g. `http://localhost:8001/` |
 | `UPDATE_AGENT_ENDPOINT` | No | Base URL for the update-agent-policies endpoint, e.g. `http://localhost:8001/` |
@@ -68,7 +71,8 @@ Example `.env`:
 ```env
 DATABASE_URL=postgres://agentdna:agentdna@localhost:5433/agentdna?sslmode=disable
 SERVER_PORT=9000
-JWT_SECRET=agentdna-dev-secret-key-2025
+CORS_ALLOWED_ORIGINS=http://localhost:3000
+SESSION_COOKIE_SECURE=false
 RUBIX_NODE_URL=http://localhost:20000
 AGENT_SERVICE_URL=http://localhost:9000
 CREATE_AGENT_ENDPOINT=http://localhost:8001/
@@ -79,26 +83,21 @@ UPDATE_AGENT_ENDPOINT=http://localhost:8001/
 
 ## Authorization
 
-### JWT Auth
+### Session Auth
 
-All dashboard routes require a Bearer token:
+`POST /login` creates a server-side session and sets it as a cookie:
 ```
-Authorization: Bearer <token>
+Set-Cookie: agentdna_session=<random token>; Path=/; Max-Age=604800; HttpOnly; Secure; SameSite=Lax
 ```
+The browser sends the cookie back automatically on every dashboard call
+(`credentials: "include"`). There is no `Authorization` header and no token in
+any response body; the cookie is `HttpOnly`, so page scripts cannot read it.
 
-Tokens are issued by `POST /login` and expire after **7 days**.
-
-JWT payload:
-```json
-{
-  "did":      "user or admin DID",
-  "email":    "user@example.com",
-  "org_id":   "Test_Org",
-  "nft_id":   "user NFT ID (empty for admins)",
-  "api_key":  "uuid",
-  "is_admin": false
-}
-```
+- Sessions last **7 days**. Only the SHA-256 hash of the token is stored (`sessions` table).
+- On every request the middleware loads the account fresh from the DB, so a newly added DID or changed email applies immediately.
+- `GET /session` returns who is logged in; `POST /logout` ends this session; `POST /logout-all` ends every session of the account.
+- Changing the password (`/update-password`) ends every *other* session; resetting it (`/reset-password`) ends all of them.
+- State-changing requests from an `Origin` not in `CORS_ALLOWED_ORIGINS` (or the API's own origin) are rejected with `403` (CSRF guard).
 
 **Admin-only endpoints** return `403` if `is_admin` is `false`:
 - `POST /agent-creation-request-result-submit`
@@ -107,7 +106,7 @@ JWT payload:
 - `POST /agent-access-request-submit`
 - `POST /upload-agent-policy`
 
-**Org isolation** — every query is filtered to the `org_id` in the JWT. Users cannot access data from other organizations.
+**Org isolation** — every query is filtered to the server's `ORG_ID`. Users cannot access data from other organizations.
 
 ---
 
@@ -249,27 +248,21 @@ All endpoints return:
 #### `POST /login`
 **Body:**
 ```json
-{ "email": "admin@myorg.com", "password": "secret" }
+{ "email": "user@myorg.com", "password": "secret" }
 ```
-Tries org user first, falls back to admin. Returns a JWT token.
+Org users only. Sets the `agentdna_session` cookie (see [Session Auth](#session-auth)). Wrong credentials return `400` (not `401`).
 
-**Response (admin):**
-```json
-{
-  "status": true,
-  "data": {
-    "token": "<jwt>", "did": "...", "email": "...",
-    "org_id": "Test_Org", "api_key": "...", "is_admin": true
-  }
-}
-```
+#### `POST /admin-login`
+**Body:** `{ "username": "root", "password": "secret" }`
+
+Admins only. The middleware verifies the credentials with the admin server (`POST {ADMIN_SERVICE_URL}/agent-admin/v1/login`), maps the admin to `new_admins` (by the `did` claim of the admin server's token, else by `name`), and sets the same session cookie. The admin server's JWT never reaches the browser. Errors: `400` wrong credentials (admin server's message), `403` admin not in `new_admins`, `502`/`504` admin server unavailable / timed out.
 
 **Response (org user):**
 ```json
 {
   "status": true,
   "data": {
-    "token": "<jwt>", "did": "...", "email": "...",
+    "did": "...", "email": "...",
     "org_id": "Test_Org", "api_key": "...", "nft_id": "...",
     "is_admin": false, "agent_access_list": ["agent-did-1"]
   }
@@ -291,7 +284,21 @@ Registers a new org admin. Calls the agent service to provision a DID, then stor
 
 ---
 
-### Dashboard — JWT Protected
+### Dashboard — Session Protected
+
+All routes below need the `agentdna_session` cookie from `POST /login`; without a valid session they return `401`.
+
+#### `GET /session`
+Who is logged in. Use it on page load — the cookie itself is unreadable from JavaScript.
+```json
+{ "status": true, "data": { "did": "...", "email": "...", "org_id": "...", "is_admin": false, "expiresAt": "2026-10-15T05:55:05Z" } }
+```
+
+#### `POST /logout`
+Ends the current session and clears the cookie. `{ "status": true, "message": "logged out" }`
+
+#### `POST /logout-all`
+Ends every session of the account on every device. `{ "status": true, "data": { "sessionsEnded": 2 } }`
 
 #### `GET /home-metrics?page=<n>`
 Overview metrics + top agents (5 per page, by interaction volume).
