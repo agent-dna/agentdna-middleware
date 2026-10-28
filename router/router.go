@@ -22,10 +22,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	public.POST("/forgot-password", h.ForgotPassword)
 	public.POST("/reset-password", h.ResetPassword)
 	public.POST("/register-user", h.RegisterUser)
-	public.POST("/signup", h.Signup)
 
-	// public.POST("/create-admin", h.CreateAdmin)
-	// public.POST("/register-admin", h.RegisterAdminMiddleware)
 
 	// CBAC authorization gate — called by the agent runtime / SDK.
 	public.POST("/authorize-action", h.AuthorizeAction)

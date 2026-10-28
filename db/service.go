@@ -1178,7 +1178,11 @@ var ErrDIDTaken = errors.New("did already registered to another user")
 // makes it their primary DID (new_org_users.did). Previously held DIDs are
 // kept. Re-adding a DID the user already holds is a no-op apart from making
 // it primary; a DID held by another user fails with ErrDIDTaken.
-func (d *DB) AddUserDIDByAPIKey(apiKey, did string) error {
+//
+// beforeCommit, when non-nil, runs with the user's email after the local
+// writes succeed but before they are committed; an error from it rolls them
+// back, so an external registration and the local DID stay in step.
+func (d *DB) AddUserDIDByAPIKey(apiKey, did string, beforeCommit func(email string) error) error {
 	tx, err := d.conn.Begin()
 	if err != nil {
 		return err
@@ -1207,6 +1211,11 @@ func (d *DB) AddUserDIDByAPIKey(apiKey, did string) error {
 
 	if _, err := tx.Exec(`UPDATE new_org_users SET did = $1 WHERE email = $2`, did, email); err != nil {
 		return err
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(email); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -3296,6 +3305,93 @@ func (d *DB) GetAppsByUser(userDID, orgID string, limit, offset int) ([]*UserApp
 			return nil, err
 		}
 		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+// UserApplicationCredential describes one credential the user presented to a
+// destination while working in one of their intents.
+type UserApplicationCredential struct {
+	CredentialID string
+	AuthMethods  []string
+	Status       string
+	RequestCount int
+	IntentCount  int
+	FirstUsedAt  sql.NullTime
+	LastUsedAt   sql.NullTime
+}
+
+// UserApplicationAccess groups observed server destinations and credentials
+// used to reach them, limited to intents involving the user.
+type UserApplicationAccess struct {
+	ApplicationName string
+	IntentCount     int
+	IntentIDs       []string
+	Credentials     []UserApplicationCredential
+}
+
+func (d *DB) GetApplicationsAccessedByUser(userDID, orgID string) ([]*UserApplicationAccess, error) {
+	return d.getApplicationsAccessedByActor(userScopeIntentsCTE+`,
+		scoped_intents AS (SELECT intent_id FROM user_intents)`, userDID, orgID)
+}
+
+func (d *DB) GetApplicationsAccessedByAgent(agentDID, orgID string) ([]*UserApplicationAccess, error) {
+	return d.getApplicationsAccessedByActor(`WITH scoped_intents AS (
+			SELECT DISTINCT intent_id FROM new_interactions
+			WHERE initiator_did = $1 AND ($2 = '' OR organization_id = $2)
+		)`, agentDID, orgID)
+}
+
+func (d *DB) getApplicationsAccessedByActor(intentScopeCTE, actorDID, orgID string) ([]*UserApplicationAccess, error) {
+	rows, err := d.conn.Query(intentScopeCTE+`,
+		request_intents AS (
+			SELECT DISTINCT e.destination, e.credential_id, e.auth_method, e.request_id,
+			       i.intent_id, e.observed_at
+			FROM auth_evidence e
+			JOIN new_interactions i ON i.signature = e.request_id
+			JOIN scoped_intents si ON si.intent_id = i.intent_id
+			WHERE e.source = 'server_out' AND e.destination <> ''
+			  AND ($2 = '' OR i.organization_id = $2)
+		),
+		app_counts AS (
+			SELECT destination, COUNT(DISTINCT intent_id) AS intent_count,
+			       ARRAY_AGG(DISTINCT intent_id ORDER BY intent_id) AS intent_ids
+			FROM request_intents GROUP BY destination
+		)
+		SELECT r.destination, ac.intent_count, ac.intent_ids, r.credential_id,
+		       ARRAY_AGG(DISTINCT r.auth_method ORDER BY r.auth_method),
+		       COALESCE(cs.status, 'active'), COUNT(DISTINCT r.request_id),
+		       COUNT(DISTINCT r.intent_id), MIN(r.observed_at), MAX(r.observed_at)
+		FROM request_intents r
+		JOIN app_counts ac ON ac.destination = r.destination
+		LEFT JOIN credentials cs ON cs.credential_id = r.credential_id
+		WHERE r.credential_id <> ''
+		GROUP BY r.destination, ac.intent_count, ac.intent_ids, r.credential_id,
+		         cs.status
+		ORDER BY ac.intent_count DESC, r.destination, r.credential_id`, actorDID, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	byDestination := map[string]*UserApplicationAccess{}
+	var result []*UserApplicationAccess
+	for rows.Next() {
+		var destination string
+		app := &UserApplicationCredential{}
+		var intentCount int
+		var intentIDs []string
+		if err := rows.Scan(&destination, &intentCount, pq.Array(&intentIDs), &app.CredentialID, pq.Array(&app.AuthMethods),
+			&app.Status, &app.RequestCount, &app.IntentCount, &app.FirstUsedAt, &app.LastUsedAt); err != nil {
+			return nil, err
+		}
+		group := byDestination[destination]
+		if group == nil {
+			group = &UserApplicationAccess{ApplicationName: destination, IntentCount: intentCount, IntentIDs: intentIDs, Credentials: []UserApplicationCredential{}}
+			byDestination[destination] = group
+			result = append(result, group)
+		}
+		group.Credentials = append(group.Credentials, *app)
 	}
 	return result, rows.Err()
 }

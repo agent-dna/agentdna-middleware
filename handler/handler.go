@@ -1022,47 +1022,6 @@ func (h *Handler) Login(c *gin.Context) {
 	c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid credentials"})
 }
 
-func (h *Handler) Signup(c *gin.Context) {
-	var req struct {
-		DID      string `json:"did"`
-		Name     string `json:"name"`
-		Email    string `json:"email"`
-		Password string `json:"password"`
-		OrgID    string `json:"orgID"`
-		OTP      string `json:"otp"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || req.Password == "" || req.OrgID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email, password and orgID are required"})
-		return
-	}
-	if req.OTP == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "otp is required"})
-		return
-	}
-	if !h.verifyOTP(req.Email, req.OTP) {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid or expired OTP"})
-		return
-	}
-
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
-		return
-	}
-
-	if err := h.db.StoreOrgUser(req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register user: %v", err)})
-		return
-	}
-
-	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
-		"did":   req.DID,
-		"name":  req.Name,
-		"email": req.Email,
-		"orgID": req.OrgID,
-	}})
-}
-
 func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
 	var req struct {
 		DID   string `json:"did"`
@@ -2383,6 +2342,39 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 	if interactedApps == nil {
 		interactedApps = []string{}
 	}
+	applicationsAccessed, err := h.db.GetApplicationsAccessedByAgent(agentDID, orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch application access: %v", err)})
+		return
+	}
+	applicationAccessList := make([]gin.H, 0, len(applicationsAccessed))
+	for _, app := range applicationsAccessed {
+		credentialList := make([]gin.H, 0, len(app.Credentials))
+		for _, credential := range app.Credentials {
+			var firstUsedAt, lastUsedAt interface{}
+			if credential.FirstUsedAt.Valid {
+				firstUsedAt = credential.FirstUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			if credential.LastUsedAt.Valid {
+				lastUsedAt = credential.LastUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			credentialList = append(credentialList, gin.H{
+				"credentialID": credential.CredentialID,
+				"authMethods":  credential.AuthMethods,
+				"status":       credential.Status,
+				"requestCount": credential.RequestCount,
+				"intentCount":  credential.IntentCount,
+				"firstUsedAt":  firstUsedAt,
+				"lastUsedAt":   lastUsedAt,
+			})
+		}
+		applicationAccessList = append(applicationAccessList, gin.H{
+			"applicationName": app.ApplicationName,
+			"intentCount":     app.IntentCount,
+			"intentIDs":       app.IntentIDs,
+			"credentials":     credentialList,
+		})
+	}
 
 	// Credentials this agent presented: the same rule as the agents list on
 	// /credential-info, so the two pages agree.
@@ -2401,20 +2393,21 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"agentDID":          agent.AgentDID,
-			"agentName":         agent.AgentName,
-			"createdAt":         agent.CreatedAt,
-			"deployerDID":       agent.DeployerDID,
-			"deployerName":      deployerName,
-			"policy":            agent.Policy,
-			"orgID":             orgID,
-			"totalInteractions": agent.TotalInteractions,
-			"totalThreats":      agent.TotalThreats,
-			"score":             agent.Score,
-			"revoked":           agent.Revoked,
-			"appsInteracted":    len(interactedApps),
-			"appsList":          interactedApps,
-			"credentials":       presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
+			"agentDID":               agent.AgentDID,
+			"agentName":              agent.AgentName,
+			"createdAt":              agent.CreatedAt,
+			"deployerDID":            agent.DeployerDID,
+			"deployerName":           deployerName,
+			"policy":                 agent.Policy,
+			"orgID":                  orgID,
+			"totalInteractions":      agent.TotalInteractions,
+			"totalThreats":           agent.TotalThreats,
+			"score":                  agent.Score,
+			"revoked":                agent.Revoked,
+			"appsInteracted":         len(interactedApps),
+			"appsList":               interactedApps,
+			"applicationsInteracted": applicationAccessList,
+			"credentials":            presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
 		},
 	})
 }
@@ -2778,6 +2771,39 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("apps: %v", err)})
 		return
 	}
+	applicationsAccessed, err := h.db.GetApplicationsAccessedByUser(userID, orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("application access: %v", err)})
+		return
+	}
+	applicationAccessList := make([]gin.H, 0, len(applicationsAccessed))
+	for _, app := range applicationsAccessed {
+		credentialList := make([]gin.H, 0, len(app.Credentials))
+		for _, credential := range app.Credentials {
+			var firstUsedAt, lastUsedAt interface{}
+			if credential.FirstUsedAt.Valid {
+				firstUsedAt = credential.FirstUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			if credential.LastUsedAt.Valid {
+				lastUsedAt = credential.LastUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			credentialList = append(credentialList, gin.H{
+				"credentialID": credential.CredentialID,
+				"authMethods":  credential.AuthMethods,
+				"status":       credential.Status,
+				"requestCount": credential.RequestCount,
+				"intentCount":  credential.IntentCount,
+				"firstUsedAt":  firstUsedAt,
+				"lastUsedAt":   lastUsedAt,
+			})
+		}
+		applicationAccessList = append(applicationAccessList, gin.H{
+			"applicationName": app.ApplicationName,
+			"intentCount":     app.IntentCount,
+			"intentIDs":       app.IntentIDs,
+			"credentials":     credentialList,
+		})
+	}
 	appList := make([]gin.H, 0, len(apps))
 	for _, a := range apps {
 		appList = append(appList, gin.H{
@@ -2860,7 +2886,8 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 				"pageSize":   pageSize,
 				"totalPages": (totalApps + pageSize - 1) / pageSize,
 			},
-			"credentials": presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
+			"applicationsInteracted": applicationAccessList,
+			"credentials":            presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
 		},
 	})
 }
@@ -2964,6 +2991,48 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 		},
 	})
 }
+
+// callRegisterUser registers a user's DID, email and api_key with the admin
+// server. It fails when the admin server rejects the user (e.g. the email or
+// user ID is already registered there).
+func (h *Handler) callRegisterUser(userID, email, apiKey string) error {
+	endpoint, err := joinURL(h.adminServiceURL, "agent-admin", "v1", "users")
+	if err != nil {
+		return fmt.Errorf("callRegisterUser: %v", err)
+	}
+	log.Printf("[callRegisterUser] POST %s user_id=%q email=%q", endpoint, userID, email)
+
+	b, _ := json.Marshal(map[string]string{"user_id": userID, "email": email, "api_key": apiKey})
+	// adminHTTP's 10s timeout bounds how long the caller's DID transaction
+	// (and its user_dids advisory lock) stays open waiting on the admin server.
+	resp, err := adminHTTP.Post(endpoint, "application/json", bytes.NewReader(b))
+	if err != nil {
+		log.Printf("[callRegisterUser] http error: %v", err)
+		return fmt.Errorf("failed to reach admin server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	rawBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[callRegisterUser] status=%d body=%s", resp.StatusCode, string(rawBody))
+
+	var result struct {
+		Status  bool   `json:"status"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rawBody, &result); err != nil {
+		return fmt.Errorf("invalid response from admin server: %v", err)
+	}
+	if !result.Status {
+		return &adminRejectedError{message: result.Message}
+	}
+	return nil
+}
+
+// adminRejectedError carries the admin server's message when it answers
+// status=false, so callers can tell a rejection from a transport failure.
+type adminRejectedError struct{ message string }
+
+func (e *adminRejectedError) Error() string { return e.message }
 
 // callRegisterAdmin calls the external agent service to register an admin and get their DID.
 func (h *Handler) callRegisterAdmin(username, org, email, password string) (string, error) {
