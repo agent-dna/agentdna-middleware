@@ -2183,9 +2183,22 @@ func (h *Handler) AppRegistration(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "tool_name and tool_id are required"})
 		return
 	}
-	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, h.orgID); err != nil {
-		log.Printf("[AppRegistration] db error tool_id=%s err=%v", req.ToolID, err)
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to register app"})
+	// The admin server registration runs inside the local transaction, after the
+	// insert succeeds and before it commits, so the tool is only kept locally
+	// when the admin server accepted it too. A tool already stored locally is
+	// not re-sent to the admin server.
+	registerWithAdmin := func() error {
+		return h.callRegisterTool(req.ToolID, req.ToolName)
+	}
+	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, h.orgID, registerWithAdmin); err != nil {
+		var rejected *adminRejectedError
+		if errors.As(err, &rejected) {
+			log.Printf("[AppRegistration] admin server rejected tool_id=%s: %s", req.ToolID, rejected.message)
+			c.JSON(http.StatusConflict, Response{Status: false, Message: rejected.message})
+			return
+		}
+		log.Printf("[AppRegistration] error tool_id=%s err=%v", req.ToolID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register app: %v", err)})
 		return
 	}
 	log.Printf("[AppRegistration] registered app tool_id=%s tool_name=%s", req.ToolID, req.ToolName)
@@ -2996,24 +3009,42 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 // server. It fails when the admin server rejects the user (e.g. the email or
 // user ID is already registered there).
 func (h *Handler) callRegisterUser(userID, email, apiKey string) error {
-	endpoint, err := joinURL(h.adminServiceURL, "agent-admin", "v1", "users")
-	if err != nil {
-		return fmt.Errorf("callRegisterUser: %v", err)
-	}
-	log.Printf("[callRegisterUser] POST %s user_id=%q email=%q", endpoint, userID, email)
+	return h.postAdmin("callRegisterUser",
+		map[string]string{"user_id": userID, "email": email, "api_key": apiKey},
+		"agent-admin", "v1", "users")
+}
 
-	b, _ := json.Marshal(map[string]string{"user_id": userID, "email": email, "api_key": apiKey})
-	// adminHTTP's 10s timeout bounds how long the caller's DID transaction
-	// (and its user_dids advisory lock) stays open waiting on the admin server.
+// callRegisterTool registers a tool's DID and name with the admin server. It
+// fails when the admin server rejects the tool.
+func (h *Handler) callRegisterTool(toolID, toolName string) error {
+	return h.postAdmin("callRegisterTool",
+		map[string]string{"tool_id": toolID, "tool_name": toolName},
+		"agent-admin", "v1", "tools", "register")
+}
+
+// postAdmin POSTs payload as JSON to the admin server at path and expects a
+// {"status": bool, "message": string} reply. A status=false reply returns an
+// *adminRejectedError carrying the admin's message; anything else that goes
+// wrong (bad URL, transport error, timeout, non-JSON body) is a plain error.
+// Callers run it inside a DB transaction just before commit, so adminHTTP's
+// 10s timeout bounds how long that transaction (and its locks) stays open.
+func (h *Handler) postAdmin(tag string, payload map[string]string, path ...string) error {
+	endpoint, err := joinURL(h.adminServiceURL, path...)
+	if err != nil {
+		return fmt.Errorf("%s: %v", tag, err)
+	}
+	log.Printf("[%s] POST %s payload=%v", tag, endpoint, redactAPIKey(payload))
+
+	b, _ := json.Marshal(payload)
 	resp, err := adminHTTP.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
-		log.Printf("[callRegisterUser] http error: %v", err)
+		log.Printf("[%s] http error: %v", tag, err)
 		return fmt.Errorf("failed to reach admin server: %v", err)
 	}
 	defer resp.Body.Close()
 
 	rawBody, _ := io.ReadAll(resp.Body)
-	log.Printf("[callRegisterUser] status=%d body=%s", resp.StatusCode, string(rawBody))
+	log.Printf("[%s] status=%d body=%s", tag, resp.StatusCode, string(rawBody))
 
 	var result struct {
 		Status  bool   `json:"status"`
@@ -3026,6 +3057,19 @@ func (h *Handler) callRegisterUser(userID, email, apiKey string) error {
 		return &adminRejectedError{message: result.Message}
 	}
 	return nil
+}
+
+// redactAPIKey returns payload with any api_key value hidden, for logging.
+func redactAPIKey(payload map[string]string) map[string]string {
+	if _, ok := payload["api_key"]; !ok {
+		return payload
+	}
+	out := make(map[string]string, len(payload))
+	for k, v := range payload {
+		out[k] = v
+	}
+	out["api_key"] = "<redacted>"
+	return out
 }
 
 // adminRejectedError carries the admin server's message when it answers

@@ -2578,12 +2578,31 @@ func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*Inte
 	return result, nil
 }
 
-func (d *DB) StoreNewTool(did, name, orgID string) error {
-	_, err := d.conn.Exec(
+// StoreNewTool inserts a tool; a tool whose DID is already stored is left as is.
+//
+// beforeCommit, when non-nil, runs only when the row is newly inserted, after
+// the insert but before it is committed; an error from it rolls the insert
+// back, so an external registration and the local row stay in step.
+func (d *DB) StoreNewTool(did, name, orgID string, beforeCommit func() error) error {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(
 		`INSERT INTO new_tools (did, name, organization_id) VALUES ($1, $2, $3) ON CONFLICT (did) DO NOTHING`,
 		did, name, orgID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 1 && beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // AddAgentToToolList records that agentDID has contacted tool toolDID, adding
