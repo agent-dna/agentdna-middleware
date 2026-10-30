@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -30,7 +31,13 @@ import (
 type otpEntry struct {
 	code      string
 	expiresAt time.Time
+	issuedAt  time.Time
+	attempts  int // wrong guesses so far; the code is dropped at maxOTPAttempts
 }
+
+// maxOTPAttempts wrong guesses discard an OTP, so a 6-digit code cannot be
+// brute-forced within its lifetime.
+const maxOTPAttempts = 5
 
 const emailWorkers = 5
 const emailQueueSize = 100
@@ -170,21 +177,37 @@ func (h *Handler) SendOTP(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{Status: true, Message: "OTP sent to " + req.Email})
 }
 
-func (h *Handler) verifyOTP(emailAddr, code string) bool {
-	val, ok := h.otpStore.Load(emailAddr)
-	if !ok {
-		return false
+// verifyOTP checks code against the OTP stored under key and consumes it on a
+// match. A wrong code counts an attempt; the OTP is dropped once it expires or
+// reaches maxOTPAttempts. Updates are compare-and-swap, so concurrent guesses
+// can neither skip the attempt count nor use one code twice.
+func (h *Handler) verifyOTP(key, code string) bool {
+	for {
+		val, ok := h.otpStore.Load(key)
+		if !ok {
+			return false
+		}
+		entry := val.(otpEntry)
+		if time.Now().After(entry.expiresAt) {
+			h.otpStore.CompareAndDelete(key, entry)
+			return false
+		}
+		if subtle.ConstantTimeCompare([]byte(entry.code), []byte(code)) == 1 {
+			if h.otpStore.CompareAndDelete(key, entry) {
+				return true
+			}
+			continue // changed underneath us; re-check
+		}
+		next := entry
+		next.attempts++
+		if next.attempts >= maxOTPAttempts {
+			if h.otpStore.CompareAndDelete(key, entry) {
+				return false
+			}
+		} else if h.otpStore.CompareAndSwap(key, entry, next) {
+			return false
+		}
 	}
-	entry := val.(otpEntry)
-	if time.Now().After(entry.expiresAt) {
-		h.otpStore.Delete(emailAddr)
-		return false
-	}
-	if entry.code != code {
-		return false
-	}
-	h.otpStore.Delete(emailAddr)
-	return true
 }
 
 func (h *Handler) ForgotPassword(c *gin.Context) {
@@ -975,6 +998,20 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo, data *intentWorkflowData
 	return branch, nil
 }
 
+// userLoginData is the body a successful org-user login returns, shared by
+// password login (/login) and OTP login (/login/verify-otp).
+func userLoginData(user *db.OrgUserRecord) gin.H {
+	return gin.H{
+		"did":               user.DID,
+		"email":             user.Email,
+		"org_id":            user.OrganizationID,
+		"api_key":           user.APIKey,
+		"nft_id":            user.NFTID,
+		"is_admin":          false,
+		"agent_access_list": user.AgentAccessList,
+	}
+}
+
 func (h *Handler) Login(c *gin.Context) {
 	var req struct {
 		Email    string `json:"email"`
@@ -1000,18 +1037,7 @@ func (h *Handler) Login(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to create session"})
 			return
 		}
-		c.JSON(http.StatusOK, Response{
-			Status: true,
-			Data: gin.H{
-				"did":               user.DID,
-				"email":             user.Email,
-				"org_id":            user.OrganizationID,
-				"api_key":           user.APIKey,
-				"nft_id":            user.NFTID,
-				"is_admin":          false,
-				"agent_access_list": user.AgentAccessList,
-			},
-		})
+		c.JSON(http.StatusOK, Response{Status: true, Data: userLoginData(user)})
 		return
 	}
 
@@ -1020,47 +1046,6 @@ func (h *Handler) Login(c *gin.Context) {
 	// Wrong credentials are 400, not 401: the dashboard reads 401 as
 	// "session expired" and would hide this message.
 	c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid credentials"})
-}
-
-func (h *Handler) Signup(c *gin.Context) {
-	var req struct {
-		DID      string `json:"did"`
-		Name     string `json:"name"`
-		Email    string `json:"email"`
-		Password string `json:"password"`
-		OrgID    string `json:"orgID"`
-		OTP      string `json:"otp"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || req.Password == "" || req.OrgID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email, password and orgID are required"})
-		return
-	}
-	if req.OTP == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "otp is required"})
-		return
-	}
-	if !h.verifyOTP(req.Email, req.OTP) {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid or expired OTP"})
-		return
-	}
-
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
-		return
-	}
-
-	if err := h.db.StoreOrgUser(req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register user: %v", err)})
-		return
-	}
-
-	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
-		"did":   req.DID,
-		"name":  req.Name,
-		"email": req.Email,
-		"orgID": req.OrgID,
-	}})
 }
 
 func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
@@ -2224,9 +2209,22 @@ func (h *Handler) AppRegistration(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "tool_name and tool_id are required"})
 		return
 	}
-	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, h.orgID); err != nil {
-		log.Printf("[AppRegistration] db error tool_id=%s err=%v", req.ToolID, err)
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to register app"})
+	// The admin server registration runs inside the local transaction, after the
+	// insert succeeds and before it commits, so the tool is only kept locally
+	// when the admin server accepted it too. A tool already stored locally is
+	// not re-sent to the admin server.
+	registerWithAdmin := func() error {
+		return h.callRegisterTool(req.ToolID, req.ToolName)
+	}
+	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, h.orgID, registerWithAdmin); err != nil {
+		var rejected *adminRejectedError
+		if errors.As(err, &rejected) {
+			log.Printf("[AppRegistration] admin server rejected tool_id=%s: %s", req.ToolID, rejected.message)
+			c.JSON(http.StatusConflict, Response{Status: false, Message: rejected.message})
+			return
+		}
+		log.Printf("[AppRegistration] error tool_id=%s err=%v", req.ToolID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register app: %v", err)})
 		return
 	}
 	log.Printf("[AppRegistration] registered app tool_id=%s tool_name=%s", req.ToolID, req.ToolName)
@@ -2383,6 +2381,39 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 	if interactedApps == nil {
 		interactedApps = []string{}
 	}
+	applicationsAccessed, err := h.db.GetApplicationsAccessedByAgent(agentDID, orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch application access: %v", err)})
+		return
+	}
+	applicationAccessList := make([]gin.H, 0, len(applicationsAccessed))
+	for _, app := range applicationsAccessed {
+		credentialList := make([]gin.H, 0, len(app.Credentials))
+		for _, credential := range app.Credentials {
+			var firstUsedAt, lastUsedAt interface{}
+			if credential.FirstUsedAt.Valid {
+				firstUsedAt = credential.FirstUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			if credential.LastUsedAt.Valid {
+				lastUsedAt = credential.LastUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			credentialList = append(credentialList, gin.H{
+				"credentialID": credential.CredentialID,
+				"authMethods":  credential.AuthMethods,
+				"status":       credential.Status,
+				"requestCount": credential.RequestCount,
+				"intentCount":  credential.IntentCount,
+				"firstUsedAt":  firstUsedAt,
+				"lastUsedAt":   lastUsedAt,
+			})
+		}
+		applicationAccessList = append(applicationAccessList, gin.H{
+			"applicationName": app.ApplicationName,
+			"intentCount":     app.IntentCount,
+			"intentIDs":       app.IntentIDs,
+			"credentials":     credentialList,
+		})
+	}
 
 	// Credentials this agent presented: the same rule as the agents list on
 	// /credential-info, so the two pages agree.
@@ -2401,20 +2432,21 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"agentDID":          agent.AgentDID,
-			"agentName":         agent.AgentName,
-			"createdAt":         agent.CreatedAt,
-			"deployerDID":       agent.DeployerDID,
-			"deployerName":      deployerName,
-			"policy":            agent.Policy,
-			"orgID":             orgID,
-			"totalInteractions": agent.TotalInteractions,
-			"totalThreats":      agent.TotalThreats,
-			"score":             agent.Score,
-			"revoked":           agent.Revoked,
-			"appsInteracted":    len(interactedApps),
-			"appsList":          interactedApps,
-			"credentials":       presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
+			"agentDID":               agent.AgentDID,
+			"agentName":              agent.AgentName,
+			"createdAt":              agent.CreatedAt,
+			"deployerDID":            agent.DeployerDID,
+			"deployerName":           deployerName,
+			"policy":                 agent.Policy,
+			"orgID":                  orgID,
+			"totalInteractions":      agent.TotalInteractions,
+			"totalThreats":           agent.TotalThreats,
+			"score":                  agent.Score,
+			"revoked":                agent.Revoked,
+			"appsInteracted":         len(interactedApps),
+			"appsList":               interactedApps,
+			"applicationsInteracted": applicationAccessList,
+			"credentials":            presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
 		},
 	})
 }
@@ -2778,6 +2810,39 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("apps: %v", err)})
 		return
 	}
+	applicationsAccessed, err := h.db.GetApplicationsAccessedByUser(userID, orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("application access: %v", err)})
+		return
+	}
+	applicationAccessList := make([]gin.H, 0, len(applicationsAccessed))
+	for _, app := range applicationsAccessed {
+		credentialList := make([]gin.H, 0, len(app.Credentials))
+		for _, credential := range app.Credentials {
+			var firstUsedAt, lastUsedAt interface{}
+			if credential.FirstUsedAt.Valid {
+				firstUsedAt = credential.FirstUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			if credential.LastUsedAt.Valid {
+				lastUsedAt = credential.LastUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			credentialList = append(credentialList, gin.H{
+				"credentialID": credential.CredentialID,
+				"authMethods":  credential.AuthMethods,
+				"status":       credential.Status,
+				"requestCount": credential.RequestCount,
+				"intentCount":  credential.IntentCount,
+				"firstUsedAt":  firstUsedAt,
+				"lastUsedAt":   lastUsedAt,
+			})
+		}
+		applicationAccessList = append(applicationAccessList, gin.H{
+			"applicationName": app.ApplicationName,
+			"intentCount":     app.IntentCount,
+			"intentIDs":       app.IntentIDs,
+			"credentials":     credentialList,
+		})
+	}
 	appList := make([]gin.H, 0, len(apps))
 	for _, a := range apps {
 		appList = append(appList, gin.H{
@@ -2860,7 +2925,8 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 				"pageSize":   pageSize,
 				"totalPages": (totalApps + pageSize - 1) / pageSize,
 			},
-			"credentials": presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
+			"applicationsInteracted": applicationAccessList,
+			"credentials":            presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
 		},
 	})
 }
@@ -2964,6 +3030,79 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 		},
 	})
 }
+
+// callRegisterUser registers a user's DID, email and api_key with the admin
+// server. It fails when the admin server rejects the user (e.g. the email or
+// user ID is already registered there).
+func (h *Handler) callRegisterUser(userID, email, apiKey string) error {
+	return h.postAdmin("callRegisterUser",
+		map[string]string{"user_id": userID, "email": email, "api_key": apiKey},
+		"agent-admin", "v1", "users")
+}
+
+// callRegisterTool registers a tool's DID and name with the admin server. It
+// fails when the admin server rejects the tool.
+func (h *Handler) callRegisterTool(toolID, toolName string) error {
+	return h.postAdmin("callRegisterTool",
+		map[string]string{"tool_id": toolID, "tool_name": toolName},
+		"agent-admin", "v1", "tools", "register")
+}
+
+// postAdmin POSTs payload as JSON to the admin server at path and expects a
+// {"status": bool, "message": string} reply. A status=false reply returns an
+// *adminRejectedError carrying the admin's message; anything else that goes
+// wrong (bad URL, transport error, timeout, non-JSON body) is a plain error.
+// Callers run it inside a DB transaction just before commit, so adminHTTP's
+// 10s timeout bounds how long that transaction (and its locks) stays open.
+func (h *Handler) postAdmin(tag string, payload map[string]string, path ...string) error {
+	endpoint, err := joinURL(h.adminServiceURL, path...)
+	if err != nil {
+		return fmt.Errorf("%s: %v", tag, err)
+	}
+	log.Printf("[%s] POST %s payload=%v", tag, endpoint, redactAPIKey(payload))
+
+	b, _ := json.Marshal(payload)
+	resp, err := adminHTTP.Post(endpoint, "application/json", bytes.NewReader(b))
+	if err != nil {
+		log.Printf("[%s] http error: %v", tag, err)
+		return fmt.Errorf("failed to reach admin server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	rawBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[%s] status=%d body=%s", tag, resp.StatusCode, string(rawBody))
+
+	var result struct {
+		Status  bool   `json:"status"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rawBody, &result); err != nil {
+		return fmt.Errorf("invalid response from admin server: %v", err)
+	}
+	if !result.Status {
+		return &adminRejectedError{message: result.Message}
+	}
+	return nil
+}
+
+// redactAPIKey returns payload with any api_key value hidden, for logging.
+func redactAPIKey(payload map[string]string) map[string]string {
+	if _, ok := payload["api_key"]; !ok {
+		return payload
+	}
+	out := make(map[string]string, len(payload))
+	for k, v := range payload {
+		out[k] = v
+	}
+	out["api_key"] = "<redacted>"
+	return out
+}
+
+// adminRejectedError carries the admin server's message when it answers
+// status=false, so callers can tell a rejection from a transport failure.
+type adminRejectedError struct{ message string }
+
+func (e *adminRejectedError) Error() string { return e.message }
 
 // callRegisterAdmin calls the external agent service to register an admin and get their DID.
 func (h *Handler) callRegisterAdmin(username, org, email, password string) (string, error) {
