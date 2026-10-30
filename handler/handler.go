@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -30,7 +31,13 @@ import (
 type otpEntry struct {
 	code      string
 	expiresAt time.Time
+	issuedAt  time.Time
+	attempts  int // wrong guesses so far; the code is dropped at maxOTPAttempts
 }
+
+// maxOTPAttempts wrong guesses discard an OTP, so a 6-digit code cannot be
+// brute-forced within its lifetime.
+const maxOTPAttempts = 5
 
 const emailWorkers = 5
 const emailQueueSize = 100
@@ -170,21 +177,37 @@ func (h *Handler) SendOTP(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{Status: true, Message: "OTP sent to " + req.Email})
 }
 
-func (h *Handler) verifyOTP(emailAddr, code string) bool {
-	val, ok := h.otpStore.Load(emailAddr)
-	if !ok {
-		return false
+// verifyOTP checks code against the OTP stored under key and consumes it on a
+// match. A wrong code counts an attempt; the OTP is dropped once it expires or
+// reaches maxOTPAttempts. Updates are compare-and-swap, so concurrent guesses
+// can neither skip the attempt count nor use one code twice.
+func (h *Handler) verifyOTP(key, code string) bool {
+	for {
+		val, ok := h.otpStore.Load(key)
+		if !ok {
+			return false
+		}
+		entry := val.(otpEntry)
+		if time.Now().After(entry.expiresAt) {
+			h.otpStore.CompareAndDelete(key, entry)
+			return false
+		}
+		if subtle.ConstantTimeCompare([]byte(entry.code), []byte(code)) == 1 {
+			if h.otpStore.CompareAndDelete(key, entry) {
+				return true
+			}
+			continue // changed underneath us; re-check
+		}
+		next := entry
+		next.attempts++
+		if next.attempts >= maxOTPAttempts {
+			if h.otpStore.CompareAndDelete(key, entry) {
+				return false
+			}
+		} else if h.otpStore.CompareAndSwap(key, entry, next) {
+			return false
+		}
 	}
-	entry := val.(otpEntry)
-	if time.Now().After(entry.expiresAt) {
-		h.otpStore.Delete(emailAddr)
-		return false
-	}
-	if entry.code != code {
-		return false
-	}
-	h.otpStore.Delete(emailAddr)
-	return true
 }
 
 func (h *Handler) ForgotPassword(c *gin.Context) {
@@ -975,6 +998,20 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo, data *intentWorkflowData
 	return branch, nil
 }
 
+// userLoginData is the body a successful org-user login returns, shared by
+// password login (/login) and OTP login (/login/verify-otp).
+func userLoginData(user *db.OrgUserRecord) gin.H {
+	return gin.H{
+		"did":               user.DID,
+		"email":             user.Email,
+		"org_id":            user.OrganizationID,
+		"api_key":           user.APIKey,
+		"nft_id":            user.NFTID,
+		"is_admin":          false,
+		"agent_access_list": user.AgentAccessList,
+	}
+}
+
 func (h *Handler) Login(c *gin.Context) {
 	var req struct {
 		Email    string `json:"email"`
@@ -1000,18 +1037,7 @@ func (h *Handler) Login(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to create session"})
 			return
 		}
-		c.JSON(http.StatusOK, Response{
-			Status: true,
-			Data: gin.H{
-				"did":               user.DID,
-				"email":             user.Email,
-				"org_id":            user.OrganizationID,
-				"api_key":           user.APIKey,
-				"nft_id":            user.NFTID,
-				"is_admin":          false,
-				"agent_access_list": user.AgentAccessList,
-			},
-		})
+		c.JSON(http.StatusOK, Response{Status: true, Data: userLoginData(user)})
 		return
 	}
 

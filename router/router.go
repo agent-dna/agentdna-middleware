@@ -16,13 +16,14 @@ func Register(r *gin.Engine, h *handler.Handler) {
 
 	// Dashboard — public
 	public := r.Group("/dashboard/v1")
-	public.POST("/login", h.Login)            // org users
-	public.POST("/admin-login", h.AdminLogin) // admins, verified by the admin server
+	public.POST("/login", h.Login)                     // org users
+	public.POST("/login/send-otp", h.SendLoginOTP)     // org users, passwordless: email a code
+	public.POST("/login/verify-otp", h.VerifyLoginOTP) // org users, passwordless: code → session
+	public.POST("/admin-login", h.AdminLogin)          // admins, verified by the admin server
 	public.POST("/send-otp", h.SendOTP)
 	public.POST("/forgot-password", h.ForgotPassword)
 	public.POST("/reset-password", h.ResetPassword)
 	public.POST("/register-user", h.RegisterUser)
-
 
 	// CBAC authorization gate — called by the agent runtime / SDK.
 	public.POST("/authorize-action", h.AuthorizeAction)
