@@ -101,12 +101,17 @@ func (h *Handler)CoreRegisterUser(c *gin.Context) {
 			return
 		}
 		var rejected *adminRejectedError
+		if errors.As(err, &rejected) && alreadyHeld {
+			// A repeat registration of a DID this user already holds: the admin
+			// server has it from the first call, so treat the retry as success.
+			log.Printf("[CoreRegisterUser] DID already registered, treating as success user_id=%q email=%q admin_message=%q",
+				req.UserID, user.Email, rejected.message)
+			c.JSON(http.StatusOK, Response{Status: true, Message: "DID already registered"})
+			return
+		}
 		if errors.As(err, &rejected) {
 			reason := "new DID for a user with none"
-			switch {
-			case alreadyHeld:
-				reason = "same DID registered again (retry?)"
-			case len(existingDIDs) > 0:
+			if len(existingDIDs) > 0 {
 				reason = fmt.Sprintf("additional DID — user already has %d, admin server only accepts the first", len(existingDIDs))
 			}
 			log.Printf("[CoreRegisterUser] 409 admin server rejected user_id=%q email=%q reason=%q admin_message=%q",
