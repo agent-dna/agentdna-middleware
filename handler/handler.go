@@ -2351,6 +2351,58 @@ func (h *Handler) UnrevokeAgent(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{Status: true, Message: adminResp.Message})
 }
 
+// UpdateUserStatus revokes (is_active=false) or whitelists (is_active=true) a
+// user ID. User status lives only on the admin server, so nothing is written
+// locally.
+func (h *Handler) UpdateUserStatus(c *gin.Context) {
+	if !c.GetBool(CtxIsAdmin) {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
+		return
+	}
+
+	var req struct {
+		UserID   string `json:"user_id"`
+		IsActive *bool  `json:"is_active"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid request body"})
+		return
+	}
+	req.UserID = strings.TrimSpace(req.UserID)
+	if req.UserID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "user_id is required"})
+		return
+	}
+	if req.IsActive == nil {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "is_active is required"})
+		return
+	}
+
+	found, err := h.setAdminUserStatus(req.UserID, *req.IsActive)
+	if err != nil {
+		var rejected *adminRejectedError
+		if errors.As(err, &rejected) {
+			log.Printf("[UpdateUserStatus] admin server rejected user_id=%s is_active=%t: %s", req.UserID, *req.IsActive, rejected.message)
+			c.JSON(http.StatusBadRequest, Response{Status: false, Message: rejected.message})
+			return
+		}
+		log.Printf("[UpdateUserStatus] error user_id=%s err=%v", req.UserID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to update user status: %v", err)})
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "user not found on admin server"})
+		return
+	}
+
+	msg := "user revoked"
+	if *req.IsActive {
+		msg = "user whitelisted"
+	}
+	log.Printf("[UpdateUserStatus] user_id=%s is_active=%t", req.UserID, *req.IsActive)
+	c.JSON(http.StatusOK, Response{Status: true, Message: msg, Data: gin.H{"user_id": req.UserID, "is_active": *req.IsActive}})
+}
+
 func (h *Handler) AgentInfo(c *gin.Context) {
 	agentDID := c.Query("agentDID")
 	orgID := c.GetString(CtxOrgID)
@@ -2670,7 +2722,14 @@ func (h *Handler) UserInfo(c *gin.Context) {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "user not found"})
 		return
 	}
-	h.writeAccountInfo(c, orgID, userID, user)
+
+	// Revoked / whitelisted state lives on the admin server. If it can't be
+	// reached the profile still renders, with the user shown as not active.
+	status, err := h.adminUserStatus(userID)
+	if err != nil {
+		log.Printf("[UserInfo] admin user status user_id=%s err=%v", userID, err)
+	}
+	h.writeAccountInfo(c, orgID, userID, user, &status)
 }
 
 // AdminInfo is UserInfo for an admin, addressed by DID in the path. The
@@ -2694,13 +2753,14 @@ func (h *Handler) AdminInfo(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to load admin"})
 		return
 	}
-	h.writeAccountInfo(c, "", adminID, admin)
+	h.writeAccountInfo(c, "", adminID, admin, nil)
 }
 
 // writeAccountInfo renders an account's detail record plus its paginated
 // interactions, intents, threats, agents and apps. An empty orgID lists them
-// across every org.
-func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *db.UserInfoRecord) {
+// across every org. A non-nil status is the admin server's is_active for the
+// account and is reported as user.status.
+func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *db.UserInfoRecord, status *bool) {
 	const pageSize = 10
 
 	interactionsPage := 1
@@ -2873,23 +2933,28 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 		lastActive = user.LastActive.UTC().Format(time.RFC3339)
 	}
 
+	userData := gin.H{
+		"userID":              user.UserDID,
+		"dids":                user.DIDs,
+		"userName":            user.UserName,
+		"displayName":         user.DisplayName,
+		"createdAt":           user.CreatedAt.UTC().Format(time.RFC3339),
+		"lastActive":          lastActive,
+		"isActive":            user.IsActive,
+		"accessAgentCount":    user.AccessAgentCount,
+		"totalInteractions":   totalInteractions,
+		"totalThreats":        totalThreats,
+		"totalIntents":        totalIntents,
+		"totalAgentsDeployed": user.TotalAgentsOwned,
+	}
+	if status != nil {
+		userData["status"] = *status
+	}
+
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"user": gin.H{
-				"userID":              user.UserDID,
-				"dids":                user.DIDs,
-				"userName":            user.UserName,
-				"displayName":         user.DisplayName,
-				"createdAt":           user.CreatedAt.UTC().Format(time.RFC3339),
-				"lastActive":          lastActive,
-				"isActive":            user.IsActive,
-				"accessAgentCount":    user.AccessAgentCount,
-				"totalInteractions":   totalInteractions,
-				"totalThreats":        totalThreats,
-				"totalIntents":        totalIntents,
-				"totalAgentsDeployed": user.TotalAgentsOwned,
-			},
+			"user": userData,
 			"interactions": gin.H{
 				"list":       interactionList,
 				"total":      totalInteractions,
@@ -3046,6 +3111,76 @@ func (h *Handler) callRegisterTool(toolID, toolName string) error {
 	return h.postAdmin("callRegisterTool",
 		map[string]string{"tool_id": toolID, "tool_name": toolName},
 		"agent-admin", "v1", "tools", "register")
+}
+
+// adminUserStatus reports whether a user ID is active (whitelisted) on the
+// admin server. The admin server answers false for a user ID it doesn't know.
+func (h *Handler) adminUserStatus(userID string) (bool, error) {
+	var active bool
+	err := h.callAdmin("adminUserStatus", http.MethodGet, nil, &active,
+		"agent-admin", "v1", "users", userID, "status")
+	return active, err
+}
+
+// setAdminUserStatus whitelists (isActive=true) or revokes (isActive=false) a
+// user ID on the admin server. found is false when the admin server has no
+// such user ID.
+func (h *Handler) setAdminUserStatus(userID string, isActive bool) (found bool, err error) {
+	err = h.callAdmin("setAdminUserStatus", http.MethodPatch, map[string]bool{"is_active": isActive}, &found,
+		"agent-admin", "v1", "users", userID, "status")
+	return found, err
+}
+
+// callAdmin sends payload (nil for none) as JSON to the admin server at path
+// with method and expects a {"status": bool, "message": string, "data": any}
+// reply, decoding data into out when out is non-nil. Errors are reported as in
+// postAdmin.
+func (h *Handler) callAdmin(tag, method string, payload, out any, path ...string) error {
+	endpoint, err := joinURL(h.adminServiceURL, path...)
+	if err != nil {
+		return fmt.Errorf("%s: %v", tag, err)
+	}
+	log.Printf("[%s] %s %s payload=%v", tag, method, endpoint, payload)
+
+	var body io.Reader
+	if payload != nil {
+		b, _ := json.Marshal(payload)
+		body = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, endpoint, body)
+	if err != nil {
+		return fmt.Errorf("%s: %v", tag, err)
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := adminHTTP.Do(req)
+	if err != nil {
+		log.Printf("[%s] http error: %v", tag, err)
+		return fmt.Errorf("failed to reach admin server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	rawBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[%s] status=%d body=%s", tag, resp.StatusCode, string(rawBody))
+
+	var result struct {
+		Status  bool            `json:"status"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(rawBody, &result); err != nil {
+		return fmt.Errorf("invalid response from admin server: %v", err)
+	}
+	if !result.Status {
+		return &adminRejectedError{message: result.Message}
+	}
+	if out != nil && len(result.Data) > 0 && string(result.Data) != "null" {
+		if err := json.Unmarshal(result.Data, out); err != nil {
+			return fmt.Errorf("invalid data from admin server: %v", err)
+		}
+	}
+	return nil
 }
 
 // postAdmin POSTs payload as JSON to the admin server at path and expects a
