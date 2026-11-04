@@ -1,14 +1,20 @@
 package handler
 
 import (
+	"agentdna-ratelimit-auth/db"
+	"agentdna-ratelimit-auth/email"
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 	"io"
 	"log"
 	"math/big"
@@ -20,25 +26,18 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"agentdna-ratelimit-auth/db"
-	"agentdna-ratelimit-auth/email"
-	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
-	"golang.org/x/crypto/bcrypt"
 )
-
-func enableCors(w *http.ResponseWriter) {
-	(*w).Header().Set("Access-Control-Allow-Origin", "*")
-	(*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-	(*w).Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization")
-}
 
 type otpEntry struct {
 	code      string
 	expiresAt time.Time
+	issuedAt  time.Time
+	attempts  int // wrong guesses so far; the code is dropped at maxOTPAttempts
 }
+
+// maxOTPAttempts wrong guesses discard an OTP, so a 6-digit code cannot be
+// brute-forced within its lifetime.
+const maxOTPAttempts = 5
 
 const emailWorkers = 5
 const emailQueueSize = 100
@@ -54,19 +53,40 @@ const (
 type provenanceCtxKey string
 
 const (
-	// ctxIntentIDKey carries the intentID generated while handling a /tx intent
-	// workflow so the /tx response hook can attach provenance_req_id to those rows.
+	// ctxIntentIDKey carries the *branchWriteResult produced while handling a
+	// /tx intent workflow so the /tx response hook knows exactly which rows
+	// this call just inserted (or relabeled), for a possible rollback or for
+	// tracking under the /tx response's result.id.
 	ctxIntentIDKey provenanceCtxKey = "provenance_intent_id"
 	// ctxSignatureIDKey carries the id from a /signature request body so the
-	// /signature response hook knows which provenance rows to update.
+	// /signature response hook knows which pending branch to resolve.
 	ctxSignatureIDKey provenanceCtxKey = "provenance_signature_id"
 )
+
+// branchWriteResult is what handleIntentWorkflow produces for one txn: the
+// intent (nftId) it belongs to, and exactly which interaction rows this call
+// inserted or relabeled — the information needed to either track the txn
+// under its eventual /tx response id (for a possible /signature rollback) or
+// roll it back immediately if /tx itself reports failure.
+type branchWriteResult struct {
+	IntentID     string
+	InsertedIDs  []string
+	InsertedKeys []db.HopKey // the same hops by identity, which survives relabeling
+	Renamed      []db.RenamedInteractionID
+}
+
+// isEmpty reports whether this call inserted or relabeled nothing at all —
+// i.e. the txn was a fully duplicate replay of hops already stored for this
+// intent, so there's nothing to roll back or track.
+func (b *branchWriteResult) isEmpty() bool {
+	return b == nil || (len(b.InsertedIDs) == 0 && len(b.Renamed) == 0)
+}
 
 type Handler struct {
 	db                  *db.DB
 	proxy               *httputil.ReverseProxy
 	baseURL             *url.URL
-	jwtSecret           string
+	session             SessionConfig
 	orgID               string
 	adminServiceURL     string
 	cbacServiceURL      string
@@ -77,13 +97,13 @@ type Handler struct {
 	emailQueue          chan email.Message
 }
 
-func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
+func New(database *db.DB, backendURL *url.URL, session SessionConfig, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
 	h := &Handler{
 		db:                  database,
 		proxy:               proxy,
 		baseURL:             backendURL,
-		jwtSecret:           jwtSecret,
+		session:             session,
 		orgID:               orgID,
 		adminServiceURL:     adminServiceURL,
 		cbacServiceURL:      cbacServiceURL,
@@ -93,6 +113,7 @@ func New(database *db.DB, backendURL *url.URL, jwtSecret, orgID, adminServiceURL
 	}
 	// Capture blockchain transaction provenance from the upstream responses.
 	proxy.ModifyResponse = h.captureRubixResponse
+	proxy.ErrorHandler = h.proxyError
 	if cfg, err := email.LoadConfigFromEnv(); err == nil {
 		h.mailer = email.New(cfg)
 	} else {
@@ -156,21 +177,37 @@ func (h *Handler) SendOTP(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{Status: true, Message: "OTP sent to " + req.Email})
 }
 
-func (h *Handler) verifyOTP(emailAddr, code string) bool {
-	val, ok := h.otpStore.Load(emailAddr)
-	if !ok {
-		return false
+// verifyOTP checks code against the OTP stored under key and consumes it on a
+// match. A wrong code counts an attempt; the OTP is dropped once it expires or
+// reaches maxOTPAttempts. Updates are compare-and-swap, so concurrent guesses
+// can neither skip the attempt count nor use one code twice.
+func (h *Handler) verifyOTP(key, code string) bool {
+	for {
+		val, ok := h.otpStore.Load(key)
+		if !ok {
+			return false
+		}
+		entry := val.(otpEntry)
+		if time.Now().After(entry.expiresAt) {
+			h.otpStore.CompareAndDelete(key, entry)
+			return false
+		}
+		if subtle.ConstantTimeCompare([]byte(entry.code), []byte(code)) == 1 {
+			if h.otpStore.CompareAndDelete(key, entry) {
+				return true
+			}
+			continue // changed underneath us; re-check
+		}
+		next := entry
+		next.attempts++
+		if next.attempts >= maxOTPAttempts {
+			if h.otpStore.CompareAndDelete(key, entry) {
+				return false
+			}
+		} else if h.otpStore.CompareAndSwap(key, entry, next) {
+			return false
+		}
 	}
-	entry := val.(otpEntry)
-	if time.Now().After(entry.expiresAt) {
-		h.otpStore.Delete(emailAddr)
-		return false
-	}
-	if entry.code != code {
-		return false
-	}
-	h.otpStore.Delete(emailAddr)
-	return true
 }
 
 func (h *Handler) ForgotPassword(c *gin.Context) {
@@ -223,18 +260,30 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 		return
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
-		return
-	}
-
-	// Try user first, then admin.
-	if err := h.db.UpdateUserPassword(req.Email, string(hash)); err != nil {
-		if err := h.db.UpdateAdminPassword(req.Email, string(hash)); err != nil {
-			c.JSON(http.StatusNotFound, Response{Status: false, Message: "no account found with that email"})
+	// Try user first, then admin. Org user passwords are stored here; admin
+	// passwords live only on the admin server. A reset means the old password
+	// may be compromised, so every existing session of that account is ended.
+	if _, err := h.db.GetOrgUserByEmail(req.Email); err == nil {
+		hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
 			return
 		}
+		if err := h.db.UpdateUserPassword(req.Email, string(hash)); err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to update password"})
+			return
+		}
+		h.endOtherSessions(db.SessionAccountUser, req.Email, "")
+	} else if admin, err := h.db.GetAdminByEmail(req.Email); err == nil {
+		if code, err := h.setAdminServerPassword(admin.Name, req.NewPassword); err != nil {
+			log.Printf("[ResetPassword] admin server update failed email=%q err=%v", req.Email, err)
+			c.JSON(code, Response{Status: false, Message: err.Error()})
+			return
+		}
+		h.endOtherSessions(db.SessionAccountAdmin, admin.DID, "")
+	} else {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "no account found with that email"})
+		return
 	}
 
 	log.Printf("[ResetPassword] password updated for email=%q", req.Email)
@@ -255,39 +304,19 @@ func (h *Handler) UpdatePassword(c *gin.Context) {
 	}
 
 	email := c.GetString(CtxEmail)
-	isAdmin := c.GetBool(CtxIsAdmin)
+	isAdmin := c.GetString(CtxAccountType) == db.SessionAccountAdmin
 
 	if isAdmin {
-		admin, err := h.db.GetAdminByEmail(email)
+		// Admin passwords live on the admin server, addressed by username.
+		admin, err := h.db.GetAdminByDID(c.GetString(CtxAccountID))
 		if err != nil {
 			c.JSON(http.StatusNotFound, Response{Status: false, Message: "account not found"})
 			return
 		}
 
-		// Call admin server to update password there.
-		endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/update-password"
-		b, _ := json.Marshal(map[string]string{"username": admin.Name, "new_password": req.NewPassword})
-		resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
-		if err != nil {
-			log.Printf("[UpdatePassword] admin server http error email=%s err=%v", email, err)
-			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to reach admin server: %v", err)})
-			return
-		}
-		defer resp.Body.Close()
-
-		var adminResp struct {
-			Status  bool   `json:"status"`
-			Message string `json:"message"`
-		}
-		rawBody, _ := io.ReadAll(resp.Body)
-		if err := json.Unmarshal(rawBody, &adminResp); err != nil {
-			log.Printf("[UpdatePassword] failed to parse admin server response email=%s body=%s", email, string(rawBody))
-			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "invalid response from admin server"})
-			return
-		}
-		if !adminResp.Status {
-			log.Printf("[UpdatePassword] admin server rejected update email=%s message=%s", email, adminResp.Message)
-			c.JSON(http.StatusBadRequest, Response{Status: false, Message: adminResp.Message})
+		if code, err := h.setAdminServerPassword(admin.Name, req.NewPassword); err != nil {
+			log.Printf("[UpdatePassword] admin server update failed did=%s err=%v", admin.DID, err)
+			c.JSON(code, Response{Status: false, Message: err.Error()})
 			return
 		}
 
@@ -303,8 +332,45 @@ func (h *Handler) UpdatePassword(c *gin.Context) {
 		}
 	}
 
+	// Log out every other device; the session making this change stays.
+	h.endOtherSessions(c.GetString(CtxAccountType), c.GetString(CtxAccountID), c.GetString(CtxSessionHash))
+
 	log.Printf("[UpdatePassword] password updated email=%q isAdmin=%v", email, isAdmin)
 	c.JSON(http.StatusOK, Response{Status: true, Message: "password updated successfully"})
+}
+
+// setAdminServerPassword changes an admin's password on the admin server —
+// the only place admin passwords are kept — addressed by their admin server
+// username. On failure it returns the HTTP status to answer with and an error
+// whose message is safe to show the caller.
+func (h *Handler) setAdminServerPassword(username, newPassword string) (int, error) {
+	if username == "" {
+		// Rows made by scripts/add_admin.py get their username on first login.
+		return http.StatusConflict, errors.New("this admin has no admin server username yet; log in once, then try again")
+	}
+	endpoint, err := joinURL(h.adminServiceURL, "agent-admin", "v1", "update-password")
+	if err != nil {
+		return http.StatusBadGateway, fmt.Errorf("failed to reach admin server: %v", err)
+	}
+	b, _ := json.Marshal(map[string]string{"username": username, "new_password": newPassword})
+	resp, err := adminHTTP.Post(endpoint, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return http.StatusBadGateway, fmt.Errorf("failed to reach admin server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var adminResp struct {
+		Status  bool   `json:"status"`
+		Message string `json:"message"`
+	}
+	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err := json.Unmarshal(rawBody, &adminResp); err != nil {
+		return http.StatusBadGateway, errors.New("invalid response from admin server")
+	}
+	if !adminResp.Status {
+		return http.StatusBadRequest, errors.New(adminResp.Message)
+	}
+	return 0, nil
 }
 
 // sendMail enqueues an email for the worker pool. Never blocks the request path.
@@ -330,8 +396,6 @@ func (h *Handler) sendMail(msg email.Message, err error) {
 }
 
 func (h *Handler) Healthz(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
@@ -366,15 +430,47 @@ func (h *Handler) ProxyHandler(c *gin.Context) {
 				case NFTTypeAgent:
 					h.handleAgentNFT(nftInfo)
 				case NFTTypeIntent:
-					// Stash the generated intentID so the /tx response hook can attach
-					// provenance_req_id to the interaction rows we just inserted. Harmless
-					// on non-/tx paths — only captureTxResponse (path-gated) reads it.
-					intentID, wfErr := h.handleIntentWorkflow(nftInfo)
-					if wfErr == nil && intentID != "" {
-						log.Printf("[provenance] tx: captured intent_id=%s, stashing in context", intentID)
-						r = r.WithContext(context.WithValue(r.Context(), ctxIntentIDKey, intentID))
+					// Malformed intent txns are rejected here and never reach the
+					// Rubix node: every real txn carries data.id and signed envelopes.
+					data, err := parseIntentWorkflow(nftInfo.Data)
+					if err == nil {
+						err = validateIntentWorkflow(data)
+					}
+					if err != nil {
+						log.Printf("[NFT] rejected intent_workflow nft_id=%s: %v", nftInfo.NFTId, err)
+						c.AbortWithStatusJSON(http.StatusBadRequest, Response{Status: false, Message: "invalid intent_workflow transaction: " + err.Error()})
+						return
+					}
+					// Every actor must already be a registered user, agent or tool.
+					// Unknown ones are never created from a txn: the whole txn is
+					// rejected, nothing is stored and it never reaches the node.
+					unknown, err := h.db.UnregisteredDIDs(intentActorDIDs(data, nftInfo.Initiator))
+					if err != nil {
+						log.Printf("[NFT] rejected intent_workflow nft_id=%s: actor lookup failed: %v", nftInfo.NFTId, err)
+						c.AbortWithStatusJSON(http.StatusServiceUnavailable, Response{Status: false, Code: ErrCodeActorCheckFailed, Message: "could not verify the transaction's actors, try again"})
+						return
+					}
+					if len(unknown) > 0 {
+						log.Printf("[NFT] rejected intent_workflow nft_id=%s: unregistered actors %v", nftInfo.NFTId, unknown)
+						c.AbortWithStatusJSON(http.StatusForbidden, Response{
+							Status:  false,
+							Code:    ErrCodeUnregisteredActor,
+							Message: fmt.Sprintf("transaction rejected: %d actor(s) not registered as a user, agent or tool", len(unknown)),
+							Data:    gin.H{"unregisteredDIDs": unknown},
+						})
+						return
+					}
+					// Stash what this call wrote so the /tx response hook can either
+					// roll it back (status=false) or track it under the response's
+					// result.id for a possible /signature-time rollback. Harmless on
+					// non-/tx paths — only captureTxResponse (path-gated) reads it.
+					branch, wfErr := h.handleIntentWorkflow(nftInfo, data)
+					if wfErr == nil && branch != nil {
+						log.Printf("[provenance] tx: captured intent_id=%s inserted=%d renamed=%d, stashing in context",
+							branch.IntentID, len(branch.InsertedIDs), len(branch.Renamed))
+						r = r.WithContext(context.WithValue(r.Context(), ctxIntentIDKey, branch))
 					} else {
-						log.Printf("[provenance] tx: FAILED to capture intent_id wfErr=%v intentID=%q", wfErr, intentID)
+						log.Printf("[provenance] tx: FAILED to capture intent workflow wfErr=%v", wfErr)
 					}
 				}
 			}
@@ -423,54 +519,81 @@ func readAndRestoreBody(resp *http.Response) ([]byte, error) {
 	return body, nil
 }
 
-// captureTxResponse handles POST /rubix/v1/tx: it stores result.id as provenance_req_id
-// on the intent's interaction rows, or deletes those rows if the tx failed to initiate.
+// captureTxResponse handles POST /rubix/v1/tx: on success it records what this
+// call wrote under the response's result.id, so a later /signature failure can
+// find and roll it back; on failure (status=false) it rolls those rows back
+// immediately, since there will be no /signature call to do it later.
 func (h *Handler) captureTxResponse(resp *http.Response) {
-	intentID, _ := resp.Request.Context().Value(ctxIntentIDKey).(string)
-	if intentID == "" {
-		log.Printf("[provenance] tx: no intent_id in context, skipping (not an intent-workflow tx we're tracking)")
+	branch, _ := resp.Request.Context().Value(ctxIntentIDKey).(*branchWriteResult)
+	if branch == nil {
+		log.Printf("[provenance] tx: no branch result in context, skipping (not an intent-workflow tx we're tracking)")
 		return
 	}
+	intentID := branch.IntentID
 
+	// Only status=true with a result.id can ever be signed. Anything else —
+	// status=false, an HTTP error, a body that isn't JSON (e.g. an HTML error
+	// page), no result.id — means this txn will never be confirmed, so what it
+	// wrote is rolled back now instead of lingering as a finished workflow.
 	body, err := readAndRestoreBody(resp)
 	if err != nil {
-		log.Printf("[provenance] tx: read body failed intent_id=%s: %v", intentID, err)
+		h.rollbackTxBranch(branch, fmt.Sprintf("read body failed: %v", err))
 		return
 	}
-
 	var txResp txResponse
 	if err := json.Unmarshal(body, &txResp); err != nil {
-		log.Printf("[provenance] tx: parse failed intent_id=%s: %v", intentID, err)
+		h.rollbackTxBranch(branch, fmt.Sprintf("HTTP %d, body is not JSON: %v", resp.StatusCode, err))
 		return
 	}
-
-	// status=false → the transaction failed to initiate; remove the intent and
-	// interaction rows we inserted during request handling.
 	if !txResp.Status {
-		interactionsDeleted, intentsDeleted, err := h.db.DeleteInteractionsByIntent(intentID)
-		if err != nil {
-			log.Printf("[provenance] tx: delete failed intent_id=%s: %v", intentID, err)
-		} else {
-			log.Printf("[provenance] tx: status=false, rolled back intent_id=%s interactions_deleted=%d intents_deleted=%d",
-				intentID, interactionsDeleted, intentsDeleted)
-		}
+		h.rollbackTxBranch(branch, fmt.Sprintf("HTTP %d, status=false: %s", resp.StatusCode, txResp.Message))
 		return
 	}
-
 	if txResp.Result.ID == "" {
-		log.Printf("[provenance] tx: empty result.id intent_id=%s", intentID)
+		h.rollbackTxBranch(branch, fmt.Sprintf("HTTP %d, status=true but no result.id", resp.StatusCode))
 		return
 	}
-	log.Printf("[provenance] tx: updating provenance_req_id intent_id=%s req_id=%s", intentID, txResp.Result.ID)
-	if err := h.db.SetProvenanceReqID(intentID, txResp.Result.ID); err != nil {
-		log.Printf("[provenance] tx: set provenance_req_id failed intent_id=%s req_id=%s: %v", intentID, txResp.Result.ID, err)
+	if branch.isEmpty() {
+		log.Printf("[provenance] tx: intent_id=%s fully duplicate replay, not tracking req_id=%s", intentID, txResp.Result.ID)
 		return
 	}
-	log.Printf("[provenance] tx: provenance_req_id updated ok intent_id=%s req_id=%s", intentID, txResp.Result.ID)
+	if err := h.db.InsertPendingBranch(txResp.Result.ID, intentID, branch.InsertedIDs, branch.InsertedKeys, branch.Renamed); err != nil {
+		log.Printf("[provenance] tx: track pending branch failed intent_id=%s req_id=%s: %v", intentID, txResp.Result.ID, err)
+		return
+	}
+	log.Printf("[provenance] tx: pending branch tracked ok intent_id=%s req_id=%s", intentID, txResp.Result.ID)
 }
 
-// captureSignatureResponse handles POST /rubix/v1/signature: it writes transactionID
-// and the first childNFTId onto the rows previously tagged with provenance_req_id.
+// rollbackTxBranch removes what an intent txn wrote when its /tx call failed.
+func (h *Handler) rollbackTxBranch(branch *branchWriteResult, reason string) {
+	if branch.isEmpty() {
+		log.Printf("[provenance] tx: failed (%s) intent_id=%s but it was a fully duplicate replay — nothing to roll back", reason, branch.IntentID)
+		return
+	}
+	interactionsDeleted, intentsDeleted, err := h.db.RollbackBranch(branch.IntentID, branch.InsertedKeys, branch.InsertedIDs)
+	if err != nil {
+		log.Printf("[provenance] tx: failed (%s), rollback failed intent_id=%s: %v", reason, branch.IntentID, err)
+		return
+	}
+	log.Printf("[provenance] tx: failed (%s), rolled back intent_id=%s interactions_deleted=%d intents_deleted=%d",
+		reason, branch.IntentID, interactionsDeleted, intentsDeleted)
+}
+
+// proxyError answers a request the Rubix node never responded to (connection
+// refused or dropped). An intent txn's rows are rolled back first: with no
+// result.id it can never be signed.
+func (h *Handler) proxyError(w http.ResponseWriter, r *http.Request, err error) {
+	log.Printf("[proxy] %s %s: node error: %v", r.Method, r.URL.Path, err)
+	if branch, _ := r.Context().Value(ctxIntentIDKey).(*branchWriteResult); branch != nil && r.URL.Path == rubixTxPath {
+		h.rollbackTxBranch(branch, fmt.Sprintf("node unreachable: %v", err))
+	}
+	w.WriteHeader(http.StatusBadGateway)
+}
+
+// captureSignatureResponse handles POST /rubix/v1/signature: success just
+// stops tracking the txn (the rows were already correct from insert time —
+// intent_id is the nftId, not this txn's transactionID, so there's nothing to
+// rewrite); failure rolls back whatever this txn wrote.
 func (h *Handler) captureSignatureResponse(resp *http.Response) {
 	reqID, _ := resp.Request.Context().Value(ctxSignatureIDKey).(string)
 	if reqID == "" {
@@ -515,40 +638,43 @@ func (h *Handler) captureSignatureResponse(resp *http.Response) {
 		return
 	}
 
-	log.Printf("[provenance] signature: updating provenance_record req_id=%s transactionID=%s childNFTId=%s", reqID, transactionID, childNFTId)
-	rows, err := h.db.SetProvenanceRecord(reqID, transactionID, childNFTId)
-	if err != nil {
-		log.Printf("[provenance] signature: update failed req_id=%s: %v", reqID, err)
+	// Confirmed: stop tracking the txn. A pending row left behind would later
+	// be handed hops by other branches' rollbacks and never be resolved, so a
+	// transient DB error gets a couple of retries.
+	var err2 error
+	for attempt, wait := range []time.Duration{0, 50 * time.Millisecond, 250 * time.Millisecond} {
+		time.Sleep(wait)
+		if err2 = h.db.DeletePendingBranch(reqID); err2 == nil {
+			break
+		}
+		log.Printf("[provenance] signature: clearing pending branch failed req_id=%s attempt=%d: %v", reqID, attempt+1, err2)
+	}
+	if err2 != nil {
+		log.Printf("[provenance] signature: confirmed req_id=%s transactionID=%s but its pending_branches row could not be cleared and is left stale: %v", reqID, transactionID, err2)
 		return
 	}
-
-	if rows == 0 {
-		log.Printf("[provenance] signature: no rows matched provenance_req_id=%s (tx write pending?)", reqID)
-		return
-	}
-	log.Printf("[provenance] signature: provenance_record updated ok rows=%d req_id=%s transactionID=%s childNFTId=%s",
-		rows, reqID, transactionID, childNFTId)
+	log.Printf("[provenance] signature: confirmed ok req_id=%s transactionID=%s childNFTId=%s", reqID, transactionID, childNFTId)
 }
 
-// rollbackFailedProvenance deletes the interaction rows and their parent intent
-// tagged with reqID — called wherever /rubix/v1/signature makes it clear this txn
-// will never get a provenance_record_id, so nothing lingers looking like a normal,
-// successfully-provenanced intent/interaction.
+// rollbackFailedProvenance rolls back exactly the rows tracked under reqID —
+// called wherever /rubix/v1/signature makes it clear this txn will never be
+// confirmed, so nothing lingers looking like a normal, successful branch.
 func (h *Handler) rollbackFailedProvenance(reqID, reason string) {
-	interactionsDeleted, intentsDeleted, err := h.db.DeleteInteractionsByProvenanceReqID(reqID)
+	interactionsDeleted, intentsDeleted, found, err := h.db.RollbackPendingBranch(reqID)
 	if err != nil {
 		log.Printf("[provenance] signature: rollback failed req_id=%s reason=%q: %v", reqID, reason, err)
 		return
 	}
+	if !found {
+		// Nothing was ever tracked under this reqID — either the /tx hook never
+		// ran for it, or this rollback fired twice (DeletePendingBranch/
+		// RollbackPendingBranch already removed the row the first time).
+		log.Printf("[provenance] signature: WARNING rollback req_id=%s matched no pending branch — nothing was tracked under this req_id", reqID)
+		return
+	}
 	log.Printf("[provenance] signature: rollback complete req_id=%s reason=%q interactions_deleted=%d intents_deleted=%d",
 		reqID, reason, interactionsDeleted, intentsDeleted)
-	if interactionsDeleted == 0 && intentsDeleted == 0 {
-		// Nothing matched provenance_req_id at all — either SetProvenanceReqID never ran
-		// for this reqID (the /tx hook missed it), or this rollback fired twice.
-		log.Printf("[provenance] signature: WARNING rollback req_id=%s matched 0 rows in both tables — nothing was tagged with this provenance_req_id, so the intent/interactions (if any) are still sitting there untouched", reqID)
-	}
 }
-
 
 func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 	log.Printf("[agentNFT] received nft_id=%s", nftInfo.NFTId)
@@ -572,20 +698,17 @@ func (h *Handler) handleAgentNFT(nftInfo NFTInfo) error {
 	return h.db.UpsertAgentFromNFT(nftInfo.NFTId, data.AgentDID, deployer, orgID, data.Policy, agentName)
 }
 
-// handleIntentWorkflow stores the intent-workflow interactions and returns the
-// generated intentID so the caller can correlate the /tx response for provenance.
-func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
-	data, err := parseIntentWorkflow(nftInfo.Data)
-	if err != nil {
-		log.Printf("[intentWorkflow] failed to parse nft_id=%s: %v", nftInfo.NFTId, err)
-		return "", err
-	}
-	if data.Envelope == nil {
-		log.Printf("[intentWorkflow] envelope is nil nft_id=%s", nftInfo.NFTId)
-		return "", fmt.Errorf("handleIntentWorkflow: envelope is nil")
-	}
-
-	intentID := uuid.New().String()
+// handleIntentWorkflow stores the intent-workflow interactions and returns
+// what this call wrote (intent id plus inserted/relabeled interaction ids) so
+// the caller can correlate the /tx response for provenance and roll back
+// precisely this call's contribution if the txn ultimately fails.
+// data must already have passed validateIntentWorkflow (non-empty id, every
+// envelope signed).
+func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo, data *intentWorkflowData) (*branchWriteResult, error) {
+	// intent_id is the workflow's nft/content id (data.id) — the same value
+	// across every txn belonging to this logical intent, including ones that
+	// share a common hop prefix and then branch.
+	intentID := data.Id
 	orgID := h.orgID
 
 	// All envelope nodes sorted oldest→newest.
@@ -622,57 +745,26 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 		executor = initiatorDID
 	}
 
-	// Build child map: parent node → its children (envelopes that list it as parent).
-	// Used to derive the "to" of each node.
-	childMap := map[*workflowEnvelope][]*workflowEnvelope{}
-	visitedCM := map[*workflowEnvelope]bool{}
-	var buildChildMap func(e *workflowEnvelope)
-	buildChildMap = func(e *workflowEnvelope) {
-		if e == nil || visitedCM[e] {
-			return
-		}
-		visitedCM[e] = true
-		for _, p := range e.ParentEnvelope {
-			childMap[p] = append(childMap[p], e)
-			buildChildMap(p)
-		}
-	}
-	buildChildMap(data.Envelope)
-
-	// ── Store one raw block row per envelope node ─────────────────────────────
+	// ── Store a threat row per threat-signalling envelope ─────────────────────
 	hashToThreatID := map[string]string{} // envelope hash → threat ID, for linking interactions
+	// Guard/CBAC envelopes carry an interaction hash as their payload, not
+	// text; their hops show the resolved reason instead (keyed by signature,
+	// which every envelope has).
+	guardMessageBySig := map[string]string{}
 	for idx, env := range allEnvelopes {
-		// Derive to: first child's From, or initiatorDID for root if different.
-		var toDID string
-		if children := childMap[env]; len(children) > 0 {
-			toDID = children[0].From
-		} else if env.From != initiatorDID {
-			toDID = initiatorDID
-		}
-
-		rawJSON, _ := json.Marshal(env)
 		msg := extractPayloadText(env.Payload)
 		threat := env.Code != 0 && env.Code != 1000
 
-		blockID := fmt.Sprintf("%s-block-%d", intentID, idx)
-		blockRec := &db.IntentBlockRecord{
-			ID:             blockID,
-			IntentID:       intentID,
-			BlockIndex:     idx,
-			AgentDID:       env.From,
-			AgentName:      h.resolveActorName(env.From, ""),
-			Message:        msg,
-			Signature:      env.Signature,
-			ThreatDetected: threat,
-			TrustIssues:    []string{},
-			CreatedAt:      time.Unix(env.Epoch, 0).UTC(),
-			FromDID:        env.From,
-			ToDID:          toDID,
-			RawData:        json.RawMessage(rawJSON),
+		// threats.interaction_id is keyed by the envelope's own hash rather
+		// than idx: idx is only this call's local position in its own DAG
+		// walk, and since intent_id is shared across every txn/branch of one
+		// nftId, two different txns' envelopes can land on the same idx. A
+		// hash-based id is stable and collision-free across calls.
+		blockIDSuffix := env.Hash
+		if blockIDSuffix == "" {
+			blockIDSuffix = fmt.Sprintf("idx%d", idx)
 		}
-		if err := h.db.StoreIntentBlockData(blockRec); err != nil {
-			log.Printf("[intentWorkflow] block data save error idx=%d: %v", idx, err)
-		}
+		blockID := fmt.Sprintf("%s-block-%s", intentID, blockIDSuffix)
 
 		// If this envelope signals a threat, resolve the message and store it.
 		if threat {
@@ -702,13 +794,33 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 					threatMsg = rec.Title
 				}
 			}
-			threatID := fmt.Sprintf("%s-threat-%d", intentID, idx)
-			if err := h.db.StoreThreat(threatID, intentID, blockID, env.Code, threatMsg, time.Unix(env.Epoch, 0).UTC()); err != nil {
-				log.Printf("[intentWorkflow] StoreThreat idx=%d code=%d: %v", idx, env.Code, err)
+			if cbacGuardCodes[env.Code] {
+				if threatMsg == "" {
+					threatMsg = fmt.Sprintf("Threat code %d", env.Code)
+				}
+				guardMessageBySig[env.Signature] = threatMsg
+			}
+			// The DAG can legitimately contain two distinct envelope objects that
+			// carry the same hash (e.g. the same signed message reachable via two
+			// converging branches) — collectAllEnvelopes only dedupes by pointer
+			// identity, not content. Downstream, extractInteractionsFromEnvelopes'
+			// hash-based dedup collapses those into a single interaction, which
+			// then links to only one threatID. Without this guard, the earlier
+			// duplicate's threat row is stored too but never referenced by any
+			// interaction — an orphaned row that inflates threat-count queries
+			// that scan the threats table directly instead of joining through
+			// new_interactions (e.g. GetTopThreats).
+			if env.Hash != "" && hashToThreatID[env.Hash] != "" {
+				log.Printf("[intentWorkflow] skipping duplicate threat idx=%d code=%d hash=%s (already recorded)", idx, env.Code, env.Hash)
 			} else {
-				log.Printf("[intentWorkflow] threat stored idx=%d code=%d msg=%q", idx, env.Code, threatMsg)
-				if env.Hash != "" {
-					hashToThreatID[env.Hash] = threatID
+				threatID := fmt.Sprintf("%s-threat-%s", intentID, blockIDSuffix)
+				if err := h.db.StoreThreat(threatID, intentID, blockID, env.Code, threatMsg, time.Unix(env.Epoch, 0).UTC()); err != nil {
+					log.Printf("[intentWorkflow] StoreThreat idx=%d code=%d: %v", idx, env.Code, err)
+				} else {
+					log.Printf("[intentWorkflow] threat stored idx=%d code=%d msg=%q", idx, env.Code, threatMsg)
+					if env.Hash != "" {
+						hashToThreatID[env.Hash] = threatID
+					}
 				}
 			}
 		}
@@ -717,20 +829,28 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	// ── Extract interactions from DAG edges ──────────────────────────────────
 	rawInteractions := extractInteractionsFromEnvelopes(data.Envelope, initiatorDID, executor)
 
-	// Deduplicate: drop only when hash + from + to are all identical.
-	type dedupKey struct{ hash, from, to string }
+	// Deduplicate: drop only when signature + to are identical — the same
+	// hop identity resolveBranchIDs matches on.
+	type dedupKey struct{ signature, to string }
 	seenKey := map[dedupKey]bool{}
 	interactions := rawInteractions[:0]
 	for _, ix := range rawInteractions {
-		k := dedupKey{ix.Hash, ix.FromDID, ix.ToDID}
-		if ix.Hash != "" && seenKey[k] {
-			log.Printf("[intentWorkflow] dropping duplicate hash=%s from=%s to=%s", ix.Hash, ix.FromDID, ix.ToDID)
+		k := dedupKey{ix.Signature, ix.ToDID}
+		if ix.Signature != "" && seenKey[k] {
+			log.Printf("[intentWorkflow] dropping duplicate signature=%s from=%s to=%s", ix.Signature, ix.FromDID, ix.ToDID)
 			continue
 		}
-		if ix.Hash != "" {
+		if ix.Signature != "" {
 			seenKey[k] = true
 		}
 		interactions = append(interactions, ix)
+	}
+
+	// Guard hops display the resolved reason, never the raw hash payload.
+	for i, ix := range interactions {
+		if msg, ok := guardMessageBySig[ix.Signature]; ok {
+			interactions[i].Message = msg
+		}
 	}
 
 	// Resolve display names.
@@ -742,177 +862,157 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo) (string, error) {
 	log.Printf("[intentWorkflow] parsed ok — dag_envelopes=%d interactions=%d initiator=%s intentID=%s orgID=%s",
 		len(allEnvelopes), len(interactions), initiatorDID, intentID, orgID)
 
-	// ── Ensure actors exist in the correct tables ────────────────────────────
-	seenDIDs := map[string]bool{}
-	for _, ix := range interactions {
-		for _, did := range []string{ix.FromDID, ix.ToDID} {
-			if did == "" || seenDIDs[did] {
-				continue
+	// ── Work out what's actually new in this txn ─────────────────────────────
+	// intent_id is now shared across every txn/branch of one nftId, so a
+	// second (or later) txn for the same intent may repeat a shared hop
+	// prefix verbatim before diverging — resolveBranchIDs compares this txn's
+	// hop sequence against what's already stored and decides: nothing new
+	// (fully duplicate replay), a plain trunk extension, or a genuine fork
+	// (optionally relabeling the existing trunk tail into branch "a" the
+	// first time a fork is discovered at a given position).
+	//
+	// Everything from reading the existing hops through saving the intent row
+	// runs in one transaction holding this intent's advisory lock. Without it,
+	// two txns of the same nftId arriving close together (parallel agent
+	// branches) both read "no hops yet", both mint "<id>-1..N", and the
+	// second's rows are silently dropped by ON CONFLICT DO NOTHING — leaving
+	// one straight line instead of a fork. With it, the later txn waits, then
+	// sees the earlier one's rows and resolves a proper branch.
+	var (
+		branch            *branchWriteResult
+		toolContacts      [][2]string // (tool, agent) pairs, applied after commit
+		threatDetected    bool
+		flowType          string
+		allInteractionIDs []string
+		insertedCount     int
+	)
+	err := h.db.WithIntentLock(intentID, func(tx *db.IntentTx) error {
+		existingHops, err := tx.GetIntentHops(intentID)
+		if err != nil {
+			return fmt.Errorf("GetIntentHops: %v", err)
+		}
+		isNewIntent := len(existingHops) == 0
+		assignment := resolveBranchIDs(intentID, existingHops, interactions)
+
+		for _, r := range assignment.Renamed {
+			if err := tx.RenameInteractionID(r.From, r.To); err != nil {
+				return fmt.Errorf("RenameInteractionID %s->%s: %v", r.From, r.To, err)
 			}
-			seenDIDs[did] = true
-			name := h.resolveActorName(did, "")
-			// Already a known user — skip.
-			if uname, err := h.db.GetOrgUserNameByDID(did); err == nil && uname != "" {
-				log.Printf("[intentWorkflow] did=%s is a user, skipping", did)
-				continue
+			log.Printf("[intentWorkflow] relabeled trunk row into branch %s -> %s", r.From, r.To)
+		}
+
+		// ── Store only the newly-discovered interactions ─────────────────────
+		for i, iid := range assignment.InsertIDs {
+			ix := interactions[assignment.FirstNew+i]
+			if ix.Threat {
+				threatDetected = true
 			}
-			// Already a known agent — skip.
-			if agent, err := h.db.GetAgentInfo(did); err == nil && agent.AgentDID != "" {
-				log.Printf("[intentWorkflow] did=%s is already an agent, skipping", did)
-				continue
+			eventTime := time.Unix(ix.Epoch, 0).UTC()
+			threatID := hashToThreatID[ix.Hash]
+			if err := tx.StoreNewInteraction(
+				iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, ix.Hash, threatID, ix.RawData, eventTime,
+			); err != nil {
+				return fmt.Errorf("StoreNewInteraction: %v", err)
 			}
-			// Found in new_tools table — skip (registered tool/app).
-			if h.db.IsNewTool(did) {
-				log.Printf("[intentWorkflow] did=%s is a registered tool, skipping", did)
-				continue
-			}
-			// Unknown DID — store as agent.
-			if err := h.db.StoreNewAgent(uuid.New().String(), did, initiatorDID, orgID, "", name); err != nil {
-				log.Printf("[intentWorkflow] StoreNewAgent did=%s: %v", did, err)
-			} else {
-				log.Printf("[intentWorkflow] new agent stored did=%s name=%s", did, name)
+			log.Printf("[intentWorkflow] interaction id=%s from=%s to=%s type=%s threat=%v", iid, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
+
+			// If this interaction's target is a registered tool, record (afte
+
+			if h.db.IsNewTool(ix.ToDID) && !h.db.IsNewTool(ix.FromDID) {
+				toolContacts = append(toolContacts, [2]string{ix.ToDID, ix.FromDID})
 			}
 		}
-	}
 
-	// ── Store interactions ───────────────────────────────────────────────────
-	threatDetected := false
-	interactionIDs := make([]string, 0, len(interactions))
-	for idx, ix := range interactions {
-		iid := fmt.Sprintf("%s-%d", intentID, idx+1)
-		interactionIDs = append(interactionIDs, iid)
-		if ix.Threat {
-			threatDetected = true
+		branch = &branchWriteResult{IntentID: intentID, InsertedIDs: assignment.InsertIDs, Renamed: assignment.Renamed}
+		for i := range assignment.InsertIDs {
+			ix := interactions[assignment.FirstNew+i]
+			branch.InsertedKeys = append(branch.InsertedKeys, db.HopKey{Signature: ix.Signature, To: ix.ToDID})
 		}
-		eventTime := time.Unix(ix.Epoch, 0).UTC()
-		threatID := hashToThreatID[ix.Hash]
-		if err := h.db.StoreNewInteraction(
-			iid, ix.FromDID, ix.FromName, ix.ToDID, ix.ToName, ix.Type, "", ix.Threat, intentID, orgID, ix.Message, ix.Signature, threatID, eventTime,
-		); err != nil {
-			return "", fmt.Errorf("handleIntentWorkflow: StoreNewInteraction: %v", err)
+		if branch.isEmpty() {
+			return nil
 		}
-		log.Printf("[intentWorkflow] interaction[%d] from=%s to=%s type=%s threat=%v", idx, ix.FromDID, ix.ToDID, ix.Type, ix.Threat)
 
-		// If this interaction's target is a registered tool, record that the
-		// initiating agent has contacted it.
-		if h.db.IsNewTool(ix.ToDID) {
-			if err := h.db.AddAgentToToolList(ix.ToDID, ix.FromDID); err != nil {
-				log.Printf("[intentWorkflow] AddAgentToToolList tool=%s agent=%s: %v", ix.ToDID, ix.FromDID, err)
+		// ── Store/merge the intent row ───────────────────────────────────────
+		// interaction_ids reflects every hop stored for this intent across
+		// every branch — existing rows (with any rename applied) plus what
+		// this call just inserted — not just this txn's own contribution.
+		renameMap := make(map[string]string, len(assignment.Renamed))
+		for _, r := range assignment.Renamed {
+			renameMap[r.From] = r.To
+		}
+		allInteractionIDs = make([]string, 0, len(existingHops)+len(assignment.InsertIDs))
+		for _, row := range existingHops {
+			id := row.InteractionID
+			if newID, ok := renameMap[id]; ok {
+				id = newID
+			}
+			allInteractionIDs = append(allInteractionIDs, id)
+		}
+		allInteractionIDs = append(allInteractionIDs, assignment.InsertIDs...)
+		insertedCount = len(assignment.InsertIDs)
+
+		flowType = detectFlowTypeFromExtracts(interactions)
+		if isNewIntent {
+			if err := tx.StoreIntent(intentID, initiatorDID, initiatorName, orgID, flowType, executor, len(allEnvelopes), threatDetected, allInteractionIDs); err != nil {
+				return fmt.Errorf("intent save: %v", err)
+			}
+		} else {
+			if err := tx.MergeIntentBranch(intentID, len(allEnvelopes), threatDetected, allInteractionIDs); err != nil {
+				return fmt.Errorf("intent merge: %v", err)
 			}
 		}
-	}
-
-	// ── Store intent ─────────────────────────────────────────────────────────
-	flowType := detectFlowTypeFromExtracts(interactions)
-	if err := h.db.StoreIntent(intentID, initiatorDID, orgID, flowType, executor, len(allEnvelopes), threatDetected, interactionIDs); err != nil {
-		log.Printf("[intentWorkflow] intent save error: %v", err)
-		return "", err
-	}
-	log.Printf("[intentWorkflow] saved intent_id=%s interactions=%d threat=%v flowType=%s", intentID, len(interactionIDs), threatDetected, flowType)
-	return intentID, nil
-}
-
-func (h *Handler) GetIntentBlockData(c *gin.Context) {
-	intentID := c.Query("intent_id")
-	if intentID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intent_id is required"})
-		return
-	}
-	blocks, err := h.db.GetIntentBlocksByIntent(intentID)
+		return nil
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
-		return
+		log.Printf("[intentWorkflow] intent_id=%s: branch write failed, rolled back: %v", intentID, err)
+		return nil, fmt.Errorf("handleIntentWorkflow: %v", err)
 	}
-	type blockActor struct {
-		DID  string `json:"did"`
-		Name string `json:"name"`
-		Type string `json:"type"`
-	}
-	type blockOut struct {
-		ID             string     `json:"id"`
-		BlockIndex     int        `json:"block_index"`
-		BlockType      string     `json:"block_type"`
-		From           blockActor `json:"from"`
-		To             blockActor `json:"to"`
-		Message        string     `json:"message"`
-		Signature      string     `json:"signature"`
-		ThreatDetected bool       `json:"threat_detected"`
-		TrustIssues    []string   `json:"trust_issues"`
-		CreatedAt      string     `json:"created_at"`
-		ParentBlock    *blockOut  `json:"parent_block"`
-	}
-	// Build nested structure: blocks[0] is innermost (no parent), each successive
-	// block wraps the previous as parent_block, outermost (latest) is the root.
-	var root *blockOut
-	for _, b := range blocks {
-		issues := b.TrustIssues
-		if issues == nil {
-			issues = []string{}
+
+	for _, tc := range toolContacts {
+		if err := h.db.AddAgentToToolList(tc[0], tc[1]); err != nil {
+			log.Printf("[intentWorkflow] AddAgentToToolList tool=%s agent=%s: %v", tc[0], tc[1], err)
 		}
-		node := &blockOut{
-			ID:         b.ID,
-			BlockIndex: b.BlockIndex,
-			BlockType:  b.BlockType,
-			From: blockActor{
-				DID:  b.FromDID,
-				Name: b.FromName,
-				Type: b.FromType,
-			},
-			To: blockActor{
-				DID:  b.ToDID,
-				Name: b.ToName,
-				Type: b.ToType,
-			},
-			Message:        b.Message,
-			Signature:      b.Signature,
-			ThreatDetected: b.ThreatDetected,
-			TrustIssues:    issues,
-			CreatedAt:      b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-			ParentBlock:    root,
-		}
-		root = node
 	}
-	c.JSON(http.StatusOK, Response{Status: true, Data: root})
+
+	// Server_out evidence for these hops usually arrived before them, when
+	// there was no intent to record it against. Record it now.
+	if branch != nil {
+		for _, k := range branch.InsertedKeys {
+			if k.Signature == "" {
+				continue
+			}
+			if n, err := h.db.RecordResourcesForRequest(k.Signature); err != nil {
+				log.Printf("[resources] intent=%s signature=%s FAILED: %v", intentID, k.Signature, err)
+			} else if n > 0 {
+				log.Printf("[resources] intent=%s signature=%s recorded %d access(es)", intentID, k.Signature, n)
+			}
+		}
+	}
+
+	if branch.isEmpty() {
+		log.Printf("[intentWorkflow] intent_id=%s: this txn was a fully duplicate replay of hops already stored, nothing new to save", intentID)
+		return branch, nil
+	}
+	log.Printf("[intentWorkflow] saved intent_id=%s new_interactions=%d total_interactions=%d threat=%v flowType=%s",
+		intentID, insertedCount, len(allInteractionIDs), threatDetected, flowType)
+	return branch, nil
 }
 
-func (h *Handler) GetIntentRawData(c *gin.Context) {
-	intentID := c.Query("intent_id")
-	if intentID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intent_id is required"})
-		return
+// userLoginData is the body a successful org-user login returns, shared by
+// password login (/login) and OTP login (/login/verify-otp).
+func userLoginData(user *db.OrgUserRecord) gin.H {
+	return gin.H{
+		"did":               user.DID,
+		"email":             user.Email,
+		"org_id":            user.OrganizationID,
+		"api_key":           user.APIKey,
+		"nft_id":            user.NFTID,
+		"is_admin":          false,
+		"agent_access_list": user.AgentAccessList,
 	}
-	blocks, err := h.db.GetIntentBlocksByIntent(intentID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
-		return
-	}
-	type blockRaw struct {
-		BlockIndex int             `json:"block_index"`
-		RawData    json.RawMessage `json:"raw_data"`
-	}
-	result := make([]blockRaw, 0, len(blocks))
-	for _, b := range blocks {
-		raw := b.RawData
-		if len(raw) == 0 {
-			raw = json.RawMessage("{}")
-		}
-		result = append(result, blockRaw{BlockIndex: b.BlockIndex, RawData: raw})
-	}
-	c.JSON(http.StatusOK, Response{Status: true, Data: result})
-}
-
-func (h *Handler) issueToken(claims JWTClaims) (string, error) {
-	claims.RegisteredClaims = jwt.RegisteredClaims{
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(7 * 24 * time.Hour)),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
-	}
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(h.jwtSecret))
 }
 
 func (h *Handler) Login(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	var req struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
@@ -922,117 +1022,30 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	// Try org user first
 	user, err := h.db.GetOrgUserByEmail(req.Email)
 	log.Printf("[Login] GetOrgUserByEmail email=%q found=%v err=%v", req.Email, err == nil, err)
 	if err == nil {
 		log.Printf("[Login] user did=%q orgID=%q hasPasswordHash=%v", user.DID, user.OrganizationID, user.PasswordHash != "")
 		if user.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
 			log.Printf("[Login] password mismatch for user email=%q", req.Email)
-			c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
+			c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid credentials"})
 			return
 		}
 		log.Printf("[Login] user login success email=%q did=%q", req.Email, user.DID)
-		tokenStr, err := h.issueToken(JWTClaims{
-			DID: user.DID, Email: user.Email, OrgID: user.OrganizationID,
-			NFTID: user.NFTID, APIKey: user.APIKey,
-		})
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate token"})
+		if err := h.startSession(c, db.SessionAccountUser, user.Email); err != nil {
+			log.Printf("[Login] create session failed email=%q err=%v", req.Email, err)
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to create session"})
 			return
 		}
-		c.JSON(http.StatusOK, Response{
-			Status: true,
-			Data: gin.H{
-				"token":             tokenStr,
-				"did":               user.DID,
-				"email":             user.Email,
-				"org_id":            user.OrganizationID,
-				"api_key":           user.APIKey,
-				"nft_id":            user.NFTID,
-				"is_admin":          false,
-				"agent_access_list": user.AgentAccessList,
-			},
-		})
+		c.JSON(http.StatusOK, Response{Status: true, Data: userLoginData(user)})
 		return
 	}
 
-	// Try admin
-	admin, err := h.db.GetAdminByEmail(req.Email)
-	log.Printf("[Login] GetAdminByEmail email=%q found=%v err=%v", req.Email, err == nil, err)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
-		return
-	}
-	log.Printf("[Login] admin did=%q orgID=%q hasPasswordHash=%v", admin.DID, admin.OrganizationID, admin.PasswordHash != "")
-	if admin.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(admin.PasswordHash), []byte(req.Password)) != nil {
-		log.Printf("[Login] password mismatch for admin email=%q", req.Email)
-		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "invalid credentials"})
-		return
-	}
-	log.Printf("[Login] admin login success email=%q did=%q", req.Email, admin.DID)
-	tokenStr, err := h.issueToken(JWTClaims{
-		DID: admin.DID, Email: admin.Email, OrgID: admin.OrganizationID,
-		APIKey: admin.APIKey,
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to generate token"})
-		return
-	}
-	c.JSON(http.StatusOK, Response{
-		Status: true,
-		Data: gin.H{
-			"token":    tokenStr,
-			"did":      admin.DID,
-			"email":    admin.Email,
-			"org_id":   admin.OrganizationID,
-			"api_key":  admin.APIKey,
-			"is_admin": true,
-		},
-	})
-}
-
-func (h *Handler) Signup(c *gin.Context) {
-	var req struct {
-		DID      string `json:"did"`
-		Name     string `json:"name"`
-		Email    string `json:"email"`
-		Password string `json:"password"`
-		OrgID    string `json:"orgID"`
-		OTP      string `json:"otp"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || req.Password == "" || req.OrgID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email, password and orgID are required"})
-		return
-	}
-	if req.OTP == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "otp is required"})
-		return
-	}
-	if !h.verifyOTP(req.Email, req.OTP) {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid or expired OTP"})
-		return
-	}
-
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
-		return
-	}
-
-
-
-	if err := h.db.StoreOrgUser( req.OrgID, req.Name, req.Email, string(passwordHash)); err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register user: %v", err)})
-		return
-	}
-
-	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
-		"did":   req.DID,
-		"name":  req.Name,
-		"email": req.Email,
-		"orgID": req.OrgID,
-	}})
+	// Org users only. Admin passwords live on the admin server, so admins
+	// sign in through /admin-login; the new_admins.password copy is stale.
+	// Wrong credentials are 400, not 401: the dashboard reads 401 as
+	// "session expired" and would hide this message.
+	c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid credentials"})
 }
 
 func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
@@ -1045,7 +1058,7 @@ func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.StoreAdmin(req.DID, req.OrgID, "", "", ""); err != nil {
+	if err := h.db.StoreAdmin(req.DID, req.OrgID, "", ""); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register admin: %v", err)})
 		return
 	}
@@ -1054,9 +1067,6 @@ func (h *Handler) RegisterAdminMiddleware(c *gin.Context) {
 }
 
 func (h *Handler) CreateUser(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return
@@ -1129,14 +1139,9 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 	}
 	log.Printf("[CreateAdmin] agent service returned did=%q", did)
 
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to hash password"})
-		return
-	}
-
+	// The password went to the admin server only; no local copy is kept.
 	apiKey := uuid.New().String()
-	if err := h.db.StoreAdmin(did, req.OrgID, apiKey, req.Email, string(passwordHash)); err != nil {
+	if err := h.db.StoreAdmin(did, req.OrgID, apiKey, req.Email); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to store admin: %v", err)})
 		return
 	}
@@ -1187,9 +1192,6 @@ func (h *Handler) GlobalStats(c *gin.Context) {
 }
 
 func (h *Handler) HomeMetrics(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1198,9 +1200,11 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 
 	isAdmin := c.GetBool(CtxIsAdmin)
 	userDID := c.GetString(CtxDID)
+	log.Printf("[HomeMetrics v2-started-at-fix] isAdmin=%v userDID=%q orgID=%q", isAdmin, userDID, orgID)
 
 	var metrics *db.OrgMetrics
 	var agents []*db.AgentVolumeRecord
+	var unacknowledgedTotal int
 	var err error
 
 	if isAdmin {
@@ -1209,11 +1213,21 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
 			return
 		}
+		unacknowledgedTotal, err = h.db.CountUnacknowledgedThreatIntentsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count unacknowledged intents: %v", err)})
+			return
+		}
 		agents, err = h.db.GetTopAgentsByOrg(orgID, 5, 0)
 	} else {
 		metrics, err = h.db.GetUserMetrics(userDID, orgID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch metrics: %v", err)})
+			return
+		}
+		unacknowledgedTotal, err = h.db.CountUnacknowledgedThreatIntentsByUser(userDID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count unacknowledged intents: %v", err)})
 			return
 		}
 		agents, err = h.db.GetTopAgentsByUser(userDID, orgID, 5, 0)
@@ -1236,20 +1250,24 @@ func (h *Handler) HomeMetrics(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"agentCount":        metrics.AgentCount,
-			"intentCount":       metrics.IntentCount,
-			"interactionsCount": metrics.InteractionsCount,
-			"threatCount":       metrics.ThreatCount,
-			"agentList":         agentList,
-			"flowEnabled":       metrics.AgentCount > 0,
+			"agentCount":                 metrics.AgentCount,
+			"intentCount":                metrics.IntentCount,
+			"interactionsCount":          metrics.InteractionsCount,
+			"threatCount":                metrics.ThreatCount,
+			"appCount":                   metrics.AppCount,
+			"agentCount24hChange":        metrics.AgentCount24hChange,
+			"intentCount24hChange":       metrics.IntentCount24hChange,
+			"interactionsCount24hChange": metrics.InteractionsCount24hChange,
+			"threatCount24hChange":       metrics.ThreatCount24hChange,
+			"appCount24hChange":          metrics.AppCount24hChange,
+			"agentList":                  agentList,
+			"flowEnabled":                metrics.AgentCount > 0,
+			"unacknowledgedTotal":        unacknowledgedTotal,
 		},
 	})
 }
 
 func (h *Handler) InteractionsList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1331,9 +1349,6 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 }
 
 func (h *Handler) ThreatsList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1408,16 +1423,22 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 }
 
 func (h *Handler) AgentsAppsMetrics(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
 		return
 	}
 
-	data, err := h.db.GetAgentsAppsMetrics(orgID)
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
+
+	var data *db.AgentsAppsMetrics
+	var err error
+	if isAdmin {
+		data, err = h.db.GetAgentsAppsMetrics(orgID)
+	} else {
+		data, err = h.db.GetAgentsAppsMetricsByUser(userDID, orgID)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
 		return
@@ -1468,9 +1489,6 @@ func (h *Handler) AgentsAppsMetrics(c *gin.Context) {
 }
 
 func (h *Handler) Search(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	q := strings.TrimSpace(c.Query("q"))
 	if q == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "q is required"})
@@ -1561,9 +1579,6 @@ func (h *Handler) InteractionSeries(c *gin.Context) {
 }
 
 func (h *Handler) TopThreatAgents(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1612,9 +1627,6 @@ func (h *Handler) TopThreatAgents(c *gin.Context) {
 }
 
 func (h *Handler) IntentList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1674,9 +1686,6 @@ func (h *Handler) IntentList(c *gin.Context) {
 }
 
 func (h *Handler) AgentMetrics(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1741,9 +1750,6 @@ func (h *Handler) AgentMetrics(c *gin.Context) {
 }
 
 func (h *Handler) AgentsList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1820,9 +1826,6 @@ func (h *Handler) AgentsList(c *gin.Context) {
 }
 
 func (h *Handler) UsersList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -1874,9 +1877,6 @@ func (h *Handler) UsersList(c *gin.Context) {
 
 func (h *Handler) AgentInteractions(c *gin.Context) {
 	agentDID := c.Query("agentDID")
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if agentDID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
@@ -1940,9 +1940,6 @@ func (h *Handler) AgentInteractions(c *gin.Context) {
 
 func (h *Handler) AgentIntents(c *gin.Context) {
 	agentDID := c.Query("agentDID")
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if agentDID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
@@ -1987,9 +1984,6 @@ func (h *Handler) AgentIntents(c *gin.Context) {
 }
 
 func (h *Handler) UserIntents(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	userDID := c.GetString(CtxDID)
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
@@ -2042,6 +2036,7 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 		entry := gin.H{
 			"intentID":           i.IntentID,
 			"title":              firstNWords(i.Title, 5),
+			"titleFull":          i.Title,
 			"initiatorDID":       i.InitiatorDID,
 			"initiatorName":      i.InitiatorName,
 			"startedAt":          i.StartedAt,
@@ -2054,6 +2049,8 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 			"interactionsCount":  i.InteractionsCount,
 			"agentsCount":        i.AgentsCount,
 			"toolsCount":         i.ToolsCount,
+			"appDIDs":            i.Apps.DIDs(),
+			"apps":               orEmptyApps(i.Apps),
 			"threatCount":        i.ThreatCount,
 			"firstInteractionAt": i.FirstInteractionAt,
 			"lastInteractionAt":  i.LastInteractionAt,
@@ -2069,9 +2066,6 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 
 func (h *Handler) IntentDiagram(c *gin.Context) {
 	intentID := c.Query("intentID")
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if intentID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intentID is required"})
@@ -2095,39 +2089,35 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 	}
 
 	type interactionOut struct {
-		InteractionID      string `json:"interactionID"`
-		Initiator          string `json:"initiator"`
-		InitiatorName      string `json:"initiatorName"`
-		To                 string `json:"to"`
-		ToName             string `json:"toName"`
-		Type               string `json:"type"`
-		Message            string `json:"message"`
-		IntentID           string `json:"intentID"`
-		Threat             bool   `json:"threat"`
-		ThreatID           string `json:"threatID"`
-		Epoch              int64  `json:"epoch"`
-		Signature          string `json:"signature"`
-		ProvenanceReqID    string `json:"provenanceReqID"`
-		ProvenanceRecordID string `json:"provenanceRecordID"`
+		InteractionID string `json:"interactionID"`
+		Initiator     string `json:"initiator"`
+		InitiatorName string `json:"initiatorName"`
+		To            string `json:"to"`
+		ToName        string `json:"toName"`
+		Type          string `json:"type"`
+		Message       string `json:"message"`
+		IntentID      string `json:"intentID"`
+		Threat        bool   `json:"threat"`
+		ThreatID      string `json:"threatID"`
+		Epoch         int64  `json:"epoch"`
+		Signature     string `json:"signature"`
 	}
 
 	list := make([]interactionOut, 0, len(interactions))
 	for _, ix := range interactions {
 		list = append(list, interactionOut{
-			InteractionID:      ix.InteractionID,
-			Initiator:          ix.From,
-			InitiatorName:      ix.FromName,
-			To:                 ix.To,
-			ToName:             ix.ToName,
-			Type:               ix.Type,
-			Message:            ix.Message,
-			IntentID:           ix.IntentID,
-			Threat:             ix.Threat,
-			ThreatID:           ix.ThreatID,
-			Epoch:              ix.Time.Unix(),
-			Signature:          ix.Signature,
-			ProvenanceReqID:    ix.ProvenanceReqID,
-			ProvenanceRecordID: ix.ProvenanceRecordID,
+			InteractionID: ix.InteractionID,
+			Initiator:     ix.From,
+			InitiatorName: ix.FromName,
+			To:            ix.To,
+			ToName:        ix.ToName,
+			Type:          ix.Type,
+			Message:       ix.Message,
+			IntentID:      ix.IntentID,
+			Threat:        ix.Threat,
+			ThreatID:      ix.ThreatID,
+			Epoch:         ix.Time.Unix(),
+			Signature:     ix.Signature,
 		})
 	}
 
@@ -2142,6 +2132,8 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 		"interactionsCount": intent.InteractionsCount,
 		"agentsCount":       intent.AgentsCount,
 		"toolsCount":        intent.ToolsCount,
+		"appDIDs":           intent.Apps.DIDs(),
+		"apps":              orEmptyApps(intent.Apps),
 		"startedAt":         intent.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 
@@ -2169,16 +2161,17 @@ func (h *Handler) UpdateProfile(c *gin.Context) {
 	}
 
 	callerEmail := c.GetString(CtxEmail)
-	isAdmin := c.GetBool(CtxIsAdmin)
+	isAdmin := c.GetString(CtxAccountType) == db.SessionAccountAdmin
+
+	// An admin's name is their admin server username, which /admin-login and
+	// /update-password depend on — it can't be changed from the dashboard.
+	if isAdmin && req.Name != nil {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "admin username is managed by the admin server and cannot be changed here"})
+		return
+	}
 
 	if req.Name != nil {
-		var err error
-		if isAdmin {
-			err = h.db.UpdateAdminName(callerEmail, *req.Name)
-		} else {
-			err = h.db.UpdateUserName(callerEmail, *req.Name)
-		}
-		if err != nil {
+		if err := h.db.UpdateUserName(callerEmail, *req.Name); err != nil {
 			log.Printf("[UpdateProfile] update name email=%s err=%v", callerEmail, err)
 			c.JSON(http.StatusBadRequest, Response{Status: false, Message: err.Error()})
 			return
@@ -2192,7 +2185,7 @@ func (h *Handler) UpdateProfile(c *gin.Context) {
 		}
 		var err error
 		if isAdmin {
-			err = h.db.UpdateAdminEmail(callerEmail, *req.Email)
+			err = h.db.UpdateAdminEmail(c.GetString(CtxAccountID), *req.Email)
 		} else {
 			err = h.db.UpdateUserEmail(callerEmail, *req.Email)
 		}
@@ -2216,9 +2209,22 @@ func (h *Handler) AppRegistration(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "tool_name and tool_id are required"})
 		return
 	}
-	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, "AGENT_DNA_BETA"); err != nil {
-		log.Printf("[AppRegistration] db error tool_id=%s err=%v", req.ToolID, err)
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to register app"})
+	// The admin server registration runs inside the local transaction, after the
+	// insert succeeds and before it commits, so the tool is only kept locally
+	// when the admin server accepted it too. A tool already stored locally is
+	// not re-sent to the admin server.
+	registerWithAdmin := func() error {
+		return h.callRegisterTool(req.ToolID, req.ToolName)
+	}
+	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, h.orgID, registerWithAdmin); err != nil {
+		var rejected *adminRejectedError
+		if errors.As(err, &rejected) {
+			log.Printf("[AppRegistration] admin server rejected tool_id=%s: %s", req.ToolID, rejected.message)
+			c.JSON(http.StatusConflict, Response{Status: false, Message: rejected.message})
+			return
+		}
+		log.Printf("[AppRegistration] error tool_id=%s err=%v", req.ToolID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register app: %v", err)})
 		return
 	}
 	log.Printf("[AppRegistration] registered app tool_id=%s tool_name=%s", req.ToolID, req.ToolName)
@@ -2242,7 +2248,12 @@ func (h *Handler) RevokeAgent(c *gin.Context) {
 	// Call admin server first to flip is_active = false on the agent — the local DB
 	// is only written once we know the admin server (the real enforcement point)
 	// actually accepted the revocation, so the two never disagree.
-	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/revoke-agent"
+	endpoint, err := joinURL(h.adminServiceURL, "agent-admin", "v1", "revoke-agent")
+	if err != nil {
+		log.Printf("[RevokeAgent] admin server url error agent_did=%s err=%v", req.AgentDID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to reach admin server: %v", err)})
+		return
+	}
 	b, _ := json.Marshal(map[string]string{"agent_id": req.AgentDID})
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
@@ -2298,7 +2309,12 @@ func (h *Handler) UnrevokeAgent(c *gin.Context) {
 	// Call admin server first to flip is_active = true on the agent — the local DB
 	// is only written once we know the admin server (the real enforcement point)
 	// actually accepted the whitelist, so the two never disagree.
-	endpoint := strings.TrimRight(h.adminServiceURL, "/") + "/agent-admin/v1/whitelist"
+	endpoint, err := joinURL(h.adminServiceURL, "agent-admin", "v1", "whitelist")
+	if err != nil {
+		log.Printf("[UnrevokeAgent] admin server url error agent_did=%s err=%v", req.AgentDID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to reach admin server: %v", err)})
+		return
+	}
 	b, _ := json.Marshal(map[string]string{"agent_id": req.AgentDID})
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
@@ -2335,11 +2351,60 @@ func (h *Handler) UnrevokeAgent(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{Status: true, Message: adminResp.Message})
 }
 
+// UpdateUserStatus revokes (is_active=false) or whitelists (is_active=true) a
+// user ID. User status lives only on the admin server, so nothing is written
+// locally.
+func (h *Handler) UpdateUserStatus(c *gin.Context) {
+	if !c.GetBool(CtxIsAdmin) {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
+		return
+	}
+
+	var req struct {
+		UserID   string `json:"user_id"`
+		IsActive *bool  `json:"is_active"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid request body"})
+		return
+	}
+	req.UserID = strings.TrimSpace(req.UserID)
+	if req.UserID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "user_id is required"})
+		return
+	}
+	if req.IsActive == nil {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "is_active is required"})
+		return
+	}
+
+	found, err := h.setAdminUserStatus(req.UserID, *req.IsActive)
+	if err != nil {
+		var rejected *adminRejectedError
+		if errors.As(err, &rejected) {
+			log.Printf("[UpdateUserStatus] admin server rejected user_id=%s is_active=%t: %s", req.UserID, *req.IsActive, rejected.message)
+			c.JSON(http.StatusBadRequest, Response{Status: false, Message: rejected.message})
+			return
+		}
+		log.Printf("[UpdateUserStatus] error user_id=%s err=%v", req.UserID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to update user status: %v", err)})
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "user not found on admin server"})
+		return
+	}
+
+	msg := "user revoked"
+	if *req.IsActive {
+		msg = "user whitelisted"
+	}
+	log.Printf("[UpdateUserStatus] user_id=%s is_active=%t", req.UserID, *req.IsActive)
+	c.JSON(http.StatusOK, Response{Status: true, Message: msg, Data: gin.H{"user_id": req.UserID, "is_active": *req.IsActive}})
+}
+
 func (h *Handler) AgentInfo(c *gin.Context) {
 	agentDID := c.Query("agentDID")
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if agentDID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
@@ -2368,32 +2433,78 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 	if interactedApps == nil {
 		interactedApps = []string{}
 	}
+	applicationsAccessed, err := h.db.GetApplicationsAccessedByAgent(agentDID, orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch application access: %v", err)})
+		return
+	}
+	applicationAccessList := make([]gin.H, 0, len(applicationsAccessed))
+	for _, app := range applicationsAccessed {
+		credentialList := make([]gin.H, 0, len(app.Credentials))
+		for _, credential := range app.Credentials {
+			var firstUsedAt, lastUsedAt interface{}
+			if credential.FirstUsedAt.Valid {
+				firstUsedAt = credential.FirstUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			if credential.LastUsedAt.Valid {
+				lastUsedAt = credential.LastUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			credentialList = append(credentialList, gin.H{
+				"credentialID": credential.CredentialID,
+				"authMethods":  credential.AuthMethods,
+				"status":       credential.Status,
+				"requestCount": credential.RequestCount,
+				"intentCount":  credential.IntentCount,
+				"firstUsedAt":  firstUsedAt,
+				"lastUsedAt":   lastUsedAt,
+			})
+		}
+		applicationAccessList = append(applicationAccessList, gin.H{
+			"applicationName": app.ApplicationName,
+			"intentCount":     app.IntentCount,
+			"intentIDs":       app.IntentIDs,
+			"credentials":     credentialList,
+		})
+	}
+
+	// Credentials this agent presented: the same rule as the agents list on
+	// /credential-info, so the two pages agree.
+	credentialsPage, credentialsPageSize := listPage(c, "credentialsPage", "credentialsPageSize")
+	totalCredentials, err := h.db.CountCredentialsByAgent(agentDID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count agent credentials: %v", err)})
+		return
+	}
+	credentials, err := h.db.GetCredentialsByAgent(agentDID, credentialsPageSize, (credentialsPage-1)*credentialsPageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch agent credentials: %v", err)})
+		return
+	}
 
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"agentDID":          agent.AgentDID,
-			"agentName":         agent.AgentName,
-			"createdAt":         agent.CreatedAt,
-			"deployerDID":       agent.DeployerDID,
-			"deployerName":      deployerName,
-			"policy":            agent.Policy,
-			"orgID":             orgID,
-			"totalInteractions": agent.TotalInteractions,
-			"totalThreats":      agent.TotalThreats,
-			"score":             agent.Score,
-			"revoked":           agent.Revoked,
-			"appsInteracted":    len(interactedApps),
-			"appsList":          interactedApps,
+			"agentDID":               agent.AgentDID,
+			"agentName":              agent.AgentName,
+			"createdAt":              agent.CreatedAt,
+			"deployerDID":            agent.DeployerDID,
+			"deployerName":           deployerName,
+			"policy":                 agent.Policy,
+			"orgID":                  orgID,
+			"totalInteractions":      agent.TotalInteractions,
+			"totalThreats":           agent.TotalThreats,
+			"score":                  agent.Score,
+			"revoked":                agent.Revoked,
+			"appsInteracted":         len(interactedApps),
+			"appsList":               interactedApps,
+			"applicationsInteracted": applicationAccessList,
+			"credentials":            presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
 		},
 	})
 }
 
 func (h *Handler) IntentInfo(c *gin.Context) {
 	intentID := c.Query("intentID")
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if intentID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intentID is required"})
@@ -2415,28 +2526,46 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch interactions: %v", err)})
 		return
 	}
+	rawByID, err := h.db.GetInteractionRawDataByIntent(intentID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch interaction raw data: %v", err)})
+		return
+	}
 
-	provenanceRecordID := ""
+	// How each request authenticated, and what the run shows as a whole.
+	// Derived on every read from the stored evidence, never cached as a verdict.
+	hopEvidence, continuity := h.authEvidenceForIntent(intentID, interactions)
+
+	// new_intents.threat_detected is written once by handleIntentWorkflow at
+	// intent-creation time and never recomputed, so it can drift stale
+	// relative to the interactions' own threat flags (the same bug fixed in
+	// observability-paths). Derive it live from the interactions below
+	// instead of trusting that stored column.
+	threatDetected := false
 	txns := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
-		if provenanceRecordID == "" && i.ProvenanceRecordID != "" {
-			provenanceRecordID = i.ProvenanceRecordID
+		if i.Threat {
+			threatDetected = true
+		}
+		raw := rawByID[i.InteractionID]
+		if len(raw) == 0 {
+			raw = json.RawMessage("{}")
 		}
 		txns = append(txns, gin.H{
-			"interactionID":      i.InteractionID,
-			"from":               i.From,
-			"fromName":           i.FromName,
-			"to":                 i.To,
-			"toName":             i.ToName,
-			"type":               i.Type,
-			"direction":          i.Direction,
-			"threat":             i.Threat,
-			"threatID":           i.ThreatID,
-			"time":               i.Time,
-			"message":            i.Message,
-			"signature":          i.Signature,
-			"provenanceReqID":    i.ProvenanceReqID,
-			"provenanceRecordID": i.ProvenanceRecordID,
+			"authEvidence":  hopEvidence[i.InteractionID],
+			"interactionID": i.InteractionID,
+			"from":          i.From,
+			"fromName":      i.FromName,
+			"to":            i.To,
+			"toName":        i.ToName,
+			"type":          i.Type,
+			"direction":     i.Direction,
+			"threat":        i.Threat,
+			"threatID":      i.ThreatID,
+			"time":          i.Time,
+			"message":       i.Message,
+			"signature":     i.Signature,
+			"rawData":       raw,
 		})
 	}
 
@@ -2447,17 +2576,19 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"startedAt":          intent.StartedAt,
 		"status":             intent.Status,
 		"reviewStatus":       intent.ReviewStatus,
-		"threatDetected":     intent.ThreatDetected,
+		"threatDetected":     threatDetected,
 		"flowType":           intent.FlowType,
 		"executor":           intent.Executor,
 		"chainDepth":         intent.ChainDepth,
 		"interactionsCount":  intent.InteractionsCount,
 		"agentsCount":        intent.AgentsCount,
 		"toolsCount":         intent.ToolsCount,
+		"appDIDs":            intent.Apps.DIDs(),
+		"apps":               orEmptyApps(intent.Apps),
 		"firstInteractionAt": intent.FirstInteractionAt,
 		"lastInteractionAt":  intent.LastInteractionAt,
 		"runtimeSeconds":     intent.RuntimeSeconds,
-		"provenanceRecordID": provenanceRecordID,
+		"continuity":         continuity,
 		"interactions":       txns,
 	}
 	if intent.EndedAt != nil {
@@ -2468,17 +2599,14 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 }
 
 var validIntentReviewStatuses = map[string]bool{
-	"Ongoing":      true,
+	"Unreviewed":   true,
 	"Acknowledged": true,
 	"Flagged":      true,
 }
 
 // POST /dashboard/v1/update-intent-status
-// Body: {"intentID": "...", "status": "Acknowledged" | "Flagged" | "Ongoing"}
+// Body: {"intentID": "...", "status": "Acknowledged" | "Flagged" | "Unreviewed"}
 func (h *Handler) UpdateIntentStatus(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -2498,7 +2626,7 @@ func (h *Handler) UpdateIntentStatus(c *gin.Context) {
 		return
 	}
 	if !validIntentReviewStatuses[req.Status] {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "status must be one of Ongoing, Acknowledged, Flagged"})
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "status must be one of Unreviewed, Acknowledged, Flagged"})
 		return
 	}
 
@@ -2518,9 +2646,6 @@ func (h *Handler) UpdateIntentStatus(c *gin.Context) {
 }
 
 func (h *Handler) ToolsList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
@@ -2584,9 +2709,6 @@ func agentStatus(score float64, totalInteractions int) string {
 }
 
 func (h *Handler) UserInfo(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 
 	userID := c.Query("userID")
@@ -2595,6 +2717,50 @@ func (h *Handler) UserInfo(c *gin.Context) {
 		return
 	}
 
+	user, err := h.db.GetUserDetail(userID, orgID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "user not found"})
+		return
+	}
+
+	// Revoked / whitelisted state lives on the admin server. If it can't be
+	// reached the profile still renders, with the user shown as not active.
+	status, err := h.adminUserStatus(userID)
+	if err != nil {
+		log.Printf("[UserInfo] admin user status user_id=%s err=%v", userID, err)
+	}
+	h.writeAccountInfo(c, orgID, userID, user, &status)
+}
+
+// AdminInfo is UserInfo for an admin, addressed by DID in the path. The
+// response has the same shape as /user-info so the profile page can share it.
+
+func (h *Handler) AdminInfo(c *gin.Context) {
+	adminID := c.Param("id")
+	if adminID == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "id is required"})
+		return
+	}
+
+	admin, err := h.db.GetAdminDetail(adminID)
+	if errors.Is(err, sql.ErrNoRows) {
+		log.Printf("[AdminInfo] no admin did=%q", adminID)
+		c.JSON(http.StatusNotFound, Response{Status: false, Message: "admin not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("[AdminInfo] loading admin did=%q failed: %v", adminID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to load admin"})
+		return
+	}
+	h.writeAccountInfo(c, "", adminID, admin, nil)
+}
+
+// writeAccountInfo renders an account's detail record plus its paginated
+// interactions, intents, threats, agents and apps. An empty orgID lists them
+// across every org. A non-nil status is the admin server's is_active for the
+// account and is reported as user.status.
+func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *db.UserInfoRecord, status *bool) {
 	const pageSize = 10
 
 	interactionsPage := 1
@@ -2613,12 +2779,12 @@ func (h *Handler) UserInfo(c *gin.Context) {
 	if p, err := strconv.Atoi(c.Query("agentsPage")); err == nil && p > 0 {
 		agentsPage = p
 	}
-
-	user, err := h.db.GetUserDetail(userID, orgID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, Response{Status: false, Message: "user not found"})
-		return
+	appsPage := 1
+	if p, err := strconv.Atoi(c.Query("appsPage")); err == nil && p > 0 {
+		appsPage = p
 	}
+	// Credentials page like /agent-info's, so one client component pages both.
+	credentialsPage, credentialsPageSize := listPage(c, "credentialsPage", "credentialsPageSize")
 
 	// Interactions
 	totalInteractions, _ := h.db.CountInteractionsByUser(userID, orgID)
@@ -2630,25 +2796,25 @@ func (h *Handler) UserInfo(c *gin.Context) {
 	interactionList := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
 		interactionList = append(interactionList, gin.H{
-			"interactionID":      i.InteractionID,
-			"from":               i.From,
-			"fromName":           i.FromName,
-			"to":                 i.To,
-			"toName":             i.ToName,
-			"type":               i.Type,
-			"threat":             i.Threat,
-			"threatID":           i.ThreatID,
-			"intentID":           i.IntentID,
-			"message":            i.Message,
-			"signature":          i.Signature,
-			"provenanceRecordID": i.ProvenanceRecordID,
-			"time":               i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
+			"interactionID": i.InteractionID,
+			"from":          i.From,
+			"fromName":      i.FromName,
+			"to":            i.To,
+			"toName":        i.ToName,
+			"type":          i.Type,
+			"threat":        i.Threat,
+			"threatID":      i.ThreatID,
+			"intentID":      i.IntentID,
+			"message":       i.Message,
+			"signature":     i.Signature,
+			"time":          i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	}
 
-	// Intents
-	totalIntents, _ := h.db.CountUserIntents(userID, orgID)
-	intents, err := h.db.GetUserIntents(userID, orgID, pageSize, (intentsPage-1)*pageSize)
+	// Intents — same scope and per-intent stats as /user-intents, so the
+	// interactions and threats below belong to exactly these intents.
+	totalIntents, _ := h.db.CountIntentsByUser(userID, orgID)
+	intents, err := h.db.GetIntentsByUser(userID, orgID, pageSize, (intentsPage-1)*pageSize)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("intents: %v", err)})
 		return
@@ -2664,18 +2830,17 @@ func (h *Handler) UserInfo(c *gin.Context) {
 	threatList := make([]gin.H, 0, len(threats))
 	for _, i := range threats {
 		threatList = append(threatList, gin.H{
-			"interactionID":      i.InteractionID,
-			"from":               i.From,
-			"fromName":           i.FromName,
-			"to":                 i.To,
-			"toName":             i.ToName,
-			"type":               i.Type,
-			"threat":             i.Threat,
-			"intentID":           i.IntentID,
-			"message":            i.Message,
-			"signature":          i.Signature,
-			"provenanceRecordID": i.ProvenanceRecordID,
-			"time":               i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
+			"interactionID": i.InteractionID,
+			"from":          i.From,
+			"fromName":      i.FromName,
+			"to":            i.To,
+			"toName":        i.ToName,
+			"type":          i.Type,
+			"threat":        i.Threat,
+			"intentID":      i.IntentID,
+			"message":       i.Message,
+			"signature":     i.Signature,
+			"time":          i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	}
 
@@ -2698,27 +2863,98 @@ func (h *Handler) UserInfo(c *gin.Context) {
 		})
 	}
 
+	// Apps reached in the user's intents, from any of their DIDs.
+	totalApps, _ := h.db.CountAppsByUser(userID, orgID)
+	apps, err := h.db.GetAppsByUser(userID, orgID, pageSize, (appsPage-1)*pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("apps: %v", err)})
+		return
+	}
+	applicationsAccessed, err := h.db.GetApplicationsAccessedByUser(userID, orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("application access: %v", err)})
+		return
+	}
+	applicationAccessList := make([]gin.H, 0, len(applicationsAccessed))
+	for _, app := range applicationsAccessed {
+		credentialList := make([]gin.H, 0, len(app.Credentials))
+		for _, credential := range app.Credentials {
+			var firstUsedAt, lastUsedAt interface{}
+			if credential.FirstUsedAt.Valid {
+				firstUsedAt = credential.FirstUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			if credential.LastUsedAt.Valid {
+				lastUsedAt = credential.LastUsedAt.Time.UTC().Format(time.RFC3339)
+			}
+			credentialList = append(credentialList, gin.H{
+				"credentialID": credential.CredentialID,
+				"authMethods":  credential.AuthMethods,
+				"status":       credential.Status,
+				"requestCount": credential.RequestCount,
+				"intentCount":  credential.IntentCount,
+				"firstUsedAt":  firstUsedAt,
+				"lastUsedAt":   lastUsedAt,
+			})
+		}
+		applicationAccessList = append(applicationAccessList, gin.H{
+			"applicationName": app.ApplicationName,
+			"intentCount":     app.IntentCount,
+			"intentIDs":       app.IntentIDs,
+			"credentials":     credentialList,
+		})
+	}
+	appList := make([]gin.H, 0, len(apps))
+	for _, a := range apps {
+		appList = append(appList, gin.H{
+			"appDID":            a.AppDID,
+			"appName":           a.AppName,
+			"totalInteractions": a.TotalInteractions,
+			"totalThreats":      a.TotalThreats,
+			"intentsCount":      a.IntentsCount,
+			"lastUsed":          a.LastUsed.UTC().Format(time.RFC3339),
+		})
+	}
+
+	// Credentials this user presented, from any of their DIDs: the same rule
+	// as the users list on /credential-info, so the two pages agree.
+	totalCredentials, err := h.db.CountCredentialsByUser(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("credentials: %v", err)})
+		return
+	}
+	credentials, err := h.db.GetCredentialsByUser(userID, credentialsPageSize, (credentialsPage-1)*credentialsPageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("credentials: %v", err)})
+		return
+	}
+
 	var lastActive interface{}
 	if user.LastActive != nil {
 		lastActive = user.LastActive.UTC().Format(time.RFC3339)
 	}
 
+	userData := gin.H{
+		"userID":              user.UserDID,
+		"dids":                user.DIDs,
+		"userName":            user.UserName,
+		"displayName":         user.DisplayName,
+		"createdAt":           user.CreatedAt.UTC().Format(time.RFC3339),
+		"lastActive":          lastActive,
+		"isActive":            user.IsActive,
+		"accessAgentCount":    user.AccessAgentCount,
+		"totalInteractions":   totalInteractions,
+		"totalThreats":        totalThreats,
+		"totalIntents":        totalIntents,
+		"totalAgentsDeployed": user.TotalAgentsOwned,
+	}
+	if status != nil {
+		userData["status"] = *status
+	}
+
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"user": gin.H{
-				"userID":              user.UserDID,
-				"userName":            user.UserName,
-				"displayName":         user.DisplayName,
-				"createdAt":           user.CreatedAt.UTC().Format(time.RFC3339),
-				"lastActive":          lastActive,
-				"isActive":            user.IsActive,
-				"accessAgentCount":    user.AccessAgentCount,
-				"totalInteractions":   user.TotalInteractions,
-				"totalThreats":        user.TotalThreats,
-				"totalIntents":        user.TotalIntents,
-				"totalAgentsDeployed": user.TotalAgentsOwned,
-			},
+			"user": userData,
 			"interactions": gin.H{
 				"list":       interactionList,
 				"total":      totalInteractions,
@@ -2747,14 +2983,20 @@ func (h *Handler) UserInfo(c *gin.Context) {
 				"pageSize":   pageSize,
 				"totalPages": (totalAgents + pageSize - 1) / pageSize,
 			},
+			"apps": gin.H{
+				"list":       appList,
+				"total":      totalApps,
+				"page":       appsPage,
+				"pageSize":   pageSize,
+				"totalPages": (totalApps + pageSize - 1) / pageSize,
+			},
+			"applicationsInteracted": applicationAccessList,
+			"credentials":            presentedCredentialsJSON(credentials, totalCredentials, credentialsPage, credentialsPageSize),
 		},
 	})
 }
 
 func (h *Handler) ToolInfo(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 
 	// Accept either ?toolDID= or ?name= — whichever is provided.
@@ -2798,19 +3040,18 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 	interactionList := make([]gin.H, 0, len(interactions))
 	for _, i := range interactions {
 		interactionList = append(interactionList, gin.H{
-			"interactionID":      i.InteractionID,
-			"from":               i.From,
-			"fromName":           i.FromName,
-			"to":                 i.To,
-			"toName":             i.ToName,
-			"type":               i.Type,
-			"threat":             i.Threat,
-			"threatID":           i.ThreatID,
-			"intentID":           i.IntentID,
-			"message":            i.Message,
-			"signature":          i.Signature,
-			"provenanceRecordID": i.ProvenanceRecordID,
-			"time":               i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
+			"interactionID": i.InteractionID,
+			"from":          i.From,
+			"fromName":      i.FromName,
+			"to":            i.To,
+			"toName":        i.ToName,
+			"type":          i.Type,
+			"threat":        i.Threat,
+			"threatID":      i.ThreatID,
+			"intentID":      i.IntentID,
+			"message":       i.Message,
+			"signature":     i.Signature,
+			"time":          i.Time.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	}
 
@@ -2855,9 +3096,155 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 	})
 }
 
+// callRegisterUser registers a user's DID, email and api_key with the admin
+// server. It fails when the admin server rejects the user (e.g. the email or
+// user ID is already registered there).
+func (h *Handler) callRegisterUser(userID, email, apiKey string) error {
+	return h.postAdmin("callRegisterUser",
+		map[string]string{"user_id": userID, "email": email, "api_key": apiKey},
+		"agent-admin", "v1", "users")
+}
+
+// callRegisterTool registers a tool's DID and name with the admin server. It
+// fails when the admin server rejects the tool.
+func (h *Handler) callRegisterTool(toolID, toolName string) error {
+	return h.postAdmin("callRegisterTool",
+		map[string]string{"tool_id": toolID, "tool_name": toolName},
+		"agent-admin", "v1", "tools", "register")
+}
+
+// adminUserStatus reports whether a user ID is active (whitelisted) on the
+// admin server. The admin server answers false for a user ID it doesn't know.
+func (h *Handler) adminUserStatus(userID string) (bool, error) {
+	var active bool
+	err := h.callAdmin("adminUserStatus", http.MethodGet, nil, &active,
+		"agent-admin", "v1", "users", userID, "status")
+	return active, err
+}
+
+// setAdminUserStatus whitelists (isActive=true) or revokes (isActive=false) a
+// user ID on the admin server. found is false when the admin server has no
+// such user ID.
+func (h *Handler) setAdminUserStatus(userID string, isActive bool) (found bool, err error) {
+	err = h.callAdmin("setAdminUserStatus", http.MethodPatch, map[string]bool{"is_active": isActive}, &found,
+		"agent-admin", "v1", "users", userID, "status")
+	return found, err
+}
+
+// callAdmin sends payload (nil for none) as JSON to the admin server at path
+// with method and expects a {"status": bool, "message": string, "data": any}
+// reply, decoding data into out when out is non-nil. Errors are reported as in
+// postAdmin.
+func (h *Handler) callAdmin(tag, method string, payload, out any, path ...string) error {
+	endpoint, err := joinURL(h.adminServiceURL, path...)
+	if err != nil {
+		return fmt.Errorf("%s: %v", tag, err)
+	}
+	log.Printf("[%s] %s %s payload=%v", tag, method, endpoint, payload)
+
+	var body io.Reader
+	if payload != nil {
+		b, _ := json.Marshal(payload)
+		body = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, endpoint, body)
+	if err != nil {
+		return fmt.Errorf("%s: %v", tag, err)
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := adminHTTP.Do(req)
+	if err != nil {
+		log.Printf("[%s] http error: %v", tag, err)
+		return fmt.Errorf("failed to reach admin server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	rawBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[%s] status=%d body=%s", tag, resp.StatusCode, string(rawBody))
+
+	var result struct {
+		Status  bool            `json:"status"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(rawBody, &result); err != nil {
+		return fmt.Errorf("invalid response from admin server: %v", err)
+	}
+	if !result.Status {
+		return &adminRejectedError{message: result.Message}
+	}
+	if out != nil && len(result.Data) > 0 && string(result.Data) != "null" {
+		if err := json.Unmarshal(result.Data, out); err != nil {
+			return fmt.Errorf("invalid data from admin server: %v", err)
+		}
+	}
+	return nil
+}
+
+// postAdmin POSTs payload as JSON to the admin server at path and expects a
+// {"status": bool, "message": string} reply. A status=false reply returns an
+// *adminRejectedError carrying the admin's message; anything else that goes
+// wrong (bad URL, transport error, timeout, non-JSON body) is a plain error.
+// Callers run it inside a DB transaction just before commit, so adminHTTP's
+// 10s timeout bounds how long that transaction (and its locks) stays open.
+func (h *Handler) postAdmin(tag string, payload map[string]string, path ...string) error {
+	endpoint, err := joinURL(h.adminServiceURL, path...)
+	if err != nil {
+		return fmt.Errorf("%s: %v", tag, err)
+	}
+	log.Printf("[%s] POST %s payload=%v", tag, endpoint, redactAPIKey(payload))
+
+	b, _ := json.Marshal(payload)
+	resp, err := adminHTTP.Post(endpoint, "application/json", bytes.NewReader(b))
+	if err != nil {
+		log.Printf("[%s] http error: %v", tag, err)
+		return fmt.Errorf("failed to reach admin server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	rawBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[%s] status=%d body=%s", tag, resp.StatusCode, string(rawBody))
+
+	var result struct {
+		Status  bool   `json:"status"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rawBody, &result); err != nil {
+		return fmt.Errorf("invalid response from admin server: %v", err)
+	}
+	if !result.Status {
+		return &adminRejectedError{message: result.Message}
+	}
+	return nil
+}
+
+// redactAPIKey returns payload with any api_key value hidden, for logging.
+func redactAPIKey(payload map[string]string) map[string]string {
+	if _, ok := payload["api_key"]; !ok {
+		return payload
+	}
+	out := make(map[string]string, len(payload))
+	for k, v := range payload {
+		out[k] = v
+	}
+	out["api_key"] = "<redacted>"
+	return out
+}
+
+// adminRejectedError carries the admin server's message when it answers
+// status=false, so callers can tell a rejection from a transport failure.
+type adminRejectedError struct{ message string }
+
+func (e *adminRejectedError) Error() string { return e.message }
+
 // callRegisterAdmin calls the external agent service to register an admin and get their DID.
 func (h *Handler) callRegisterAdmin(username, org, email, password string) (string, error) {
-	endpoint := h.createAgentEndpoint + "agent-admin/v1/register-admin"
+	endpoint, err := h.agentServiceURL(h.createAgentEndpoint, "CREATE_AGENT_ENDPOINT", "agent-admin", "v1", "register-admin")
+	if err != nil {
+		return "", fmt.Errorf("callRegisterAdmin: %v", err)
+	}
 	log.Printf("[callRegisterAdmin] POST %s username=%q org=%q email=%q", endpoint, username, org, email)
 
 	b, _ := json.Marshal(map[string]string{"username": username, "org": org, "email": email, "password": password})
@@ -2909,7 +3296,10 @@ func (h *Handler) callCreateAgent(agentName, policy, creatorDID, orgID, agentDID
 	}
 	mw.Close()
 
-	endpoint := h.createAgentEndpoint + "agent-admin/v1/create-agent"
+	endpoint, err := h.agentServiceURL(h.createAgentEndpoint, "CREATE_AGENT_ENDPOINT", "agent-admin", "v1", "create-agent")
+	if err != nil {
+		return "", fmt.Errorf("callCreateAgent: %v", err)
+	}
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
 	if err != nil {
 		return "", fmt.Errorf("callCreateAgent: http post: %v", err)
@@ -2942,7 +3332,7 @@ func (h *Handler) callUpdateAgent(agentName, agentID, policy, adminDID, orgID st
 	mw.WriteField("org_id", orgID)
 	mw.WriteField("agent_name", agentName)
 	mw.WriteField("agent_id", agentID)
-	
+
 	fw, err := mw.CreateFormFile("policy", "policy.txt")
 	if err != nil {
 		return fmt.Errorf("callUpdateAgent: create form file: %v", err)
@@ -2952,7 +3342,10 @@ func (h *Handler) callUpdateAgent(agentName, agentID, policy, adminDID, orgID st
 	}
 	mw.Close()
 
-	endpoint := h.updateAgentEndpoint + "agent-admin/v1/update-agent-policies"
+	endpoint, err := h.agentServiceURL(h.updateAgentEndpoint, "UPDATE_AGENT_ENDPOINT", "agent-admin", "v1", "update-agent-policies")
+	if err != nil {
+		return fmt.Errorf("callUpdateAgent: %v", err)
+	}
 	resp, err := http.Post(endpoint, mw.FormDataContentType(), &buf)
 	if err != nil {
 		return fmt.Errorf("callUpdateAgent: http post: %v", err)
@@ -3254,13 +3647,27 @@ func readPolicyFile(c *gin.Context) (string, bool) {
 	return string(raw), true
 }
 
+// AgentsCreationRequestsList returns every request row (any request_type —
+// deploy_agent, agent_access, ...), scoped to the whole org for an admin
+// caller or to just the caller's own requests otherwise.
 func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing org context"})
+		return
+	}
+
+	isAdmin := c.GetBool(CtxIsAdmin)
+	creatorDID := c.GetString(CtxDID)
+	email := c.GetString(CtxEmail)
+	if !isAdmin && creatorDID == "" && email != "" {
+		if u, err := h.db.GetOrgUserByEmail(email); err == nil && u.DID != "" {
+			creatorDID = u.DID
+		}
+	}
+	log.Printf("[AgentsCreationRequestsList v2-all-types] isAdmin=%v creatorDID=%q orgID=%q page=%s", isAdmin, creatorDID, orgID, c.Query("page"))
+	if !isAdmin && creatorDID == "" {
+		c.JSON(http.StatusOK, Response{Status: false, Message: "no_did", Data: map[string]string{"email": email}})
 		return
 	}
 
@@ -3271,17 +3678,31 @@ func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	total, err := h.db.CountRequestsByOrg(orgID, "deploy_agent")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count requests: %v", err)})
-		return
+	var (
+		total    int
+		requests []*db.RequestRecord
+		err      error
+	)
+	if isAdmin {
+		total, err = h.db.CountAllRequestsByOrg(orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count requests: %v", err)})
+			return
+		}
+		requests, err = h.db.GetAllRequestsByOrg(orgID, pageSize, offset)
+	} else {
+		total, err = h.db.CountAllRequestsByUser(creatorDID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count requests: %v", err)})
+			return
+		}
+		requests, err = h.db.GetAllRequestsByUser(creatorDID, pageSize, offset)
 	}
-
-	requests, err := h.db.GetRequestsByOrg(orgID, "deploy_agent", pageSize, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch requests: %v", err)})
 		return
 	}
+	log.Printf("[AgentsCreationRequestsList v2-all-types] total=%d returned=%d isAdmin=%v", total, len(requests), isAdmin)
 
 	c.JSON(http.StatusOK, Response{
 		Status: true,
@@ -3296,9 +3717,6 @@ func (h *Handler) AgentsCreationRequestsList(c *gin.Context) {
 }
 
 func (h *Handler) AgentsCreationRequestsListUser(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	creatorDID := c.GetString(CtxDID)
 	email := c.GetString(CtxEmail)
 	log.Printf("[AgentsCreationRequestsListUser] ctx did=%q email=%q org_id=%q", creatorDID, email, c.GetString(CtxOrgID))
@@ -3321,17 +3739,27 @@ func (h *Handler) AgentsCreationRequestsListUser(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
+	log.Printf("[AgentsCreationRequestsListUser] querying creator_did=%q request_type=deploy_agent page=%d pageSize=%d offset=%d", creatorDID, page, pageSize, offset)
+
 	total, err := h.db.CountRequestsByUser(creatorDID, "deploy_agent")
 	if err != nil {
+		log.Printf("[AgentsCreationRequestsListUser] count failed creator_did=%q err=%v", creatorDID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count requests: %v", err)})
 		return
 	}
+	log.Printf("[AgentsCreationRequestsListUser] total matching rows=%d creator_did=%q", total, creatorDID)
 
 	requests, err := h.db.GetRequestsByUser(creatorDID, "deploy_agent", pageSize, offset)
 	if err != nil {
+		log.Printf("[AgentsCreationRequestsListUser] fetch failed creator_did=%q err=%v", creatorDID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch requests: %v", err)})
 		return
 	}
+	ids := make([]string, 0, len(requests))
+	for _, r := range requests {
+		ids = append(ids, r.RequestID)
+	}
+	log.Printf("[AgentsCreationRequestsListUser] returning %d row(s) creator_did=%q request_ids=%v", len(requests), creatorDID, ids)
 
 	c.JSON(http.StatusOK, Response{
 		Status: true,
@@ -3346,9 +3774,6 @@ func (h *Handler) AgentsCreationRequestsListUser(c *gin.Context) {
 }
 
 func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	creatorDID := c.GetString(CtxDID)
 	orgID := c.GetString(CtxOrgID)
 	if creatorDID == "" || orgID == "" {
@@ -3439,9 +3864,6 @@ func (h *Handler) AgentsCreationRequestsCreate(c *gin.Context) {
 }
 
 func (h *Handler) AgentsCreationRequestsEdit(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	creatorDID := c.GetString(CtxDID)
 	if creatorDID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
@@ -3464,7 +3886,7 @@ func (h *Handler) AgentsCreationRequestsEdit(c *gin.Context) {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "request not found"})
 		return
 	}
-	if existing.CreatorDID != creatorDID {
+	if !h.db.SameUserDID(existing.CreatorDID, creatorDID) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized to edit this request"})
 		return
 	}
@@ -3482,9 +3904,6 @@ func (h *Handler) AgentsCreationRequestsEdit(c *gin.Context) {
 }
 
 func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return
@@ -3554,9 +3973,6 @@ func (h *Handler) AgentCreationRequestSubmit(c *gin.Context) {
 }
 
 func (h *Handler) AgentInfoEdit(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return
@@ -3589,9 +4005,6 @@ func (h *Handler) AgentInfoEdit(c *gin.Context) {
 }
 
 func (h *Handler) AgentAccessRequestsListOrg(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return
@@ -3635,9 +4048,6 @@ func (h *Handler) AgentAccessRequestsListOrg(c *gin.Context) {
 }
 
 func (h *Handler) AgentAccessRequestsListUser(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	userDID := c.GetString(CtxDID)
 	if userDID == "" {
 		c.JSON(http.StatusUnauthorized, Response{Status: false, Message: "missing auth context"})
@@ -3676,9 +4086,6 @@ func (h *Handler) AgentAccessRequestsListUser(c *gin.Context) {
 }
 
 func (h *Handler) AgentAccessRequestSubmit(c *gin.Context) {
-	w := http.ResponseWriter(c.Writer)
-	enableCors(&w)
-
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return
@@ -3823,7 +4230,11 @@ func (h *Handler) fetchCbacDecisionReason(hash string) string {
 		log.Printf("[cbac] skipping lookup — cbacServiceURL=%q hash=%q", h.cbacServiceURL, hash)
 		return ""
 	}
-	url := strings.TrimRight(h.cbacServiceURL, "/") + "/decisions/by-hash/" + hash
+	url, err := joinURL(h.cbacServiceURL, "decisions", "by-hash", hash)
+	if err != nil {
+		log.Printf("[cbac] decision reason: %v", err)
+		return ""
+	}
 	log.Printf("[cbac] GET %s", url)
 	resp, err := http.Get(url)
 	if err != nil {
@@ -3885,7 +4296,10 @@ func (h *Handler) fetchAgentLHIScores(agentIDs []string) (map[string][]LHIScoreE
 		return nil, fmt.Errorf("marshal request: %v", err)
 	}
 
-	url := strings.TrimRight(h.cbacServiceURL, "/") + "/lhi-scores"
+	url, err := joinURL(h.cbacServiceURL, "lhi-scores")
+	if err != nil {
+		return nil, err
+	}
 	log.Printf("[cbac] POST %s agent_ids=%v", url, agentIDs)
 	resp, err := http.Post(url, "application/json", bytes.NewReader(reqBody))
 	if err != nil {
@@ -4072,21 +4486,34 @@ func (h *Handler) TopThreats(c *gin.Context) {
 		return
 	}
 
-	top, err := h.db.GetTopThreats(orgID, 5)
+	isAdmin := c.GetBool(CtxIsAdmin)
+	userDID := c.GetString(CtxDID)
+
+	var top []*db.TopThreatRecord
+	var err error
+	if isAdmin {
+		top, err = h.db.GetTopThreats(orgID)
+	} else {
+		top, err = h.db.GetTopThreatsByUser(userDID, orgID)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch top threats: %v", err)})
 		return
 	}
 
 	type topItem struct {
-		ThreatCode int    `json:"threat_code"`
+		ThreatCode string `json:"threat_code"`
 		Title      string `json:"title"`
 		Count      int    `json:"count"`
 	}
 	items := make([]topItem, 0, len(top))
 	for _, t := range top {
+		code := "0000"
+		if t.ThreatCode != 0 {
+			code = strconv.Itoa(t.ThreatCode)
+		}
 		items = append(items, topItem{
-			ThreatCode: t.ThreatCode,
+			ThreatCode: code,
 			Title:      t.Title,
 			Count:      t.Count,
 		})

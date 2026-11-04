@@ -11,35 +11,38 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	r.POST("/core/v1/register-agent", h.CoreRegisterAgent)
 	r.POST("/core/v1/register-tool", h.AppRegistration)
 	r.GET("/core/v1/did-by-email", h.CoreDIDByEmail)
-
+	// Authentication evidence from an observation point (MCP server, gateway).
+	r.POST("/core/v1/auth-evidence", h.StoreAuthEvidence)
 
 	// Dashboard — public
 	public := r.Group("/dashboard/v1")
-	public.POST("/login", h.Login)
+	public.POST("/login", h.Login)                     // org users
+	public.POST("/login/send-otp", h.SendLoginOTP)     // org users, passwordless: email a code
+	public.POST("/login/verify-otp", h.VerifyLoginOTP) // org users, passwordless: code → session
+	public.POST("/admin-login", h.AdminLogin)          // admins, verified by the admin server
 	public.POST("/send-otp", h.SendOTP)
 	public.POST("/forgot-password", h.ForgotPassword)
 	public.POST("/reset-password", h.ResetPassword)
 	public.POST("/register-user", h.RegisterUser)
-	public.POST("/signup", h.Signup)
-
-	// public.POST("/create-admin", h.CreateAdmin)
-	// public.POST("/register-admin", h.RegisterAdminMiddleware)
 
 	// CBAC authorization gate — called by the agent runtime / SDK.
 	public.POST("/authorize-action", h.AuthorizeAction)
 	public.GET("/global-stats", h.GlobalStats)
 
-	// Dashboard — JWT protected
-	dashboard := r.Group("/dashboard/v1", h.JWTAuthMiddleware())
-	dashboard.GET("/user-profile", h.UserProfile) 
-	dashboard.GET("/admin-profile", h.AdminProfile) 
+	// Dashboard — session protected (HttpOnly session cookie set by /login)
+	dashboard := r.Group("/dashboard/v1", h.SessionAuthMiddleware())
+	dashboard.GET("/session", h.Session)
+	dashboard.POST("/logout", h.Logout)
+	dashboard.POST("/logout-all", h.LogoutAll)
+	dashboard.GET("/user-profile", h.UserProfile)
+	dashboard.GET("/admin-profile", h.AdminProfile)
 
 	dashboard.GET("/home-metrics", h.HomeMetrics)
 	dashboard.GET("/interactions-list", h.InteractionsList)
-	dashboard.GET("/agent-metrics", h.AgentMetrics) 
+	dashboard.GET("/agent-metrics", h.AgentMetrics)
 
 	dashboard.GET("/agents-list", h.AgentsList)
-	dashboard.GET("/users-list", h.UsersList) 
+	dashboard.GET("/users-list", h.UsersList)
 	dashboard.POST("/create-user", h.CreateUser)
 	dashboard.GET("/agent-interactions", h.AgentInteractions)
 	dashboard.GET("/agent-intents", h.AgentIntents)
@@ -49,16 +52,22 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/tool-agent-scores", h.ToolAgentScores)
 	dashboard.POST("/revoke-agent", h.RevokeAgent)
 	dashboard.POST("/unrevoke-agent", h.UnrevokeAgent)
+	dashboard.POST("/update-user-status", h.UpdateUserStatus) // admin: revoke / whitelist a user ID on the admin server
 	dashboard.GET("/intent-info", h.IntentInfo)
+	dashboard.GET("/intent-auth-evidence", h.IntentAuthEvidence)
+	dashboard.GET("/resources-list", h.ResourcesList)
+	dashboard.GET("/resource-info", h.ResourceInfo)
+	dashboard.GET("/credentials-list", h.CredentialsList)
+	dashboard.GET("/credential-info", h.CredentialInfo)
+	dashboard.POST("/update-credential-status", h.UpdateCredentialStatus)
 	dashboard.POST("/update-intent-status", h.UpdateIntentStatus)
 	dashboard.GET("/intent-diagram", h.IntentDiagram)
-	dashboard.GET("/intent-block-data", h.GetIntentBlockData)
-	dashboard.GET("/intent-raw-data", h.GetIntentRawData)
 	dashboard.POST("/update-password", h.UpdatePassword)
 	dashboard.POST("/update-profile", h.UpdateProfile)
 	dashboard.GET("/tools-list", h.ToolsList)
 	dashboard.GET("/tool-info", h.ToolInfo)
 	dashboard.GET("/user-info", h.UserInfo)
+	dashboard.GET("/admins/:id", h.AdminInfo)
 	dashboard.GET("/intent-list", h.IntentList)
 	dashboard.GET("/threats-list", h.ThreatsList)
 	dashboard.GET("/threat-events", h.ThreatEvents)
@@ -70,13 +79,22 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/search", h.Search)
 	dashboard.GET("/agents-apps-metrics", h.AgentsAppsMetrics)
 
+	dashboard.GET("/observability-summary", h.ObservabilitySummary)
+	dashboard.GET("/observability-graph", h.ObservabilityGraph)
+	dashboard.GET("/observability-users", h.ObservabilityUsers)
+	dashboard.GET("/observability-user-flow", h.ObservabilityUserFlow)
+	dashboard.GET("/observability-agent-flow", h.ObservabilityAgentFlow)
+	dashboard.GET("/observability-app-flow", h.ObservabilityAppFlow)
+	dashboard.GET("/observability-intents", h.ObservabilityIntents)
+	dashboard.GET("/observability-paths", h.ObservabilityPaths)
+
 	dashboard.GET("/agents-creation-requests-list", h.AgentsCreationRequestsList)
 	dashboard.GET("/agents-creation-requests-list-user", h.AgentsCreationRequestsListUser)
 	dashboard.POST("/agents-creation-requests-create", h.AgentsCreationRequestsCreate)
 	dashboard.POST("/agents-creation-requests-edit", h.AgentsCreationRequestsEdit)
 
 	dashboard.POST("/agent-creation-request-result-submit", h.AgentCreationRequestSubmit)
-	dashboard.POST("/agent-info-edit", h.AgentInfoEdit) 
+	dashboard.POST("/agent-info-edit", h.AgentInfoEdit)
 
 	dashboard.GET("/agent-access-requests-list-org", h.AgentAccessRequestsListOrg)
 	dashboard.GET("/agent-access-requests-list-user", h.AgentAccessRequestsListUser)
@@ -89,6 +107,5 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/agent-policy", h.GetAgentPolicy)
 	dashboard.GET("/agent-policy-history", h.GetAgentPolicyHistory)
 	dashboard.GET("/agent-policy-update", h.GetAgentPolicyUpdate)
-	
-}
 
+}
