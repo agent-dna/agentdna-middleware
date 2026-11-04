@@ -646,14 +646,42 @@ var apiKeyDeliveryTmpl = template.Must(template.New("apikey").Parse(`
 
 // OTPVerification sends a 6-digit OTP code to the given email for registration verification.
 func OTPVerification(toEmail, code string) (Message, error) {
+	return otpMessage(toEmail, code, otpCopy{
+		Title:   "Verify your email",
+		Badge:   "Email Verification",
+		Heading: "Verify your email address",
+		Purpose: "complete your registration",
+		Subject: "Your AgentDNA verification code",
+	})
+}
+
+// LoginOTP sends a 6-digit OTP code a user signs in to the dashboard with.
+func LoginOTP(toEmail, code string) (Message, error) {
+	return otpMessage(toEmail, code, otpCopy{
+		Title:   "Sign in",
+		Badge:   "Sign-in Code",
+		Heading: "Your sign-in code",
+		Purpose: "sign in to your AgentDNA dashboard",
+		Subject: "Your AgentDNA sign-in code",
+	})
+}
+
+// otpCopy is the wording that differs between the OTP emails.
+type otpCopy struct {
+	Title, Badge, Heading, Purpose, Subject string
+}
+
+func otpMessage(toEmail, code string, copy otpCopy) (Message, error) {
 	data := struct {
+		otpCopy
 		Email string
 		Code  string
 		Year  int
 	}{
-		Email: toEmail,
-		Code:  code,
-		Year:  time.Now().Year(),
+		otpCopy: copy,
+		Email:   toEmail,
+		Code:    code,
+		Year:    time.Now().Year(),
 	}
 	html, err := render(otpVerificationTmpl, data)
 	if err != nil {
@@ -661,7 +689,7 @@ func OTPVerification(toEmail, code string) (Message, error) {
 	}
 	return Message{
 		To:      toEmail,
-		Subject: "Your AgentDNA verification code",
+		Subject: copy.Subject,
 		HTML:    html,
 	}, nil
 }
@@ -672,7 +700,7 @@ var otpVerificationTmpl = template.Must(template.New("otp-verification").Parse(`
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <title>Verify your email · AgentDNA</title>
+  <title>{{.Title}} · AgentDNA</title>
   <style>body{margin:0;padding:0;background:#F0F4F9;font-family:'Inter',-apple-system,sans-serif;}</style>
 </head>
 <body>
@@ -689,12 +717,12 @@ var otpVerificationTmpl = template.Must(template.New("otp-verification").Parse(`
         <tr><td style="padding:32px 40px 40px;">
           <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:20px;">
             <tr><td style="background:#EAF2FF;border-radius:999px;padding:5px 12px;">
-              <p style="margin:0;font-size:11px;font-weight:600;color:#1D5FD9;text-transform:uppercase;letter-spacing:.14em;line-height:1;">&#9679;&ensp;Email Verification</p>
+              <p style="margin:0;font-size:11px;font-weight:600;color:#1D5FD9;text-transform:uppercase;letter-spacing:.14em;line-height:1;">&#9679;&ensp;{{.Badge}}</p>
             </td></tr>
           </table>
-          <h1 style="margin:0 0 10px;font-size:28px;font-weight:800;color:#0A2240;">Verify your email address</h1>
+          <h1 style="margin:0 0 10px;font-size:28px;font-weight:800;color:#0A2240;">{{.Heading}}</h1>
           <p style="margin:0 0 24px;font-size:15.5px;color:#0E1A2B;line-height:1.7;">
-            Use the code below to complete your registration. It expires in <strong>5 minutes</strong>.
+            Use the code below to {{.Purpose}}. It expires in <strong>5 minutes</strong>.
           </p>
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
             <tr><td align="center" style="background:#F6F9FE;border:1.5px solid #DCE6F4;border-radius:12px;padding:28px 20px;">

@@ -29,7 +29,7 @@ func TestUnregisteredDIDsAcceptsEveryRegisteredDID(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, did := range []string{"old-did", "new-did"} {
-		if err := d.AddUserDIDByAPIKey(apiKey, did); err != nil {
+		if err := d.AddUserDIDByAPIKey(apiKey, did, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

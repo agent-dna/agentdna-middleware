@@ -109,9 +109,7 @@ func TestBuildIntentAuthEvidence_OrderAndFilter(t *testing.T) {
 		},
 		"sigC": {{RequestID: "sigC", Source: "server_in"}},
 	}
-
 	got := buildIntentAuthEvidence(interactions, byRequest)
-
 	if len(got) != 2 {
 		t.Fatalf("want 2 interactions with evidence, got %d", len(got))
 	}

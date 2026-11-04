@@ -50,10 +50,12 @@ type userFromAPIKeyResult struct {
 // CoreRegisterUser is called by the external server to add a DID to the user
 // identified by their API key. A user may hold several DIDs; the newest one
 // becomes their primary DID. A DID already held by another user returns 409.
+// The user is also registered with the admin server (POST /agent-admin/v1/users)
+// atomically: if the admin server rejects it, the DID is not stored locally.
 // POST /core/v1/register-user
 // Header: X-API-Key: <api_key>
 // Body:   {"user_id": "did:rubix:xyz"}
-func (h *Handler) CoreRegisterUser(c *gin.Context) {
+func (h *Handler)CoreRegisterUser(c *gin.Context) {
 	user, ok := h.userFromAPIKey(c)
 	if !ok {
 		return
@@ -67,9 +69,21 @@ func (h *Handler) CoreRegisterUser(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.AddUserDIDByAPIKey(user.APIKey, req.UserID); err != nil {
+	// The admin server registration runs inside the local transaction, after the
+	// local writes succeed and before they commit, so the DID is only kept
+	// locally when the admin server accepted the user too.
+	registerWithAdmin := func(email string) error {
+		return h.callRegisterUser(req.UserID, email, user.APIKey)
+	}
+	if err := h.db.AddUserDIDByAPIKey(user.APIKey, req.UserID, registerWithAdmin); err != nil {
 		if errors.Is(err, db.ErrDIDTaken) {
 			c.JSON(http.StatusConflict, Response{Status: false, Message: "this DID is already registered to another user"})
+			return
+		}
+		var rejected *adminRejectedError
+		if errors.As(err, &rejected) {
+			log.Printf("[CoreRegisterUser] admin server rejected user_id=%s: %s", req.UserID, rejected.message)
+			c.JSON(http.StatusConflict, Response{Status: false, Message: rejected.message})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to add user DID: %v", err)})
