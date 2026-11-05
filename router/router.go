@@ -52,7 +52,7 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.GET("/tool-agent-scores", h.ToolAgentScores)
 	dashboard.POST("/revoke-agent", h.RevokeAgent)
 	dashboard.POST("/unrevoke-agent", h.UnrevokeAgent)
-	dashboard.POST("/update-user-status", h.UpdateUserStatus) // admin: revoke / whitelist a user ID on the admin server
+	dashboard.POST("/update-user-status", h.UpdateUserStatus) // admin: revoke / whitelist a user (by email) on the admin server
 	dashboard.GET("/intent-info", h.IntentInfo)
 	dashboard.GET("/intent-auth-evidence", h.IntentAuthEvidence)
 	dashboard.GET("/resources-list", h.ResourcesList)

@@ -24,7 +24,7 @@ WORKDIR /app
 COPY --from=build /out/server /app/server
 
 # SERVER_PORT is the only var with a sane default; DATABASE_URL, RUBIX_NODE_URL,
-# JWT_SECRET and ADMIN_SERVICE_URL must be supplied at runtime.
+
 ENV SERVER_PORT=8080
 EXPOSE 8080
 

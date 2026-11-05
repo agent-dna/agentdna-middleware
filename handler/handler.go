@@ -2352,8 +2352,9 @@ func (h *Handler) UnrevokeAgent(c *gin.Context) {
 }
 
 // UpdateUserStatus revokes (is_active=false) or whitelists (is_active=true) a
-// user ID. User status lives only on the admin server, so nothing is written
-// locally.
+// user by email. The admin server applies it to every DID the user holds and
+// to DIDs they register later. User status lives only on the admin server, so
+// nothing is written locally.
 func (h *Handler) UpdateUserStatus(c *gin.Context) {
 	if !c.GetBool(CtxIsAdmin) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
@@ -2361,16 +2362,16 @@ func (h *Handler) UpdateUserStatus(c *gin.Context) {
 	}
 
 	var req struct {
-		UserID   string `json:"user_id"`
+		Email    string `json:"email"`
 		IsActive *bool  `json:"is_active"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid request body"})
 		return
 	}
-	req.UserID = strings.TrimSpace(req.UserID)
-	if req.UserID == "" {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "user_id is required"})
+	req.Email = strings.TrimSpace(req.Email)
+	if req.Email == "" {
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "email is required"})
 		return
 	}
 	if req.IsActive == nil {
@@ -2378,15 +2379,15 @@ func (h *Handler) UpdateUserStatus(c *gin.Context) {
 		return
 	}
 
-	found, err := h.setAdminUserStatus(req.UserID, *req.IsActive)
+	found, err := h.setAdminUserStatus(req.Email, *req.IsActive)
 	if err != nil {
 		var rejected *adminRejectedError
 		if errors.As(err, &rejected) {
-			log.Printf("[UpdateUserStatus] admin server rejected user_id=%s is_active=%t: %s", req.UserID, *req.IsActive, rejected.message)
+			log.Printf("[UpdateUserStatus] admin server rejected email=%s is_active=%t: %s", req.Email, *req.IsActive, rejected.message)
 			c.JSON(http.StatusBadRequest, Response{Status: false, Message: rejected.message})
 			return
 		}
-		log.Printf("[UpdateUserStatus] error user_id=%s err=%v", req.UserID, err)
+		log.Printf("[UpdateUserStatus] error email=%s err=%v", req.Email, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to update user status: %v", err)})
 		return
 	}
@@ -2399,8 +2400,8 @@ func (h *Handler) UpdateUserStatus(c *gin.Context) {
 	if *req.IsActive {
 		msg = "user whitelisted"
 	}
-	log.Printf("[UpdateUserStatus] user_id=%s is_active=%t", req.UserID, *req.IsActive)
-	c.JSON(http.StatusOK, Response{Status: true, Message: msg, Data: gin.H{"user_id": req.UserID, "is_active": *req.IsActive}})
+	log.Printf("[UpdateUserStatus] email=%s is_active=%t", req.Email, *req.IsActive)
+	c.JSON(http.StatusOK, Response{Status: true, Message: msg, Data: gin.H{"email": req.Email, "is_active": *req.IsActive}})
 }
 
 func (h *Handler) AgentInfo(c *gin.Context) {
@@ -3123,11 +3124,11 @@ func (h *Handler) adminUserStatus(userID string) (bool, error) {
 }
 
 // setAdminUserStatus whitelists (isActive=true) or revokes (isActive=false) a
-// user ID on the admin server. found is false when the admin server has no
-// such user ID.
-func (h *Handler) setAdminUserStatus(userID string, isActive bool) (found bool, err error) {
+// user, addressed by email, on the admin server. found is false when the
+// admin server has no such user.
+func (h *Handler) setAdminUserStatus(email string, isActive bool) (found bool, err error) {
 	err = h.callAdmin("setAdminUserStatus", http.MethodPatch, map[string]bool{"is_active": isActive}, &found,
-		"agent-admin", "v1", "users", userID, "status")
+		"agent-admin", "v1", "users", email, "status_by_email")
 	return found, err
 }
 
