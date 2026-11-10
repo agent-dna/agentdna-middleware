@@ -65,31 +65,66 @@ func (h *Handler)CoreRegisterUser(c *gin.Context) {
 		UserID string `json:"user_id" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[CoreRegisterUser] rejected — user_id missing email=%q", user.Email)
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "user_id is required"})
 		return
 	}
+
+	// The DIDs this user already holds tell a 409 from the admin server apart:
+	// the same DID again (a retry) or an extra DID for a user the admin server
+	// already has (its POST /users only takes a user's first user ID).
+	existingDIDs, err := h.db.GetUserDIDsByDID(user.DID)
+	if err != nil {
+		log.Printf("[CoreRegisterUser] loading existing DIDs email=%q did=%q failed: %v", user.Email, user.DID, err)
+	}
+	alreadyHeld := false
+	for _, d := range existingDIDs {
+		if d == req.UserID {
+			alreadyHeld = true
+			break
+		}
+	}
+	log.Printf("[CoreRegisterUser] request user_id=%q email=%q current_did=%q existing_dids=%v already_held=%t first_did=%t",
+		req.UserID, user.Email, user.DID, existingDIDs, alreadyHeld, len(existingDIDs) == 0)
 
 	// The admin server registration runs inside the local transaction, after the
 	// local writes succeed and before they commit, so the DID is only kept
 	// locally when the admin server accepted the user too.
 	registerWithAdmin := func(email string) error {
+		log.Printf("[CoreRegisterUser] local DID write ok, registering with admin server user_id=%q email=%q", req.UserID, email)
 		return h.callRegisterUser(req.UserID, email, user.APIKey)
 	}
 	if err := h.db.AddUserDIDByAPIKey(user.APIKey, req.UserID, registerWithAdmin); err != nil {
 		if errors.Is(err, db.ErrDIDTaken) {
+			log.Printf("[CoreRegisterUser] 409 DID held by another user user_id=%q email=%q", req.UserID, user.Email)
 			c.JSON(http.StatusConflict, Response{Status: false, Message: "this DID is already registered to another user"})
 			return
 		}
 		var rejected *adminRejectedError
+		if errors.As(err, &rejected) && alreadyHeld {
+			// A repeat registration of a DID this user already holds: the admin
+			// server has it from the first call, so treat the retry as success.
+			log.Printf("[CoreRegisterUser] DID already registered, treating as success user_id=%q email=%q admin_message=%q",
+				req.UserID, user.Email, rejected.message)
+			c.JSON(http.StatusOK, Response{Status: true, Message: "DID already registered"})
+			return
+		}
 		if errors.As(err, &rejected) {
-			log.Printf("[CoreRegisterUser] admin server rejected user_id=%s: %s", req.UserID, rejected.message)
+			reason := "new DID for a user with none"
+			if len(existingDIDs) > 0 {
+				reason = fmt.Sprintf("additional DID — user already has %d, admin server only accepts the first", len(existingDIDs))
+			}
+			log.Printf("[CoreRegisterUser] 409 admin server rejected user_id=%q email=%q reason=%q admin_message=%q",
+				req.UserID, user.Email, reason, rejected.message)
 			c.JSON(http.StatusConflict, Response{Status: false, Message: rejected.message})
 			return
 		}
+		log.Printf("[CoreRegisterUser] 500 user_id=%q email=%q err=%v", req.UserID, user.Email, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to add user DID: %v", err)})
 		return
 	}
 
+	log.Printf("[CoreRegisterUser] registered user_id=%q email=%q", req.UserID, user.Email)
 	c.JSON(http.StatusOK, Response{Status: true, Message: ""})
 }
 
