@@ -2222,21 +2222,31 @@ func (h *Handler) AppRegistration(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "tool_name and tool_id are required"})
 		return
 	}
-	// The admin server registration runs inside the local transaction, after the
-	// insert succeeds and before it commits, so the tool is only kept locally
-	// when the admin server accepted it too. A tool already stored locally is
-	// not re-sent to the admin server.
-	registerWithAdmin := func() error {
-		return h.callRegisterTool(req.ToolID, req.ToolName)
+	// A tool already stored locally is not re-sent to the admin server.
+	// (IsNewTool reports whether the DID is already in new_tools.)
+	if h.db.IsNewTool(req.ToolID) {
+		log.Printf("[AppRegistration] tool already registered tool_id=%s", req.ToolID)
+		c.JSON(http.StatusOK, Response{Status: true, Message: "app registered successfully"})
+		return
 	}
-	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, h.orgID, registerWithAdmin); err != nil {
+
+	// Register with the admin server first; the tool is only stored locally
+	// once the admin server has accepted it. The admin server accepts
+	// duplicates, so if the local insert below fails a retry recovers.
+	if err := h.callRegisterTool(req.ToolID, req.ToolName); err != nil {
 		var rejected *adminRejectedError
 		if errors.As(err, &rejected) {
 			log.Printf("[AppRegistration] admin server rejected tool_id=%s: %s", req.ToolID, rejected.message)
 			c.JSON(http.StatusConflict, Response{Status: false, Message: rejected.message})
 			return
 		}
-		log.Printf("[AppRegistration] error tool_id=%s err=%v", req.ToolID, err)
+		log.Printf("[AppRegistration] admin server error tool_id=%s err=%v", req.ToolID, err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register app: %v", err)})
+		return
+	}
+
+	if err := h.db.StoreNewTool(req.ToolID, req.ToolName, h.orgID); err != nil {
+		log.Printf("[AppRegistration] local store error tool_id=%s err=%v", req.ToolID, err)
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to register app: %v", err)})
 		return
 	}
