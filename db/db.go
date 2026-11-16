@@ -634,20 +634,102 @@ func New(dsn string) *DB {
 	// Auth evidence is matched to its interaction by signature (request_id).
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_interactions_signature ON new_interactions (signature)`)
 
-	// resources: every destination a server called while serving a request
-	// (auth_evidence rows with source server_out), keyed by the destination
-	// exactly as recorded.
-	//   credentials  {"<credentialID>": {"authMethod": "...", "intents": ["<intentID>", ...]}}
-	//   intents      ["<intentID>", ...] - every intent it was accessed in,
-	//                including with no credential
-	// Filled from both sides, since evidence and the signed chain arrive in
-	// either order: see RecordResourceAccess.
-	conn.Exec(`CREATE TABLE IF NOT EXISTS resources (
-		id          TEXT PRIMARY KEY,
-		name        TEXT NOT NULL DEFAULT '',
-		credentials JSONB NOT NULL DEFAULT '{}'::jsonb,
-		intents     JSONB NOT NULL DEFAULT '[]'::jsonb
-	)`)
+	// Resources: every destination a server called while serving a request
+	// (auth_evidence rows with source server_out).
+	//
+	//   resource_bases     the known services (loaded by an ops script, ~100
+	//                      rows) plus any host an admin set a trust status on.
+	//                      Trust status lives here.
+	//   resource_accesses  one row per (url, intent, credential) actually seen.
+	//   resource_access_groups (view)
+	//                      each access matched, at read time, to the base with
+	//                      the same host and the longest path_prefix that its
+	//                      path starts with on a "/" boundary. No match: the
+	//                      access groups under its host, Unreviewed.
+	//
+	// Grouping is never stored, so adding or changing a base regroups all
+	// past accesses at once. URLs and bases are both normalized by
+	// resource_url_parts, so the two sides cannot disagree.
+	//
+	// The old JSONB "resources" table is no longer written or read; its trust
+	// statuses are carried into resource_bases by BackfillResources.
+	for _, stmt := range []string{
+		// resource_url_parts("POST https://www.Atlasisin.com:443/jira/t1/?q=1#x")
+		//   -> host "atlasisin.com", path "/jira/t1"
+		// Drops a leading HTTP method (destinations arrive as "POST https://..."),
+		// scheme, userinfo, "www.", default ports, query, fragment and trailing
+		// "/"; lowercases the host. A bare host has path ''.
+		`CREATE OR REPLACE FUNCTION resource_url_parts(raw TEXT, OUT host TEXT, OUT path TEXT)
+		 LANGUAGE sql IMMUTABLE AS $$
+			SELECT regexp_replace(regexp_replace(lower(regexp_replace(split_part(v, '/', 1), '^.*@', '')),
+			                                     '^www\.', ''), ':(80|443)$', ''),
+			       CASE WHEN strpos(v, '/') > 0 THEN regexp_replace(substr(v, strpos(v, '/')), '/+$', '') ELSE '' END
+			FROM (SELECT regexp_replace(regexp_replace(regexp_replace(btrim(COALESCE(raw, '')),
+			             '^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|CONNECT|TRACE)\s+', '', 'i'),
+			             '^[A-Za-z][A-Za-z0-9+.-]*://', ''), '[?#].*$', '') AS v) s
+		 $$`,
+		`CREATE TABLE IF NOT EXISTS resource_bases (
+			id           SERIAL PRIMARY KEY,
+			base_url     TEXT NOT NULL,
+			host         TEXT NOT NULL DEFAULT '',
+			path_prefix  TEXT NOT NULL DEFAULT '',
+			name         TEXT NOT NULL DEFAULT '',
+			trust_status TEXT NOT NULL DEFAULT 'Unreviewed'
+			             CHECK (trust_status IN ('Unreviewed', 'Flagged', 'Trusted')),
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (host, path_prefix)
+		)`,
+		// Fills host/path_prefix from base_url, so the ops script only
+		// inserts (base_url, name) in whatever form it has the URL.
+		`CREATE OR REPLACE FUNCTION resource_bases_normalize() RETURNS trigger
+		 LANGUAGE plpgsql AS $$
+		 BEGIN
+			SELECT p.host, p.path INTO NEW.host, NEW.path_prefix FROM resource_url_parts(NEW.base_url) p;
+			IF NEW.host = '' THEN
+				RAISE EXCEPTION 'resource_bases: base_url % has no host', NEW.base_url
+					USING ERRCODE = 'check_violation';
+			END IF;
+			IF COALESCE(NEW.name, '') = '' THEN
+				NEW.name := NEW.host || NEW.path_prefix;
+			END IF;
+			RETURN NEW;
+		 END $$`,
+		`DROP TRIGGER IF EXISTS resource_bases_normalize ON resource_bases`,
+		`CREATE TRIGGER resource_bases_normalize BEFORE INSERT OR UPDATE OF base_url ON resource_bases
+		 FOR EACH ROW EXECUTE FUNCTION resource_bases_normalize()`,
+		`CREATE TABLE IF NOT EXISTS resource_accesses (
+			url           TEXT NOT NULL,
+			host          TEXT NOT NULL,
+			path          TEXT NOT NULL DEFAULT '',
+			intent_id     TEXT NOT NULL,
+			credential_id TEXT NOT NULL DEFAULT '',
+			auth_method   TEXT NOT NULL DEFAULT '',
+			first_seen    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (url, intent_id, credential_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_resource_accesses_intent ON resource_accesses (intent_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_resource_accesses_host ON resource_accesses (host)`,
+		`CREATE OR REPLACE VIEW resource_access_groups AS
+		 SELECT ra.url, ra.host, ra.path, ra.intent_id, ra.credential_id, ra.auth_method, ra.first_seen,
+		        COALESCE(b.host || b.path_prefix, ra.host)    AS resource_id,
+		        COALESCE(b.name, ra.host)                     AS resource_name,
+		        COALESCE(b.trust_status, 'Unreviewed')        AS trust_status
+		 FROM resource_accesses ra
+		 LEFT JOIN LATERAL (
+			SELECT rb.host, rb.path_prefix, rb.name, rb.trust_status
+			FROM resource_bases rb
+			WHERE rb.host = ra.host
+			  AND (rb.path_prefix = ''
+			       OR ra.path = rb.path_prefix
+			       OR left(ra.path, length(rb.path_prefix) + 1) = rb.path_prefix || '/')
+			ORDER BY length(rb.path_prefix) DESC
+			LIMIT 1
+		 ) b ON TRUE`,
+	} {
+		if _, err := conn.Exec(stmt); err != nil {
+			log.Printf("[migrate] resources: %v", err)
+		}
+	}
 
 	// credentials: the status an admin gave a credential. Only credentials
 	// someone has set a status on have a row; no row means active.

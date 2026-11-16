@@ -2550,6 +2550,29 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 	// Derived on every read from the stored evidence, never cached as a verdict.
 	hopEvidence, continuity := h.authEvidenceForIntent(intentID, interactions)
 
+	// Every destination a server called while serving this intent, with the
+	// trust status an admin has given it (Unreviewed until reviewed).
+	intentResources, err := h.db.GetIntentResources(intentID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch intent resources: %v", err)})
+		return
+	}
+	resources := make([]gin.H, 0, len(intentResources))
+	for _, r := range intentResources {
+		urls := r.URLs
+		if urls == nil {
+			urls = []string{}
+		}
+		resources = append(resources, gin.H{
+			"resourceID":  r.ID,
+			"name":        r.Name,
+			"url":         r.ID,
+			"trustStatus": r.TrustStatus,
+			// The full URLs this intent actually hit under this resource.
+			"urls": urls,
+		})
+	}
+
 	// new_intents.threat_detected is written once by handleIntentWorkflow at
 	// intent-creation time and never recomputed, so it can drift stale
 	// relative to the interactions' own threat flags (the same bug fixed in
@@ -2603,6 +2626,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"lastInteractionAt":  intent.LastInteractionAt,
 		"runtimeSeconds":     intent.RuntimeSeconds,
 		"continuity":         continuity,
+		"resources":          resources,
 		"interactions":       txns,
 	}
 	if intent.EndedAt != nil {

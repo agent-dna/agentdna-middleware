@@ -3667,11 +3667,12 @@ type AuthEvidenceRecord struct {
 // second finds the other and does the write; until the interaction exists there
 // is no intent to record against, and it returns 0.
 //
-// One INSERT ... ON CONFLICT per intent, so concurrent writes to the same
-// resource cannot drop each other. Lists keep first-seen order, and an intent
-// is never added twice, so running it again changes nothing.
+// One resource_accesses row per (normalized url, intent, credential); the
+// resource it belongs to is decided at read time (resource_access_groups), so
+// nothing here depends on resource_bases. Running it again changes nothing
+// except refreshing a non-empty auth_method.
 func (d *DB) RecordResourceAccess(requestID, destination, credentialID, authMethod string) (int, error) {
-	if destination == "" {
+	if strings.TrimSpace(destination) == "" {
 		return 0, nil
 	}
 	rows, err := d.conn.Query(
@@ -3695,24 +3696,13 @@ func (d *DB) RecordResourceAccess(requestID, destination, credentialID, authMeth
 
 	for _, intentID := range intents {
 		_, err := d.conn.Exec(`
-			INSERT INTO resources AS r (id, name, credentials, intents)
-			VALUES ($1, $1,
-				CASE WHEN $2::text = '' THEN '{}'::jsonb
-				     ELSE jsonb_build_object($2::text, jsonb_build_object('authMethod', $3::text, 'intents', jsonb_build_array($4::text)))
-				END,
-				jsonb_build_array($4::text))
-			ON CONFLICT (id) DO UPDATE SET
-				intents = CASE WHEN r.intents @> jsonb_build_array($4::text) THEN r.intents
-				               ELSE r.intents || jsonb_build_array($4::text) END,
-				credentials = CASE WHEN $2::text = '' THEN r.credentials
-					ELSE jsonb_set(r.credentials, ARRAY[$2::text], jsonb_build_object(
-						'authMethod', $3::text,
-						'intents', CASE
-							WHEN COALESCE(r.credentials->$2::text->'intents', '[]'::jsonb) @> jsonb_build_array($4::text)
-								THEN r.credentials->$2::text->'intents'
-							ELSE COALESCE(r.credentials->$2::text->'intents', '[]'::jsonb) || jsonb_build_array($4::text)
-						END))
-				END`,
+			INSERT INTO resource_accesses AS ra (url, host, path, intent_id, credential_id, auth_method)
+			SELECT p.host || p.path, p.host, p.path, $4, $2, $3
+			FROM resource_url_parts($1) p
+			WHERE p.host <> ''
+			ON CONFLICT (url, intent_id, credential_id) DO UPDATE
+				SET auth_method = EXCLUDED.auth_method
+				WHERE EXCLUDED.auth_method <> '' AND EXCLUDED.auth_method <> ra.auth_method`,
 			destination, credentialID, authMethod, intentID,
 		)
 		if err != nil {
@@ -3744,16 +3734,30 @@ func (d *DB) RecordResourcesForRequest(requestID string) (int, error) {
 	return total, nil
 }
 
-// BackfillResources fills resources from the evidence already stored. It only
-// runs while the table is empty - once both write paths are live they keep it
-// current - so it costs nothing on later starts.
+// BackfillResources fills resource_accesses from the evidence already stored.
+// It only runs while the table is empty - once both write paths are live they
+// keep it current - so it costs nothing on later starts.
+//
+// On that first run it also carries every non-default trust status from the
+// legacy JSONB "resources" table into resource_bases, so statuses admins set
+// before the move are kept.
 func (d *DB) BackfillResources() (int, error) {
 	var existing bool
-	if err := d.conn.QueryRow(`SELECT EXISTS (SELECT 1 FROM resources)`).Scan(&existing); err != nil {
+	if err := d.conn.QueryRow(`SELECT EXISTS (SELECT 1 FROM resource_accesses)`).Scan(&existing); err != nil {
 		return 0, err
 	}
 	if existing {
 		return 0, nil
+	}
+	if _, err := d.conn.Exec(`DO $$ BEGIN
+		IF to_regclass('resources') IS NOT NULL THEN
+			INSERT INTO resource_bases (base_url, name, trust_status)
+			SELECT id, '', trust_status FROM resources
+			WHERE trust_status <> 'Unreviewed' AND (resource_url_parts(id)).host <> ''
+			ON CONFLICT (host, path_prefix) DO NOTHING;
+		END IF;
+	END $$`); err != nil {
+		return 0, fmt.Errorf("carry legacy trust statuses: %w", err)
 	}
 	// Oldest first, so lists keep the order intents happened in.
 	evidence, err := d.serverOutEvidence(`
@@ -3777,16 +3781,35 @@ func (d *DB) BackfillResources() (int, error) {
 	return total, nil
 }
 
-// ResourceSummary is a resource with its counts.
+// Trust statuses an admin can set on a resource. Every resource starts
+// ResourceUnreviewed.
+const (
+	ResourceUnreviewed = "Unreviewed"
+	ResourceFlagged    = "Flagged"
+	ResourceTrusted    = "Trusted"
+)
+
+var ValidResourceTrustStatuses = map[string]bool{
+	ResourceUnreviewed: true,
+	ResourceFlagged:    true,
+	ResourceTrusted:    true,
+}
+
+// ResourceSummary is a resource (a base from resource_bases, or a host no
+// base matches) with its counts across every URL grouped under it. URLs is
+// only filled by GetIntentResources: the full URLs that one intent hit.
 type ResourceSummary struct {
 	ID              string
 	Name            string
+	TrustStatus     string
 	IntentCount     int
 	CredentialCount int
+	URLs            []string
 }
 
 // ResourceIntent is one intent that reached a resource, with the credentials
-// it reached it with (empty when it went without one).
+// it reached it with (empty when it went without one) and the full URLs under
+// the resource it hit.
 type ResourceIntent struct {
 	IntentID       string
 	InitiatorDID   string
@@ -3797,6 +3820,7 @@ type ResourceIntent struct {
 	ThreatDetected bool
 	StartedAt      sql.NullTime
 	CredentialIDs  []string
+	URLs           []string
 }
 
 // ResourceCredential is one credential used against a resource, with the
@@ -3808,23 +3832,46 @@ type ResourceCredential struct {
 	Status       string
 }
 
-const resourceSummaryColumns = `
-	id, name, jsonb_array_length(intents),
-	(SELECT COUNT(*) FROM jsonb_object_keys(credentials))`
+// resourceSummarySelect aggregates resource_access_groups (alias g) into one
+// row per resource; callers add WHERE and must GROUP BY resourceSummaryGroup.
+const resourceSummarySelect = `
+	SELECT g.resource_id, g.resource_name, g.trust_status,
+	       COUNT(DISTINCT g.intent_id),
+	       COUNT(DISTINCT g.credential_id) FILTER (WHERE g.credential_id <> '')`
 
-func (d *DB) CountResources() (int, error) {
+const resourceSummaryGroup = ` GROUP BY g.resource_id, g.resource_name, g.trust_status`
+
+func scanResourceSummary(sc interface{ Scan(...any) error }, extra ...any) (*ResourceSummary, error) {
+	r := &ResourceSummary{}
+	dest := append([]any{&r.ID, &r.Name, &r.TrustStatus, &r.IntentCount, &r.CredentialCount}, extra...)
+	if err := sc.Scan(dest...); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// CountResources counts resources; with trustStatus set, only those with
+// that trust status.
+func (d *DB) CountResources(trustStatus string) (int, error) {
 	var total int
-	err := d.conn.QueryRow(`SELECT COUNT(*) FROM resources`).Scan(&total)
+	err := d.conn.QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT g.resource_id FROM resource_access_groups g
+			WHERE $1::text = '' OR g.trust_status = $1::text
+			GROUP BY g.resource_id
+		) s`, trustStatus).Scan(&total)
 	return total, err
 }
 
-// ListResources returns a page of resources, most-used first.
-func (d *DB) ListResources(limit, offset int) ([]*ResourceSummary, error) {
-	rows, err := d.conn.Query(`SELECT`+resourceSummaryColumns+`
-		FROM resources
-		ORDER BY jsonb_array_length(intents) DESC, id
-		LIMIT $1 OFFSET $2`,
-		limit, offset,
+// ListResources returns a page of resources, most-used first; with
+// trustStatus set, only those with that trust status.
+func (d *DB) ListResources(trustStatus string, limit, offset int) ([]*ResourceSummary, error) {
+	rows, err := d.conn.Query(resourceSummarySelect+`
+		FROM resource_access_groups g
+		WHERE $1::text = '' OR g.trust_status = $1::text`+resourceSummaryGroup+`
+		ORDER BY 4 DESC, g.resource_id
+		LIMIT $2 OFFSET $3`,
+		trustStatus, limit, offset,
 	)
 	if err != nil {
 		return nil, err
@@ -3832,8 +3879,8 @@ func (d *DB) ListResources(limit, offset int) ([]*ResourceSummary, error) {
 	defer rows.Close()
 	out := []*ResourceSummary{}
 	for rows.Next() {
-		r := &ResourceSummary{}
-		if err := rows.Scan(&r.ID, &r.Name, &r.IntentCount, &r.CredentialCount); err != nil {
+		r, err := scanResourceSummary(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -3841,36 +3888,83 @@ func (d *DB) ListResources(limit, offset int) ([]*ResourceSummary, error) {
 	return out, rows.Err()
 }
 
-// GetResource returns resource id, or nil when there is none.
+// GetResource returns resource id, or nil when no access is grouped under it.
 func (d *DB) GetResource(id string) (*ResourceSummary, error) {
-	r := &ResourceSummary{}
-	err := d.conn.QueryRow(`SELECT`+resourceSummaryColumns+` FROM resources WHERE id = $1`, id).
-		Scan(&r.ID, &r.Name, &r.IntentCount, &r.CredentialCount)
+	r, err := scanResourceSummary(d.conn.QueryRow(resourceSummarySelect+`
+		FROM resource_access_groups g
+		WHERE g.resource_id = $1`+resourceSummaryGroup, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
+	return r, err
+}
+
+// SetResourceTrustStatus sets resource id's trust_status and returns the
+// updated resource, or nil when there is no such resource. status must be
+// in ValidResourceTrustStatuses.
+//
+// The status lives on resource_bases. A resource that is a base is updated in
+// place; a host no base matches gets a host-level base created for it (the
+// grouping is unchanged: a host-level base groups exactly that host's
+// unmatched URLs).
+func (d *DB) SetResourceTrustStatus(id, status string) (*ResourceSummary, error) {
+	existing, err := d.GetResource(id)
+	if err != nil || existing == nil {
+		return nil, err
+	}
+	if _, err := d.conn.Exec(`
+		INSERT INTO resource_bases (base_url, name, trust_status) VALUES ($1, $2, $3)
+		ON CONFLICT (host, path_prefix) DO UPDATE SET trust_status = EXCLUDED.trust_status`,
+		id, existing.Name, status); err != nil {
+		return nil, err
+	}
+	return d.GetResource(id)
+}
+
+// GetIntentResources returns every resource reached while serving intent
+// intentID, with its trust status and counts across all intents, most-used
+// first. URLs holds the full URLs this intent hit under each resource.
+func (d *DB) GetIntentResources(intentID string) ([]*ResourceSummary, error) {
+	rows, err := d.conn.Query(resourceSummarySelect+`,
+	       ARRAY_AGG(DISTINCT g.url) FILTER (WHERE g.intent_id = $1)
+		FROM resource_access_groups g
+		WHERE g.resource_id IN (SELECT resource_id FROM resource_access_groups WHERE intent_id = $1)`+
+		resourceSummaryGroup+`
+		ORDER BY 4 DESC, g.resource_id`,
+		intentID,
+	)
 	if err != nil {
 		return nil, err
 	}
-	return r, nil
+	defer rows.Close()
+	out := []*ResourceSummary{}
+	for rows.Next() {
+		var urls []string
+		r, err := scanResourceSummary(rows, pq.Array(&urls))
+		if err != nil {
+			return nil, err
+		}
+		r.URLs = urls
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // GetResourceIntents returns a page of the intents that reached resource id,
 // newest first. The total is GetResource's IntentCount. An intent missing
-// from new_intents is still listed, with only its id and credentials.
+// from new_intents is still listed, with only its id, credentials and URLs.
 func (d *DB) GetResourceIntents(id string, limit, offset int) ([]*ResourceIntent, error) {
 	rows, err := d.conn.Query(`
-		SELECT ri.intent_id, COALESCE(ni.initiator_did, ''), COALESCE(ni.initiator_name, ''),
+		SELECT g.intent_id, COALESCE(ni.initiator_did, ''), COALESCE(ni.initiator_name, ''),
 		       COALESCE(ni.status, ''), COALESCE(ni.review_status, 'Unreviewed'), COALESCE(ni.flow_type, ''),
 		       COALESCE(ni.threat_detected, 0) = 1, ni.started_at,
-		       ARRAY(SELECT c.key FROM jsonb_each(r.credentials) AS c
-		             WHERE COALESCE(c.value->'intents', '[]'::jsonb) @> jsonb_build_array(ri.intent_id)
-		             ORDER BY c.key)
-		FROM resources r
-		CROSS JOIN LATERAL jsonb_array_elements_text(r.intents) AS ri(intent_id)
-		LEFT JOIN new_intents ni ON ni.intent_id = ri.intent_id
-		WHERE r.id = $1
-		ORDER BY ni.started_at DESC NULLS LAST, ri.intent_id
+		       ARRAY_AGG(DISTINCT g.credential_id) FILTER (WHERE g.credential_id <> ''),
+		       ARRAY_AGG(DISTINCT g.url)
+		FROM resource_access_groups g
+		LEFT JOIN new_intents ni ON ni.intent_id = g.intent_id
+		WHERE g.resource_id = $1
+		GROUP BY g.intent_id, ni.intent_id
+		ORDER BY ni.started_at DESC NULLS LAST, g.intent_id
 		LIMIT $2 OFFSET $3`,
 		id, limit, offset,
 	)
@@ -3882,7 +3976,7 @@ func (d *DB) GetResourceIntents(id string, limit, offset int) ([]*ResourceIntent
 	for rows.Next() {
 		r := &ResourceIntent{}
 		if err := rows.Scan(&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.Status, &r.ReviewStatus,
-			&r.FlowType, &r.ThreatDetected, &r.StartedAt, pq.Array(&r.CredentialIDs)); err != nil {
+			&r.FlowType, &r.ThreatDetected, &r.StartedAt, pq.Array(&r.CredentialIDs), pq.Array(&r.URLs)); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -3892,16 +3986,18 @@ func (d *DB) GetResourceIntents(id string, limit, offset int) ([]*ResourceIntent
 
 // GetResourceCredentials returns a page of the credentials used against
 // resource id, most-used first. The total is GetResource's CredentialCount.
+// AuthMethod is the most recently recorded one.
 func (d *DB) GetResourceCredentials(id string, limit, offset int) ([]*ResourceCredential, error) {
 	rows, err := d.conn.Query(`
-		SELECT c.credential_id, COALESCE(c.info->>'authMethod', ''),
-		       jsonb_array_length(COALESCE(c.info->'intents', '[]'::jsonb)) AS intent_count,
+		SELECT g.credential_id,
+		       (ARRAY_AGG(g.auth_method ORDER BY g.first_seen DESC) FILTER (WHERE g.auth_method <> ''))[1],
+		       COUNT(DISTINCT g.intent_id) AS intent_count,
 		       COALESCE(cs.status, 'active')
-		FROM resources r
-		CROSS JOIN LATERAL jsonb_each(r.credentials) AS c(credential_id, info)
-		LEFT JOIN credentials cs ON cs.credential_id = c.credential_id
-		WHERE r.id = $1
-		ORDER BY intent_count DESC, c.credential_id
+		FROM resource_access_groups g
+		LEFT JOIN credentials cs ON cs.credential_id = g.credential_id
+		WHERE g.resource_id = $1 AND g.credential_id <> ''
+		GROUP BY g.credential_id, cs.status
+		ORDER BY intent_count DESC, g.credential_id
 		LIMIT $2 OFFSET $3`,
 		id, limit, offset,
 	)
@@ -3912,9 +4008,11 @@ func (d *DB) GetResourceCredentials(id string, limit, offset int) ([]*ResourceCr
 	out := []*ResourceCredential{}
 	for rows.Next() {
 		r := &ResourceCredential{}
-		if err := rows.Scan(&r.CredentialID, &r.AuthMethod, &r.IntentCount, &r.Status); err != nil {
+		var authMethod sql.NullString
+		if err := rows.Scan(&r.CredentialID, &authMethod, &r.IntentCount, &r.Status); err != nil {
 			return nil, err
 		}
+		r.AuthMethod = authMethod.String
 		out = append(out, r)
 	}
 	return out, rows.Err()
