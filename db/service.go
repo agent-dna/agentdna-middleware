@@ -3449,39 +3449,7 @@ func (d *DB) GetThreats(orgID string, limit, offset int) ([]*ThreatRecord, int, 
 }
 
 func (d *DB) GetTopThreats(orgID string) ([]*TopThreatRecord, error) {
-	// Counted off new_interactions (one row per deduplicated interaction) rather
-	// than raw COUNT(*) on threats — the threats table can carry duplicate rows
-	// per interaction (see StoreThreat/idx-drift), which previously inflated
-	// this total past what home-metrics/threats-list report.
-	//
-	// Every threat_code with a nonzero count is returned (no LIMIT) — the JOINs
-	// already drop any code with zero occurrences, so there's nothing to filter
-	// after the fact. threats is LEFT JOINed (not INNER) so a threat-flagged
-	// interaction with no matching/resolved threat_code (missing threat_id, or
-	// a threats row whose threat_code was never set) still gets counted, bucketed
-	// under code 0 — the handler renders that bucket as "0000".
-	rows, err := d.conn.Query(`
-		SELECT COALESCE(t.threat_code, 0), COALESCE(tc.title, ''), COUNT(*) AS cnt
-		FROM new_interactions ni
-		LEFT JOIN threats t ON t.id = ni.threat_id
-		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
-		WHERE ni.threat = 1
-		GROUP BY COALESCE(t.threat_code, 0), COALESCE(tc.title, '')
-		ORDER BY cnt DESC`,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []*TopThreatRecord
-	for rows.Next() {
-		r := &TopThreatRecord{}
-		if err := rows.Scan(&r.ThreatCode, &r.Title, &r.Count); err != nil {
-			return nil, err
-		}
-		result = append(result, r)
-	}
-	return result, nil
+	return d.topThreats("", "")
 }
 
 // GetTopThreatsByUser is the non-admin counterpart of GetTopThreats — scoped
@@ -3489,15 +3457,35 @@ func (d *DB) GetTopThreats(orgID string) ([]*TopThreatRecord, error) {
 // (intent_id IN user_intents), the same scoping GetUserMetrics already uses
 // for its interaction/threat counts, rather than every threat in the org.
 func (d *DB) GetTopThreatsByUser(userDID, orgID string) ([]*TopThreatRecord, error) {
-	rows, err := d.conn.Query(userScopeIntentsCTE+`
-		SELECT COALESCE(t.threat_code, 0), COALESCE(tc.title, ''), COUNT(*) AS cnt
+	return d.topThreats(userScopeIntentsCTE, "AND ni.intent_id IN (SELECT intent_id FROM user_intents)", userDID, orgID)
+}
+
+// topThreats counts threat interactions per threat code, for GetTopThreats
+// and GetTopThreatsByUser. prefix (e.g. a WITH clause) goes before the query
+// and filter is appended to its WHERE; args are their placeholders' values.
+//
+// Counted off new_interactions (one row per deduplicated interaction) rather
+// than raw COUNT(*) on threats — the threats table can carry duplicate rows
+// per interaction (see StoreThreat/idx-drift), which previously inflated
+// this total past what home-metrics/threats-list report.
+//
+// Every threat_code with a nonzero count is returned (no LIMIT) — the JOINs
+// already drop any code with zero occurrences, so there's nothing to filter
+// after the fact. threats is LEFT JOINed (not INNER) so a threat-flagged
+// interaction with no matching/resolved threat_code (missing threat_id, or
+// a threats row whose threat_code was never set) still gets counted, under
+// code 0. Every code not in threat_codes is aggregated into one
+// UnknownThreatCode bucket with an empty title, which the handler fills in.
+func (d *DB) topThreats(prefix, filter string, args ...any) ([]*TopThreatRecord, error) {
+	rows, err := d.conn.Query(prefix+`
+		SELECT COALESCE(tc.code, -1), COALESCE(tc.title, ''), COALESCE(tc.severity, ''), COUNT(*) AS cnt
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
-		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
-		WHERE ni.threat = 1 AND ni.intent_id IN (SELECT intent_id FROM user_intents)
-		GROUP BY COALESCE(t.threat_code, 0), COALESCE(tc.title, '')
+		LEFT JOIN threat_codes tc ON tc.code = COALESCE(t.threat_code, 0)
+		WHERE ni.threat = 1 `+filter+`
+		GROUP BY 1, 2, 3
 		ORDER BY cnt DESC`,
-		userDID, orgID,
+		args...,
 	)
 	if err != nil {
 		return nil, err
@@ -3506,31 +3494,67 @@ func (d *DB) GetTopThreatsByUser(userDID, orgID string) ([]*TopThreatRecord, err
 	var result []*TopThreatRecord
 	for rows.Next() {
 		r := &TopThreatRecord{}
-		if err := rows.Scan(&r.ThreatCode, &r.Title, &r.Count); err != nil {
+		if err := rows.Scan(&r.ThreatCode, &r.Title, &r.Severity, &r.Count); err != nil {
 			return nil, err
 		}
 		result = append(result, r)
 	}
-	return result, nil
+	return result, rows.Err()
+}
+
+// SyncThreatCodes makes threat_codes hold exactly codes: each is inserted or
+// updated, and any code not in the list is deleted (its threats then count as
+// UnknownThreatCode).
+func (d *DB) SyncThreatCodes(codes []ThreatCodeRecord) error {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	keep := make([]int64, 0, len(codes))
+	for _, c := range codes {
+		if _, err := tx.Exec(`
+			INSERT INTO threat_codes (code, title, severity, description) VALUES ($1, $2, $3, $4)
+			ON CONFLICT (code) DO UPDATE
+			SET title = EXCLUDED.title, severity = EXCLUDED.severity, description = EXCLUDED.description`,
+			c.Code, c.Title, c.Severity, c.Description); err != nil {
+			return fmt.Errorf("upsert threat code %d: %w", c.Code, err)
+		}
+		keep = append(keep, int64(c.Code))
+	}
+	if _, err := tx.Exec(`DELETE FROM threat_codes WHERE code <> ALL($1)`, pq.Array(keep)); err != nil {
+		return fmt.Errorf("delete stale threat codes: %w", err)
+	}
+	return tx.Commit()
 }
 
 func (d *DB) GetThreatCodeDetail(code int) (*ThreatCodeRecord, error) {
 	r := &ThreatCodeRecord{}
 	err := d.conn.QueryRow(`
-		SELECT code, title, description FROM threat_codes WHERE code = $1`, code).
-		Scan(&r.Code, &r.Title, &r.Description)
+		SELECT code, title, severity, description FROM threat_codes WHERE code = $1`, code).
+		Scan(&r.Code, &r.Title, &r.Severity, &r.Description)
 	if err != nil {
 		return nil, err
 	}
 	return r, nil
 }
 
+// UnknownThreatCode stands for every threat code not in threat_codes: the
+// "Unknown" bucket of GetTopThreats and GetThreatsByCode.
+const UnknownThreatCode = -1
+
+// unknownThreatCodeFilter matches threats whose code has no threat_codes row
+// when $2 is UnknownThreatCode.
+const unknownThreatCodeFilter = `($2 = -1 AND NOT EXISTS (SELECT 1 FROM threat_codes tc WHERE tc.code = t.threat_code))`
+
+// GetThreatsByCode lists an org's threats with the given code.
+// UnknownThreatCode lists every threat whose code is not in threat_codes.
 func (d *DB) GetThreatsByCode(orgID string, code int) ([]*ThreatRecord, int, error) {
 	var total int
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
-		WHERE ni.organization_id = $1 AND t.threat_code = $2`, orgID, code).Scan(&total)
+		WHERE ni.organization_id = $1 AND (t.threat_code = $2 OR `+unknownThreatCodeFilter+`)`, orgID, code).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -3538,7 +3562,7 @@ func (d *DB) GetThreatsByCode(orgID string, code int) ([]*ThreatRecord, int, err
 		SELECT t.id, t.intent_id, t.interaction_id, t.time, t.threat_code, t.message
 		FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
-		WHERE ni.organization_id = $1 AND t.threat_code = $2
+		WHERE ni.organization_id = $1 AND (t.threat_code = $2 OR `+unknownThreatCodeFilter+`)
 		ORDER BY t.time DESC`,
 		orgID, code,
 	)

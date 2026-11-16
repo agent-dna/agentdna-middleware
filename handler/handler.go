@@ -95,6 +95,7 @@ type Handler struct {
 	mailer              *email.Mailer
 	otpStore            sync.Map
 	emailQueue          chan email.Message
+	unknownThreat       db.ThreatCodeRecord // error_code.json's entry without a code
 }
 
 func New(database *db.DB, backendURL *url.URL, session SessionConfig, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
@@ -111,6 +112,15 @@ func New(database *db.DB, backendURL *url.URL, session SessionConfig, orgID, adm
 		updateAgentEndpoint: updateAgentEndpoint,
 		emailQueue:          make(chan email.Message, emailQueueSize),
 	}
+	codes, unknown, err := loadThreatCodes()
+	if err != nil {
+		log.Fatalf("[threat-codes] %v", err)
+	}
+	if err := database.SyncThreatCodes(codes); err != nil {
+		log.Fatalf("[threat-codes] sync: %v", err)
+	}
+	h.unknownThreat = unknown
+	log.Printf("[threat-codes] loaded %d codes from error_code.json", len(codes))
 	// Capture blockchain transaction provenance from the upstream responses.
 	proxy.ModifyResponse = h.captureRubixResponse
 	proxy.ErrorHandler = h.proxyError
@@ -789,9 +799,12 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo, data *intentWorkflowData
 			}
 			if threatMsg == "" {
 				// Last resort — payload had no usable text either, fall back to
-				// the generic seeded title so the field isn't blank.
-				if rec, err := h.db.GetThreatCodeDetail(env.Code); err == nil {
+				// the code's error_code.json title (Unknown's for an untracked
+				// code) so the field isn't blank.
+				if rec, err := h.threatCodeInfo(env.Code); err == nil {
 					threatMsg = rec.Title
+				} else {
+					log.Printf("[intentWorkflow] threat code %d lookup: %v", env.Code, err)
 				}
 			}
 			if cbacGuardCodes[env.Code] {
@@ -4180,7 +4193,10 @@ func (h *Handler) ThreatByID(c *gin.Context) {
 		return
 	}
 
-	codeInfo, _ := h.db.GetThreatCodeDetail(threat.ThreatCode)
+	codeInfo, err := h.threatCodeInfo(threat.ThreatCode)
+	if err != nil {
+		log.Printf("[ThreatByID] threat code %d lookup: %v", threat.ThreatCode, err)
+	}
 
 	data := gin.H{
 		"id":             threat.ID,
@@ -4192,6 +4208,7 @@ func (h *Handler) ThreatByID(c *gin.Context) {
 	}
 	if codeInfo != nil {
 		data["title"] = codeInfo.Title
+		data["severity"] = codeInfo.Severity
 		data["description"] = codeInfo.Description
 	}
 
@@ -4505,25 +4522,43 @@ func (h *Handler) TopThreats(c *gin.Context) {
 	type topItem struct {
 		ThreatCode string `json:"threat_code"`
 		Title      string `json:"title"`
+		Severity   string `json:"severity"`
 		Count      int    `json:"count"`
 	}
 	items := make([]topItem, 0, len(top))
 	for _, t := range top {
-		code := "0000"
-		if t.ThreatCode != 0 {
-			code = strconv.Itoa(t.ThreatCode)
+		item := topItem{ThreatCode: strconv.Itoa(t.ThreatCode), Title: t.Title, Severity: t.Severity, Count: t.Count}
+		switch t.ThreatCode {
+		case 0:
+			item.ThreatCode = "0000"
+		case db.UnknownThreatCode:
+			item.ThreatCode = unknownThreatCodeParam
+			item.Title, item.Severity = h.unknownThreat.Title, h.unknownThreat.Severity
 		}
-		items = append(items, topItem{
-			ThreatCode: code,
-			Title:      t.Title,
-			Count:      t.Count,
-		})
+		items = append(items, item)
 	}
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: items})
 }
 
+// threatCodeInfo returns code's title, severity and description, or the
+// Unknown entry from error_code.json when code is not a tracked code. Other
+// lookup failures are returned as errors.
+func (h *Handler) threatCodeInfo(code int) (*db.ThreatCodeRecord, error) {
+	rec, err := h.db.GetThreatCodeDetail(code)
+	if errors.Is(err, sql.ErrNoRows) {
+		unknown := h.unknownThreat
+		return &unknown, nil
+	}
+	return rec, err
+}
+
+// unknownThreatCodeParam is how the Unknown bucket's threat_code appears in
+// /top-threats and is passed back to /threat-detail.
+const unknownThreatCodeParam = "unknown"
+
 // GET /dashboard/v1/threat-detail?threat_code=2001
+// threat_code=unknown lists every threat whose code is not in error_code.json.
 func (h *Handler) ThreatDetail(c *gin.Context) {
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
@@ -4531,16 +4566,21 @@ func (h *Handler) ThreatDetail(c *gin.Context) {
 		return
 	}
 
-	code, err := strconv.Atoi(c.Query("threat_code"))
-	if err != nil || code == 0 {
-		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "threat_code is required"})
-		return
-	}
-
-	codeInfo, err := h.db.GetThreatCodeDetail(code)
-	if err != nil {
-		c.JSON(http.StatusNotFound, Response{Status: false, Message: fmt.Sprintf("threat code %d not found", code)})
-		return
+	var codeInfo *db.ThreatCodeRecord
+	code := db.UnknownThreatCode
+	if param := c.Query("threat_code"); param == unknownThreatCodeParam {
+		unknown := h.unknownThreat
+		codeInfo = &unknown
+	} else {
+		var err error
+		if code, err = strconv.Atoi(param); err != nil || code == db.UnknownThreatCode {
+			c.JSON(http.StatusBadRequest, Response{Status: false, Message: "threat_code is required"})
+			return
+		}
+		if codeInfo, err = h.db.GetThreatCodeDetail(code); err != nil {
+			c.JSON(http.StatusNotFound, Response{Status: false, Message: fmt.Sprintf("threat code %d not found", code)})
+			return
+		}
 	}
 
 	threats, total, err := h.db.GetThreatsByCode(orgID, code)
@@ -4567,9 +4607,14 @@ func (h *Handler) ThreatDetail(c *gin.Context) {
 		})
 	}
 
+	var threatCode any = codeInfo.Code
+	if codeInfo.Code == db.UnknownThreatCode {
+		threatCode = unknownThreatCodeParam
+	}
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
-		"threat_code": codeInfo.Code,
+		"threat_code": threatCode,
 		"title":       codeInfo.Title,
+		"severity":    codeInfo.Severity,
 		"description": codeInfo.Description,
 		"count":       total,
 		"threats":     items,

@@ -96,12 +96,14 @@ type ThreatRecord struct {
 type ThreatCodeRecord struct {
 	Code        int
 	Title       string
+	Severity    string
 	Description string
 }
 
 type TopThreatRecord struct {
-	ThreatCode int
+	ThreatCode int // UnknownThreatCode for codes not in threat_codes
 	Title      string
+	Severity   string
 	Count      int
 }
 
@@ -620,38 +622,8 @@ func New(dsn string) *DB {
 		description TEXT NOT NULL DEFAULT ''
 	)`)
 
-	// Seed known threat codes.
-	conn.Exec(`INSERT INTO threat_codes (code, title, description) VALUES
-		(1001, 'Whitelist Error',               'The agent is not on the whitelist'),
-		(2001, 'COCA Verification Failed (Light)',    'Light COCA verification failed — the interaction did not pass the lightweight consistency check'),
-		(2002, 'COCA Verification Failed (Heavy)',    'Heavy COCA verification failed — the interaction did not pass the full consistency check'),
-		(2003, 'COCA Verification Failed (Boundary)','Boundary COCA verification failed — the interaction violated a policy boundary constraint'),
-		(3001, 'Guard: Intended Action Empty',  'Pre-model guard failed — the intended action field is empty'),
-		(3002, 'Guard: Policy Lookup Failed',   'Pre-model guard failed — could not look up the policy for this agent'),
-		(3003, 'Guard: No Policy Available',    'Pre-model guard failed — no policy is available for this agent'),
-		(3004, 'Guard: Policy Index Failed',    'Pre-model guard failed — policy index could not be built or loaded'),
-		(3005, 'Guard: Policy No Content',      'Pre-model guard failed — the policy document has no usable content'),
-		(3101, 'Check 1: Drift Deny',           'Drift check denied — the request deviates from the established baseline'),
-		(3201, 'Tier 1: Gap Allow',             'Tier 1 cosine-gap check passed — action allowed'),
-		(3202, 'Tier 1: Gap Deny',              'Tier 1 cosine-gap check failed — semantic distance exceeds threshold'),
-		(3301, 'Tier 2: No Allowed Chunks',     'Tier 2 NLI check failed — no policy chunks were marked as allowed'),
-		(3302, 'Tier 2: Entailment Allow',      'Tier 2 NLI entailment check passed — action allowed'),
-		(3303, 'Tier 2: Contradiction Deny',    'Tier 2 NLI contradiction check failed — action contradicts policy'),
-		(3401, 'Tier 3: No Backend',            'Tier 3 LLM backend is not configured — decision deferred'),
-		(3402, 'Tier 3: LLM Error',             'Tier 3 LLM backend returned an error — decision deferred'),
-		(3403, 'Tier 3: LLM Keyword Deny',      'Tier 3 LLM detected a deny keyword in the response'),
-		(3404, 'Tier 3: LLM Keyword Allow',     'Tier 3 LLM detected an allow keyword in the response'),
-		(3405, 'Tier 3: LLM Inconclusive',      'Tier 3 LLM response was inconclusive — decision deferred'),
-		(3406, 'Tier 3: LLM Allow',             'Tier 3 LLM explicitly allowed the action'),
-		(3407, 'Tier 3: LLM Deny',              'Tier 3 LLM explicitly denied the action'),
-		(3408, 'Tier 3: LLM Advise',            'Tier 3 LLM returned an advisory — human review recommended'),
-		(3409, 'Tier 3: LLM Malformed',         'Tier 3 LLM response was malformed and could not be parsed'),
-		(4001, 'MCP Tool Exec Error',           'The MCP tool call failed to execute'),
-		(9101, 'CBAC Client: No Service Configured', 'No cbac_url was passed and CBAC_URL is not set in the environment'),
-		(9102, 'CBAC Client: Unrecognized Response', 'The cbac-service returned a 200 response whose body carried no decision at all'),
-		(9103, 'CBAC Client: Transport Failed', 'The POST to the cbac-service raised a transport error — connection refused, timed out, or bad TLS'),
-		(9104, 'CBAC Client: Verdict Without Code', 'A decision came back from the cbac-service, but with no code to key off of')
-		ON CONFLICT (code) DO NOTHING`)
+	// Rows come from handler/error_code.json via SyncThreatCodes at startup.
+	conn.Exec(`ALTER TABLE threat_codes ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT ''`)
 
 	// Observability page: hop lookups filter/join on these columns on every
 	// request (org+time window, per-intent, per-DID-pair, per-initiator).
