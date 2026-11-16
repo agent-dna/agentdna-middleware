@@ -3478,18 +3478,15 @@ func (h *Handler) UploadAgentPolicy(c *gin.Context) {
 		c.JSON(http.StatusForbidden, Response{Status: false, Message: "admin access required"})
 		return
 	}
-
 	agentDID := c.PostForm("agentDID")
 	if agentDID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
 		return
 	}
-
 	content, ok := readPolicyFile(c)
 	if !ok {
 		return
 	}
-
 	agentInfo, err := h.db.GetAgentInfo(agentDID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "agent not found"})
@@ -3500,7 +3497,6 @@ func (h *Handler) UploadAgentPolicy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("agent service error: %v", err)})
 		return
 	}
-
 	if err := h.db.UpdateAgentPolicy(agentDID, content); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to save policy: %v", err)})
 		return
