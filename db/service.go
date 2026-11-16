@@ -2529,7 +2529,6 @@ func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*Inte
 		       COALESCE((SELECT message FROM new_interactions
 		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
-		JOIN new_interactions tool_ix ON tool_ix.intent_id = ni.intent_id AND tool_ix.interacted_to_did = $1
 		LEFT JOIN user_dids ud ON ud.dids @> ARRAY[ni.initiator_did]
 		LEFT JOIN new_org_users u ON u.email = ud.email
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
@@ -2537,6 +2536,10 @@ func (d *DB) GetIntentsByTool(toolDID, orgID string, limit, offset int) ([]*Inte
 		LEFT JOIN new_agents a ON a.did = ix.interacted_to_did
 		LEFT JOIN new_tools t ON t.did = ix.interacted_to_did
 		WHERE ni.organization_id = $2
+		  -- EXISTS, not a JOIN: joining the tool's hops multiplied every
+		  -- aggregate by how many times the intent called this tool.
+		  AND EXISTS (SELECT 1 FROM new_interactions tool_ix
+		              WHERE tool_ix.intent_id = ni.intent_id AND tool_ix.interacted_to_did = $1)
 		GROUP BY ni.intent_id, u.name, ag_init.name
 		ORDER BY ni.started_at DESC
 		LIMIT $3 OFFSET $4`,
