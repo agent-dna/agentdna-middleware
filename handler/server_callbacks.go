@@ -131,7 +131,9 @@ func (h *Handler)CoreRegisterUser(c *gin.Context) {
 // CoreDIDByEmail resolves the DID linked to an org user's email. Called by the
 // Identity Binding Service during human login to bind a run to a DID. A missing
 // email, unknown user, or unlinked DID all return an empty did (fail closed) —
-// the caller denies when no DID comes back.
+// the caller denies when no DID comes back. "dids" also lists every DID the user
+// holds (one per identity they registered), so IBS can accept a run signed by
+// any of them; "did" is unchanged.
 // GET /core/v1/did-by-email?email=<email>
 func (h *Handler) CoreDIDByEmail(c *gin.Context) {
 	email := strings.TrimSpace(c.Query("email"))
@@ -144,7 +146,14 @@ func (h *Handler) CoreDIDByEmail(c *gin.Context) {
 	if u, err := h.db.GetOrgUserByEmail(email); err == nil && u.DID != "" && u.DID != "none" {
 		did = u.DID
 	}
-	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"did": did}})
+	dids := []string{}
+	if did != "" {
+		dids = []string{did}
+		if all, err := h.db.GetUserDIDsByDID(did); err == nil && len(all) > 0 {
+			dids = all
+		}
+	}
+	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{"did": did, "dids": dids}})
 }
 
 // CoreRegisterAgent is called by the external server to create an agent
