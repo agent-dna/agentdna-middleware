@@ -3625,6 +3625,7 @@ type AuthEvidenceRecord struct {
 	AuthMethod   string
 	CredentialID string
 	IdentityID   *string
+	IdentityName *string
 	AuthStatus   string
 	KeyVersion   string
 	Destination  string
@@ -4009,6 +4010,7 @@ type CredentialSummary struct {
 	CredentialID string
 	AuthMethod   string
 	IdentityID   *string
+	IdentityName *string
 	Sources      []string
 	RequestCount int
 	IntentCount  int
@@ -4077,7 +4079,7 @@ type CredentialActor struct {
 // landed yet counts as a request with no intent and no actor.
 const credentialUsesCTE = `
 	WITH uses AS (
-		SELECT e.credential_id, e.auth_method, e.identity_id, e.source, e.request_id,
+		SELECT e.credential_id, e.auth_method, e.identity_id, e.identity_name, e.source, e.request_id,
 		       COALESCE(e.observed_at, i.time) AS used_at,
 		       NULLIF(i.intent_id, '') AS intent_id,
 		       NULLIF(CASE WHEN e.source = 'server_out' THEN i.interacted_to_did ELSE i.initiator_did END, '') AS actor_did,
@@ -4099,6 +4101,7 @@ const credentialSummarySelect = `
 	SELECT u.credential_id,
 	       COALESCE((array_agg(u.auth_method ORDER BY u.used_at DESC NULLS LAST))[1], ''),
 	       (array_agg(u.identity_id ORDER BY u.used_at DESC NULLS LAST) FILTER (WHERE u.identity_id IS NOT NULL))[1],
+	       (array_agg(u.identity_name ORDER BY u.used_at DESC NULLS LAST) FILTER (WHERE u.identity_name IS NOT NULL))[1],
 	       array_agg(DISTINCT u.source ORDER BY u.source),
 	       COUNT(DISTINCT u.request_id),
 	       COUNT(DISTINCT u.intent_id),
@@ -4114,7 +4117,7 @@ const credentialSummarySelect = `
 
 func scanCredentialSummary(s interface{ Scan(...any) error }) (*CredentialSummary, error) {
 	c := &CredentialSummary{}
-	err := s.Scan(&c.CredentialID, &c.AuthMethod, &c.IdentityID, pq.Array(&c.Sources),
+	err := s.Scan(&c.CredentialID, &c.AuthMethod, &c.IdentityID, &c.IdentityName, pq.Array(&c.Sources),
 		&c.RequestCount, &c.IntentCount, &c.UserCount, &c.AgentCount, &c.ToolCount,
 		&c.FirstUsedAt, &c.LastUsedAt,
 		&c.Status, &c.StatusReason, &c.StatusUpdatedBy, &c.StatusUpdatedAt)
@@ -4371,12 +4374,12 @@ func (d *DB) serverOutEvidence(query string, args ...any) ([]*AuthEvidenceRecord
 func (d *DB) StoreAuthEvidence(r *AuthEvidenceRecord, orgID string) (inserted bool, err error) {
 	res, err := d.conn.Exec(`
 		INSERT INTO auth_evidence
-		  (request_id, source, run_id, auth_method, credential_id, identity_id,
+		  (request_id, source, run_id, auth_method, credential_id, identity_id, identity_name,
 		   auth_status, key_version, destination, organization_id, observed_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-		        COALESCE(to_timestamp($11), NOW()))
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+		        COALESCE(to_timestamp($12), NOW()))
 		ON CONFLICT (request_id, source, destination) DO NOTHING`,
-		r.RequestID, r.Source, r.RunID, r.AuthMethod, r.CredentialID, r.IdentityID,
+		r.RequestID, r.Source, r.RunID, r.AuthMethod, r.CredentialID, r.IdentityID, r.IdentityName,
 		r.AuthStatus, r.KeyVersion, r.Destination, orgID, r.ObservedAt,
 	)
 	if err != nil {
@@ -4399,7 +4402,7 @@ func (d *DB) StoreAuthEvidence(r *AuthEvidenceRecord, orgID string) (inserted bo
 func (d *DB) GetAuthEvidenceByIntent(intentID string) (map[string][]*AuthEvidenceRecord, error) {
 	rows, err := d.conn.Query(`
 		SELECT DISTINCT e.request_id, e.source, COALESCE(e.run_id, ''),
-		       COALESCE(e.auth_method, ''), COALESCE(e.credential_id, ''), e.identity_id,
+		       COALESCE(e.auth_method, ''), COALESCE(e.credential_id, ''), e.identity_id, e.identity_name,
 		       COALESCE(e.auth_status, ''), COALESCE(e.key_version, ''), COALESCE(e.destination, ''),
 		       EXTRACT(EPOCH FROM e.observed_at)::float8
 		FROM auth_evidence e
@@ -4418,7 +4421,7 @@ func (d *DB) GetAuthEvidenceByIntent(intentID string) (map[string][]*AuthEvidenc
 	for rows.Next() {
 		r := &AuthEvidenceRecord{}
 		if err := rows.Scan(&r.RequestID, &r.Source, &r.RunID, &r.AuthMethod,
-			&r.CredentialID, &r.IdentityID, &r.AuthStatus, &r.KeyVersion, &r.Destination, &r.ObservedAt); err != nil {
+			&r.CredentialID, &r.IdentityID, &r.IdentityName, &r.AuthStatus, &r.KeyVersion, &r.Destination, &r.ObservedAt); err != nil {
 			return nil, err
 		}
 		out[r.RequestID] = append(out[r.RequestID], r)

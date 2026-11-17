@@ -440,6 +440,7 @@ func New(dsn string) *DB {
 			auth_method     TEXT DEFAULT '',
 			credential_id   TEXT DEFAULT '',
 			identity_id     TEXT,
+			identity_name   TEXT,
 			auth_status     TEXT DEFAULT 'unknown',
 			key_version     TEXT DEFAULT '',
 			destination     TEXT DEFAULT '',
@@ -457,6 +458,7 @@ func New(dsn string) *DB {
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
 	conn.Exec(`ALTER TABLE new_agents ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE`)
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS message TEXT DEFAULT ''`)
+	conn.Exec(`ALTER TABLE auth_evidence ADD COLUMN IF NOT EXISTS identity_name TEXT`)
 	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''`)
 	conn.Exec(`ALTER TABLE new_admins ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`)
 	// Admin passwords live only on the admin server; drop the old local copies.

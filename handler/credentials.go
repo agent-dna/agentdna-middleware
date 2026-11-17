@@ -29,6 +29,7 @@ func credentialSummaryJSON(c *db.CredentialSummary) gin.H {
 		"credentialID": c.CredentialID,
 		"authMethod":   c.AuthMethod,
 		"identityID":   c.IdentityID,
+		"identityName": c.IdentityName,
 		"sources":      sources,
 		"requestCount": c.RequestCount,
 		"intentCount":  c.IntentCount,

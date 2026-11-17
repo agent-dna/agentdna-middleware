@@ -39,6 +39,7 @@ type HopEvidence struct {
 	AuthMethod   string        `json:"authMethod,omitempty"`
 	CredentialID string        `json:"credentialID,omitempty"`
 	IdentityID   *string       `json:"identityID,omitempty"`
+	IdentityName *string       `json:"identityName,omitempty"`
 	AuthStatus   string        `json:"authStatus,omitempty"`
 	BackendCalls []BackendCall `json:"backendCalls,omitempty"`
 }
@@ -49,6 +50,7 @@ type BackendCall struct {
 	AuthMethod   string  `json:"authMethod"`
 	CredentialID string  `json:"credentialID,omitempty"`
 	IdentityID   *string `json:"identityID,omitempty"`
+	IdentityName *string `json:"identityName,omitempty"`
 	AuthStatus   string  `json:"authStatus"`
 }
 
@@ -124,6 +126,7 @@ func evidenceForHop(records []*db.AuthEvidenceRecord) HopEvidence {
 				AuthMethod:   r.AuthMethod,
 				CredentialID: r.CredentialID,
 				IdentityID:   r.IdentityID,
+				IdentityName: r.IdentityName,
 				AuthStatus:   r.AuthStatus,
 			})
 		} else {
@@ -140,6 +143,7 @@ func evidenceForHop(records []*db.AuthEvidenceRecord) HopEvidence {
 	view.AuthMethod = onWire[0].AuthMethod
 	view.CredentialID = onWire[0].CredentialID
 	view.IdentityID = onWire[0].IdentityID
+	view.IdentityName = onWire[0].IdentityName
 	view.AuthStatus = onWire[0].AuthStatus
 
 	// One end of the wire: nothing to agree or disagree with.
@@ -292,6 +296,7 @@ type AuthEvidenceEntry struct {
 	AuthMethod   string  `json:"authMethod"`
 	CredentialID string  `json:"credentialID"`
 	IdentityID   *string `json:"identityID"`
+	IdentityName *string `json:"identityName"`
 	AuthStatus   string  `json:"authStatus"`
 	KeyVersion   string  `json:"keyVersion"`
 	ObservedAt   string  `json:"observedAt"`
@@ -315,6 +320,7 @@ func authEvidenceEntries(records []*db.AuthEvidenceRecord) []AuthEvidenceEntry {
 			AuthMethod:   r.AuthMethod,
 			CredentialID: r.CredentialID,
 			IdentityID:   r.IdentityID,
+			IdentityName: r.IdentityName,
 			AuthStatus:   r.AuthStatus,
 			KeyVersion:   r.KeyVersion,
 			ObservedAt:   observedAt,

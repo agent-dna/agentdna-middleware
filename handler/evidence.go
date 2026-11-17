@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -20,6 +22,7 @@ type authEvidenceInput struct {
 	AuthMethod   string  `json:"auth_method"`
 	CredentialID string  `json:"credential_id"`
 	IdentityID   *string `json:"identity_id"`
+	IdentityName *string `json:"identity_name"`
 	AuthStatus   string  `json:"auth_status"`
 	KeyVersion   string  `json:"key_version"`
 	Destination  string  `json:"destination"`
@@ -48,10 +51,20 @@ func (h *Handler) StoreAuthEvidence(c *gin.Context) {
 		return
 	}
 
+	raw, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		log.Printf("[auth-evidence] store: read body failed org=%s err=%v", user.OrgID, err)
+		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid body"})
+		return
+	}
+	// The body exactly as the observer sent it, before any field is dropped
+	// by the struct below.
+	log.Printf("[auth-evidence] store: raw body org=%s: %s", user.OrgID, raw)
+
 	var body struct {
 		Records []authEvidenceInput `json:"records"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		log.Printf("[auth-evidence] store: invalid body org=%s err=%v", user.OrgID, err)
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "invalid body"})
 		return
@@ -60,8 +73,8 @@ func (h *Handler) StoreAuthEvidence(c *gin.Context) {
 
 	stored := 0
 	for idx, in := range body.Records {
-		log.Printf("[auth-evidence] store: record[%d] request_id=%q source=%q run_id=%q auth_method=%q credential_id=%q identity_id=%s auth_status=%q key_version=%q destination=%q observed_at=%s",
-			idx, in.RequestID, in.Source, in.RunID, in.AuthMethod, in.CredentialID, logStrPtr(in.IdentityID),
+		log.Printf("[auth-evidence] store: record[%d] request_id=%q source=%q run_id=%q auth_method=%q credential_id=%q identity_id=%s identity_name=%s auth_status=%q key_version=%q destination=%q observed_at=%s",
+			idx, in.RequestID, in.Source, in.RunID, in.AuthMethod, in.CredentialID, logStrPtr(in.IdentityID), logStrPtr(in.IdentityName),
 			in.AuthStatus, in.KeyVersion, in.Destination, logFloatPtr(in.ObservedAt))
 		if in.RequestID == "" || in.Source == "" {
 			log.Printf("[auth-evidence] store: record[%d] SKIPPED: request_id and source are required", idx)
@@ -74,6 +87,7 @@ func (h *Handler) StoreAuthEvidence(c *gin.Context) {
 			AuthMethod:   in.AuthMethod,
 			CredentialID: in.CredentialID,
 			IdentityID:   in.IdentityID,
+			IdentityName: in.IdentityName,
 			AuthStatus:   in.AuthStatus,
 			KeyVersion:   in.KeyVersion,
 			Destination:  in.Destination,
@@ -123,6 +137,7 @@ type authEvidenceRow struct {
 	AuthMethod   string     `json:"authMethod"`
 	CredentialID string     `json:"credentialID"`
 	IdentityID   *string    `json:"identityID"`
+	IdentityName *string    `json:"identityName"`
 	AuthStatus   string     `json:"authStatus"`
 	KeyVersion   string     `json:"keyVersion"`
 	Destination  string     `json:"destination"`
@@ -177,6 +192,7 @@ func buildIntentAuthEvidence(
 				AuthMethod:   r.AuthMethod,
 				CredentialID: r.CredentialID,
 				IdentityID:   r.IdentityID,
+				IdentityName: r.IdentityName,
 				AuthStatus:   r.AuthStatus,
 				KeyVersion:   r.KeyVersion,
 				Destination:  r.Destination,
@@ -284,8 +300,8 @@ func logEvidenceForIntent(tag, intentID string, interactions []*db.InteractionRe
 			continue
 		}
 		for _, r := range recs {
-			log.Printf("[auth-evidence] %s: intent=%s interaction=%s source=%q auth_method=%q credential_id=%q identity_id=%s auth_status=%q key_version=%q destination=%q observed_at=%s",
-				tag, intentID, i.InteractionID, r.Source, r.AuthMethod, r.CredentialID, logStrPtr(r.IdentityID),
+			log.Printf("[auth-evidence] %s: intent=%s interaction=%s source=%q auth_method=%q credential_id=%q identity_id=%s identity_name=%s auth_status=%q key_version=%q destination=%q observed_at=%s",
+				tag, intentID, i.InteractionID, r.Source, r.AuthMethod, r.CredentialID, logStrPtr(r.IdentityID), logStrPtr(r.IdentityName),
 				r.AuthStatus, r.KeyVersion, r.Destination, logFloatPtr(r.ObservedAt))
 		}
 	}
