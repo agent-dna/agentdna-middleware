@@ -4071,21 +4071,30 @@ type CredentialActor struct {
 
 // credentialUsesCTE yields uses: one row per auth_evidence row carrying a
 // credential (only credential $1 when $1 is not empty), joined to the
-// interaction it was observed on; and actors: the type of every actor in uses.
+// interaction it was observed on and that interaction's intent; and actors:
+// the type of every actor in uses.
 //
 // The actor is whoever presented the credential. At server_out that is the
 // server answering the hop (interacted_to), calling its own backend; at every
 // other source it is the hop's initiator. Evidence whose interaction has not
 // landed yet counts as a request with no intent and no actor.
+//
+// initiator_did is the user who started the intent the use belongs to. That
+// user counts among the credential's users even when they never presented it
+// themselves: the credential was used on their behalf.
 const credentialUsesCTE = `
 	WITH uses AS (
 		SELECT e.credential_id, e.auth_method, e.identity_id, e.identity_name, e.source, e.request_id,
+		       COALESCE(e.destination, '') AS destination,
 		       COALESCE(e.observed_at, i.time) AS used_at,
 		       NULLIF(i.intent_id, '') AS intent_id,
 		       NULLIF(CASE WHEN e.source = 'server_out' THEN i.interacted_to_did ELSE i.initiator_did END, '') AS actor_did,
-		       CASE WHEN e.source = 'server_out' THEN i.interacted_to_name ELSE i.initiator_name END AS actor_name
+		       CASE WHEN e.source = 'server_out' THEN i.interacted_to_name ELSE i.initiator_name END AS actor_name,
+		       NULLIF(ni.initiator_did, '') AS initiator_did,
+		       ni.initiator_name AS initiator_name
 		FROM auth_evidence e
 		LEFT JOIN new_interactions i ON i.signature = e.request_id
+		LEFT JOIN new_intents ni ON ni.intent_id = NULLIF(i.intent_id, '')
 		WHERE COALESCE(e.credential_id, '') <> '' AND ($1::text = '' OR e.credential_id = $1::text)
 	), actors AS (
 		SELECT DISTINCT actor_did AS did,
@@ -4105,7 +4114,9 @@ const credentialSummarySelect = `
 	       array_agg(DISTINCT u.source ORDER BY u.source),
 	       COUNT(DISTINCT u.request_id),
 	       COUNT(DISTINCT u.intent_id),
-	       COUNT(DISTINCT u.actor_did) FILTER (WHERE a.type = 'user'),
+	       (SELECT COUNT(DISTINCT d) FROM unnest(
+	           array_agg(u.actor_did) FILTER (WHERE a.type = 'user') ||
+	           array_agg(u.initiator_did) FILTER (WHERE u.initiator_did IS NOT NULL)) d),
 	       COUNT(DISTINCT u.actor_did) FILTER (WHERE a.type = 'agent'),
 	       COUNT(DISTINCT u.actor_did) FILTER (WHERE a.type = 'tool'),
 	       MIN(u.used_at), MAX(u.used_at),
@@ -4209,18 +4220,28 @@ func (d *DB) GetCredentialIntents(id string, limit, offset int) ([]*CredentialIn
 }
 
 // GetCredentialActors returns every user, agent and tool that presented
-// credential id, most recently first. Name is the latest non-empty name the
-// actor was recorded under.
+// credential id, plus the initiator of every intent it was used in (as a
+// user), most recently first. Name is the latest non-empty name the actor was
+// recorded under. A DID that is both an initiator and a presenting actor is
+// listed once, as a user.
 func (d *DB) GetCredentialActors(id string) ([]*CredentialActor, error) {
-	rows, err := d.conn.Query(credentialUsesCTE+`
-		SELECT u.actor_did, a.type,
-		       COALESCE((array_agg(u.actor_name ORDER BY u.used_at DESC NULLS LAST)
-		                 FILTER (WHERE COALESCE(u.actor_name, '') <> ''))[1], ''),
-		       COUNT(DISTINCT u.request_id), COUNT(DISTINCT u.intent_id), MAX(u.used_at)
-		FROM uses u
-		JOIN actors a ON a.did = u.actor_did
-		GROUP BY u.actor_did, a.type
-		ORDER BY MAX(u.used_at) DESC NULLS LAST, u.actor_did`,
+	rows, err := d.conn.Query(credentialUsesCTE+`, involved AS (
+			SELECT u.actor_did AS did, a.type, u.actor_name AS name, u.request_id, u.intent_id, u.used_at
+			FROM uses u
+			JOIN actors a ON a.did = u.actor_did
+			UNION ALL
+			SELECT u.initiator_did, 'user', u.initiator_name, u.request_id, u.intent_id, u.used_at
+			FROM uses u
+			WHERE u.initiator_did IS NOT NULL
+		)
+		SELECT v.did,
+		       CASE WHEN bool_or(v.type = 'user') THEN 'user' ELSE MIN(v.type) END,
+		       COALESCE((array_agg(v.name ORDER BY v.used_at DESC NULLS LAST)
+		                 FILTER (WHERE COALESCE(v.name, '') <> ''))[1], ''),
+		       COUNT(DISTINCT v.request_id), COUNT(DISTINCT v.intent_id), MAX(v.used_at)
+		FROM involved v
+		GROUP BY v.did
+		ORDER BY MAX(v.used_at) DESC NULLS LAST, v.did`,
 		id,
 	)
 	if err != nil {
@@ -4234,6 +4255,86 @@ func (d *DB) GetCredentialActors(id string) ([]*CredentialActor, error) {
 			return nil, err
 		}
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CredentialResource is one resource (app) a credential was used against.
+// IntentCount and URLs cover only this credential's uses of it.
+type CredentialResource struct {
+	ResourceID  string
+	Name        string
+	TrustStatus string
+	IntentCount int
+	URLs        []string
+	FirstSeenAt sql.NullTime
+	LastSeenAt  sql.NullTime
+}
+
+// GetCredentialResources returns every resource credential id was used
+// against, most-used first. Only accesses whose interaction has landed are
+// here (see RecordResourceAccess); GetCredentialDestinations has the rest.
+func (d *DB) GetCredentialResources(id string) ([]*CredentialResource, error) {
+	rows, err := d.conn.Query(`
+		SELECT g.resource_id, g.resource_name, g.trust_status,
+		       COUNT(DISTINCT g.intent_id) AS intent_count,
+		       ARRAY_AGG(DISTINCT g.url),
+		       MIN(g.first_seen), MAX(g.first_seen)
+		FROM resource_access_groups g
+		WHERE g.credential_id = $1
+		GROUP BY g.resource_id, g.resource_name, g.trust_status
+		ORDER BY intent_count DESC, g.resource_id`,
+		id,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*CredentialResource{}
+	for rows.Next() {
+		r := &CredentialResource{}
+		if err := rows.Scan(&r.ResourceID, &r.Name, &r.TrustStatus, &r.IntentCount,
+			pq.Array(&r.URLs), &r.FirstSeenAt, &r.LastSeenAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CredentialDestination is one destination, exactly as the observer reported
+// it (e.g. "PUT https://graph.microsoft.com/v1.0/me/drive/..."), that a
+// credential was sent to.
+type CredentialDestination struct {
+	Destination  string
+	RequestCount int
+	IntentCount  int
+	LastUsedAt   sql.NullTime
+}
+
+// GetCredentialDestinations returns every destination credential id was sent
+// to, most recently used first. Read straight from auth_evidence, so it
+// includes requests whose interaction has not landed yet (IntentCount 0).
+func (d *DB) GetCredentialDestinations(id string) ([]*CredentialDestination, error) {
+	rows, err := d.conn.Query(credentialUsesCTE+`
+		SELECT u.destination, COUNT(DISTINCT u.request_id), COUNT(DISTINCT u.intent_id), MAX(u.used_at)
+		FROM uses u
+		WHERE u.destination <> ''
+		GROUP BY u.destination
+		ORDER BY MAX(u.used_at) DESC NULLS LAST, u.destination`,
+		id,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*CredentialDestination{}
+	for rows.Next() {
+		r := &CredentialDestination{}
+		if err := rows.Scan(&r.Destination, &r.RequestCount, &r.IntentCount, &r.LastUsedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }
@@ -4256,7 +4357,8 @@ type PresentedCredential struct {
 // credential is listed for an actor exactly when that actor is among its
 // users or agents on /credential-info.
 const (
-	presentedByUser  = ` WHERE u.actor_did IN (SELECT user_did_set($2))` // any DID of the user holding $2
+	// any DID of the user holding $2, as presenter or as the intent's initiator
+	presentedByUser  = ` WHERE (u.actor_did IN (SELECT user_did_set($2)) OR u.initiator_did IN (SELECT user_did_set($2)))`
 	presentedByAgent = ` WHERE u.actor_did = $2`
 )
 

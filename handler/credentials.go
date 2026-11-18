@@ -109,7 +109,9 @@ func (h *Handler) CredentialsList(c *gin.Context) {
 
 // CredentialInfo handles GET /dashboard/v1/credential-info?credentialID=
 // &intentsPage=&intentsPageSize=: one credential, a page of the intents it was
-// used in, and every user, agent and tool that presented it.
+// used in, every user, agent and tool that presented it (users also include
+// each intent's initiator), the resources (apps) it was used against, and the
+// raw destinations it was sent to.
 func (h *Handler) CredentialInfo(c *gin.Context) {
 	credentialID := c.Query("credentialID")
 	if credentialID == "" {
@@ -137,6 +139,42 @@ func (h *Handler) CredentialInfo(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch credential users: %v", err)})
 		return
+	}
+	resources, err := h.db.GetCredentialResources(credentialID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch credential resources: %v", err)})
+		return
+	}
+	destinations, err := h.db.GetCredentialDestinations(credentialID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch credential destinations: %v", err)})
+		return
+	}
+
+	resourceList := make([]gin.H, 0, len(resources))
+	for _, r := range resources {
+		urls := r.URLs
+		if urls == nil {
+			urls = []string{}
+		}
+		resourceList = append(resourceList, gin.H{
+			"resourceID":  r.ResourceID,
+			"name":        r.Name,
+			"trustStatus": r.TrustStatus,
+			"intentCount": r.IntentCount,
+			"urls":        urls,
+			"firstSeenAt": timeOrNil(r.FirstSeenAt),
+			"lastSeenAt":  timeOrNil(r.LastSeenAt),
+		})
+	}
+	destinationList := make([]gin.H, 0, len(destinations))
+	for _, d := range destinations {
+		destinationList = append(destinationList, gin.H{
+			"destination":  d.Destination,
+			"requestCount": d.RequestCount,
+			"intentCount":  d.IntentCount,
+			"lastUsedAt":   timeOrNil(d.LastUsedAt),
+		})
 	}
 
 	intentList := make([]gin.H, 0, len(intents))
@@ -172,6 +210,8 @@ func (h *Handler) CredentialInfo(c *gin.Context) {
 	data["agents"] = byType["agent"]
 	data["tools"] = byType["tool"]
 	data["unknown"] = byType["unknown"]
+	data["resources"] = resourceList
+	data["destinations"] = destinationList
 	c.JSON(http.StatusOK, Response{Status: true, Data: data})
 }
 
