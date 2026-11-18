@@ -3726,7 +3726,8 @@ func (d *DB) RecordResourcesForRequest(requestID string) (int, error) {
 //
 // On that first run it also carries every non-default trust status from the
 // legacy JSONB "resources" table into resource_bases, so statuses admins set
-// before the move are kept.
+// before the move are kept. Older deployments' resources table has no
+// trust_status column; then there is nothing to carry and that step is skipped.
 func (d *DB) BackfillResources() (int, error) {
 	var existing bool
 	if err := d.conn.QueryRow(`SELECT EXISTS (SELECT 1 FROM resource_accesses)`).Scan(&existing); err != nil {
@@ -3736,7 +3737,9 @@ func (d *DB) BackfillResources() (int, error) {
 		return 0, nil
 	}
 	if _, err := d.conn.Exec(`DO $$ BEGIN
-		IF to_regclass('resources') IS NOT NULL THEN
+		IF EXISTS (SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = current_schema()
+		             AND table_name = 'resources' AND column_name = 'trust_status') THEN
 			INSERT INTO resource_bases (base_url, name, trust_status)
 			SELECT id, '', trust_status FROM resources
 			WHERE trust_status <> 'Unreviewed' AND (resource_url_parts(id)).host <> ''
