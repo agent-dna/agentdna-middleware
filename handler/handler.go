@@ -4558,10 +4558,7 @@ func (h *Handler) TopThreats(c *gin.Context) {
 	items := make([]topItem, 0, len(top))
 	for _, t := range top {
 		item := topItem{ThreatCode: strconv.Itoa(t.ThreatCode), Title: t.Title, Severity: t.Severity, Count: t.Count}
-		switch t.ThreatCode {
-		case 0:
-			item.ThreatCode = "0000"
-		case db.UnknownThreatCode:
+		if t.ThreatCode == db.UnknownThreatCode {
 			item.ThreatCode = unknownThreatCodeParam
 			item.Title, item.Severity = h.unknownThreat.Title, h.unknownThreat.Severity
 		}
@@ -4584,11 +4581,13 @@ func (h *Handler) threatCodeInfo(code int) (*db.ThreatCodeRecord, error) {
 }
 
 // unknownThreatCodeParam is how the Unknown bucket's threat_code appears in
-// /top-threats and is passed back to /threat-detail.
-const unknownThreatCodeParam = "unknown"
+// /top-threats and is passed back to /threat-detail. Internally the bucket is
+// db.UnknownThreatCode; 0 is reserved for it and may not be a tracked code.
+const unknownThreatCodeParam = "0"
 
 // GET /dashboard/v1/threat-detail?threat_code=2001
-// threat_code=unknown lists every threat whose code is not in error_code.json.
+// threat_code=0 lists every threat whose code is not in error_code.json
+// (including threats stored with no code).
 func (h *Handler) ThreatDetail(c *gin.Context) {
 	orgID := c.GetString(CtxOrgID)
 	if orgID == "" {
@@ -4598,7 +4597,7 @@ func (h *Handler) ThreatDetail(c *gin.Context) {
 
 	var codeInfo *db.ThreatCodeRecord
 	code := db.UnknownThreatCode
-	if param := c.Query("threat_code"); param == unknownThreatCodeParam {
+	if param := c.Query("threat_code"); param == unknownThreatCodeParam || param == "0000" || param == "unknown" {
 		unknown := h.unknownThreat
 		codeInfo = &unknown
 	} else {

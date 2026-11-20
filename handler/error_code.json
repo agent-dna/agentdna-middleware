@@ -37,7 +37,6 @@
   { "code": 9101, "title": "No Service Configured", "severity": "High", "description": "No cbac_url configured for this environment" },
   { "code": 9102, "title": "Unrecognized Response", "severity": "High", "description": "CBAC returned a 200 with no usable decision" },
   { "code": 9103, "title": "Transport Failed", "severity": "High", "description": "Failed to reach the CBAC service" },
-  { "code": 9104, "title": "Verdict Without Code", "severity": "High", "description": "CBAC returned a decision with no incident code" },
-  { "code": 0, "title": "Untracked Error", "severity": "Low", "description": "Unknown Error" }
+  { "code": 9104, "title": "Verdict Without Code", "severity": "High", "description": "CBAC returned a decision with no incident code" }
 
 ]

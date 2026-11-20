@@ -45,7 +45,7 @@ func loadThreatCodes() ([]db.ThreatCodeRecord, db.ThreatCodeRecord, error) {
 			unknown, unknownSet = rec, true
 			continue
 		}
-		if *e.Code == db.UnknownThreatCode {
+		if *e.Code == db.UnknownThreatCode || *e.Code == 0 {
 			return nil, db.ThreatCodeRecord{}, fmt.Errorf("error_code.json entry %d: code %d is reserved for the Unknown bucket", i, *e.Code)
 		}
 		if seen[*e.Code] {

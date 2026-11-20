@@ -3481,15 +3481,15 @@ func (d *DB) GetTopThreatsByUser(userDID, orgID string) ([]*TopThreatRecord, err
 // already drop any code with zero occurrences, so there's nothing to filter
 // after the fact. threats is LEFT JOINed (not INNER) so a threat-flagged
 // interaction with no matching/resolved threat_code (missing threat_id, or
-// a threats row whose threat_code was never set) still gets counted, under
-// code 0. Every code not in threat_codes is aggregated into one
+// a threats row whose threat_code was never set) still gets counted. Those,
+// and every code not in threat_codes, are aggregated into one
 // UnknownThreatCode bucket with an empty title, which the handler fills in.
 func (d *DB) topThreats(prefix, filter string, args ...any) ([]*TopThreatRecord, error) {
 	rows, err := d.conn.Query(prefix+`
 		SELECT COALESCE(tc.code, -1), COALESCE(tc.title, ''), COALESCE(tc.severity, ''), COUNT(*) AS cnt
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
-		LEFT JOIN threat_codes tc ON tc.code = COALESCE(t.threat_code, 0)
+		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
 		WHERE ni.threat = 1 `+filter+`
 		GROUP BY 1, 2, 3
 		ORDER BY cnt DESC`,
