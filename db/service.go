@@ -2205,19 +2205,35 @@ func (d *DB) CountAgentIntents(agentDID, orgID string) (int, error) {
 	return total, err
 }
 
+// GetAgentIntents lists the intents the agent took part in (as initiator of at
+// least one interaction). The per-intent counts cover the whole intent, the
+// same as the org and user intent lists, so the numbers match across pages.
 func (d *DB) GetAgentIntents(agentDID, orgID string, limit, offset int) ([]*IntentRecord, error) {
 	rows, err := d.conn.Query(`
-		SELECT ni.intent_id, ni.initiator_did, COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), NULLIF(ni.initiator_name, ''), ''), ni.started_at,
-		       ni.ended_at, ni.status, ni.threat_detected,
+		SELECT ni.intent_id, ni.initiator_did,
+		       COALESCE(NULLIF(u.name, ''), NULLIF(ag_init.name, ''), NULLIF(ni.initiator_name, ''), ''),
+		       COALESCE(ni.organization_id, ''),
+		       ni.started_at, ni.ended_at, ni.status, COALESCE(ni.review_status, 'Unreviewed'), ni.threat_detected,
 		       COALESCE(ni.flow_type, ''), COALESCE(ni.executor, 'user'), COALESCE(ni.chain_depth, 0),
+		       COUNT(i.interaction_id)                                                  AS interactions_count,
+		       COUNT(DISTINCT CASE WHEN a.did IS NOT NULL THEN i.interacted_to_did END) AS agents_count,
+		       COUNT(DISTINCT CASE WHEN t.did IS NOT NULL THEN i.interacted_to_did END) AS tools_count,
+		       COALESCE(JSONB_AGG(DISTINCT JSONB_BUILD_OBJECT('did', t.did, 'name', COALESCE(t.name, ''))) FILTER (WHERE t.did IS NOT NULL), '[]') AS apps,
+		       SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)                           AS threat_count,
+		       MIN(i.time)                                                               AS first_interaction_at,
+		       MAX(i.time)                                                               AS last_interaction_at,
 		       COALESCE((SELECT message FROM new_interactions
 		        WHERE intent_id = ni.intent_id ORDER BY time ASC LIMIT 1), '') AS title
 		FROM new_intents ni
-		JOIN new_interactions i ON i.intent_id = ni.intent_id
 		LEFT JOIN user_dids ud ON ud.dids @> ARRAY[ni.initiator_did]
 		LEFT JOIN new_org_users u ON u.email = ud.email
 		LEFT JOIN new_agents ag_init ON ag_init.did = ni.initiator_did
-		WHERE i.initiator_did = $1 AND ni.organization_id = $2
+		LEFT JOIN new_interactions i ON i.intent_id = ni.intent_id
+		LEFT JOIN new_agents a ON a.did = i.interacted_to_did
+		LEFT JOIN new_tools t ON t.did = i.interacted_to_did
+		WHERE ni.organization_id = $2
+		  AND EXISTS (SELECT 1 FROM new_interactions ai
+		              WHERE ai.intent_id = ni.intent_id AND ai.initiator_did = $1)
 		GROUP BY ni.intent_id, u.name, ag_init.name
 		ORDER BY ni.started_at DESC
 		LIMIT $3 OFFSET $4`,
@@ -2227,19 +2243,17 @@ func (d *DB) GetAgentIntents(agentDID, orgID string, limit, offset int) ([]*Inte
 		return nil, err
 	}
 	defer rows.Close()
-	return scanIntentRows(rows)
-}
-
-func scanIntentRows(rows *sql.Rows) ([]*IntentRecord, error) {
 	var result []*IntentRecord
 	for rows.Next() {
 		r := &IntentRecord{}
-		var endedAt sql.NullTime
+		var endedAt, firstAt, lastAt sql.NullTime
 		var threatInt int
 		if err := rows.Scan(
-			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.StartedAt, &endedAt,
-			&r.Status, &threatInt,
-			&r.FlowType, &r.Executor, &r.ChainDepth, &r.Title,
+			&r.IntentID, &r.InitiatorDID, &r.InitiatorName, &r.OrgID,
+			&r.StartedAt, &endedAt, &r.Status, &r.ReviewStatus, &threatInt,
+			&r.FlowType, &r.Executor, &r.ChainDepth,
+			&r.InteractionsCount, &r.AgentsCount, &r.ToolsCount, &r.Apps, &r.ThreatCount,
+			&firstAt, &lastAt, &r.Title,
 		); err != nil {
 			return nil, err
 		}
@@ -2247,9 +2261,18 @@ func scanIntentRows(rows *sql.Rows) ([]*IntentRecord, error) {
 		if endedAt.Valid {
 			r.EndedAt = &endedAt.Time
 		}
+		if firstAt.Valid {
+			r.FirstInteractionAt = &firstAt.Time
+		}
+		if lastAt.Valid {
+			r.LastInteractionAt = &lastAt.Time
+			if firstAt.Valid {
+				r.RuntimeSeconds = lastAt.Time.Sub(firstAt.Time).Seconds()
+			}
+		}
 		result = append(result, r)
 	}
-	return result, nil
+	return result, rows.Err()
 }
 
 // GetAgentInteractedApps returns the distinct tools (from the new_tools table) that the
