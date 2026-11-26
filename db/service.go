@@ -377,7 +377,7 @@ func (d *DB) CountAgentsByUser(userDID, orgID string) (int, error) {
 	var total int
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM new_agents a
-		WHERE a.deployer_did IN (SELECT user_did_set($1))`,
+		WHERE a.did IN (SELECT user_visible_agents($1))`,
 		userDID,
 	).Scan(&total)
 	return total, err
@@ -401,7 +401,7 @@ func (d *DB) GetAgentsByUser(userDID, orgID string, limit, offset int) ([]*Agent
 			END                                                                  AS score
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
-		WHERE a.deployer_did IN (SELECT user_did_set($1))
+		WHERE a.did IN (SELECT user_visible_agents($1))
 		GROUP BY a.did, a.name, a.created_at, a.deployer_did, a.policy
 		ORDER BY a.did
 		LIMIT $2 OFFSET $3`,
@@ -424,37 +424,29 @@ func (d *DB) GetAgentsByUser(userDID, orgID string, limit, offset int) ([]*Agent
 	return result, nil
 }
 
-// userScopeIntentsCTE returns a CTE block that defines user_agents and user_intents
-// for the given userDID ($1) and orgID ($2). Used across all user-scoped queries.
-// An empty orgID applies no org filter (admin profiles).
+// userScopeIntentsCTE returns a CTE block for the given userDID ($1) and
+// orgID ($2), used across all user-scoped queries. An empty orgID applies no
+// org filter (admin profiles). The rules live in the SQL functions of the
+// same names (see db.go):
+//
+//   - user_agents:         agents the user deployed
+//   - user_visible_agents: agents the user deployed or used
+//   - user_intents:        intents the user, or an agent they deployed, took part in
 const userScopeIntentsCTE = `
 WITH user_agents AS (
-    SELECT a.did
-    FROM new_agents a
+    SELECT a.did FROM new_agents a
     WHERE ($2 = '' OR a.organization_id = $2)
-      AND (
-          a.deployer_did IN (SELECT user_did_set($1))
-          OR a.did IN (
-              SELECT agent_did FROM new_requests
-              WHERE creator_did IN (SELECT user_did_set($1)) AND request_type = 'deploy_agent' AND status = 'approved'
-          )
-          OR a.did IN (
-              SELECT json_array_elements_text(COALESCE(u.agent_access_list,'[]')::json)
-              FROM new_org_users u WHERE u.email = (SELECT email FROM user_dids WHERE dids @> ARRAY[$1::text])
-          )
-      )
+      AND a.did IN (SELECT user_owned_agents($1))
+),
+user_visible_agents AS (
+    SELECT a.did FROM new_agents a
+    WHERE ($2 = '' OR a.organization_id = $2)
+      AND a.did IN (SELECT user_visible_agents($1))
 ),
 user_intents AS (
-    SELECT DISTINCT ni.intent_id, ni.started_at
-    FROM new_intents ni
-    LEFT JOIN new_interactions ix ON ix.intent_id = ni.intent_id
+    SELECT ni.intent_id, ni.started_at FROM new_intents ni
     WHERE ($2 = '' OR ni.organization_id = $2)
-      AND (
-          ni.initiator_did IN (SELECT user_did_set($1))
-          OR ix.initiator_did IN (SELECT user_did_set($1))
-          OR ix.initiator_did    IN (SELECT did FROM user_agents)
-          OR ix.interacted_to_did IN (SELECT did FROM user_agents)
-      )
+      AND ni.intent_id IN (SELECT user_intent_ids($1))
 )
 `
 
@@ -464,7 +456,7 @@ func (d *DB) GetUserMetrics(userDID, orgID string) (*OrgMetrics, error) {
 
 	err := d.conn.QueryRow(userScopeIntentsCTE+`
 		SELECT
-			(SELECT COUNT(*) FROM new_agents WHERE deployer_did IN (SELECT user_did_set($1))),
+			(SELECT COUNT(*) FROM user_visible_agents),
 			(SELECT COUNT(*) FROM user_intents),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents)),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents)),
@@ -473,7 +465,7 @@ func (d *DB) GetUserMetrics(userDID, orgID string) (*OrgMetrics, error) {
 			         ON (i.interacted_to_did = t.did OR i.initiator_did = t.did)
 			        AND i.organization_id = $2
 			 WHERE i.intent_id IN (SELECT intent_id FROM user_intents)),
-			(SELECT COUNT(*) FROM new_agents WHERE deployer_did IN (SELECT user_did_set($1)) AND created_at >= $3),
+			(SELECT COUNT(*) FROM new_agents WHERE did IN (SELECT did FROM user_visible_agents) AND created_at >= $3),
 			(SELECT COUNT(*) FROM user_intents WHERE started_at >= $3),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND intent_id IN (SELECT intent_id FROM user_intents) AND time >= $3),
 			(SELECT COUNT(*) FROM new_interactions WHERE organization_id = $2 AND threat = 1 AND intent_id IN (SELECT intent_id FROM user_intents) AND time >= $3),
@@ -499,7 +491,7 @@ func (d *DB) GetTopAgentsByUser(userDID, orgID string, limit, offset int) ([]*Ag
 			SUM(CASE WHEN i.threat = 1 THEN 1 ELSE 0 END)   AS total_threats
 		FROM new_agents a
 		LEFT JOIN new_interactions i ON i.initiator_did = a.did
-		WHERE a.did IN (SELECT did FROM user_agents)
+		WHERE a.did IN (SELECT did FROM user_visible_agents)
 		GROUP BY a.did, a.nft_id, a.name
 		ORDER BY total_interactions DESC
 		LIMIT $3 OFFSET $4`,
@@ -1234,6 +1226,9 @@ func (d *DB) GetUserDIDsByDID(did string) ([]string, error) {
 // SameUserDID reports whether DIDs a and b belong to the same user (or are
 // identical). Used by ownership checks that used to compare DIDs with ==.
 func (d *DB) SameUserDID(a, b string) bool {
+	if IsPlaceholderDID(a) || IsPlaceholderDID(b) {
+		return false
+	}
 	if a == b {
 		return true
 	}
@@ -1241,6 +1236,51 @@ func (d *DB) SameUserDID(a, b string) bool {
 	d.conn.QueryRow(`
 		SELECT EXISTS(SELECT 1 FROM user_dids WHERE dids @> ARRAY[$1::text, $2::text])`, a, b).Scan(&same)
 	return same
+}
+
+// IsPlaceholderDID reports whether did is one of the stand-ins stored for a
+// user who has no real DID yet. Such a DID identifies nobody: it must never
+// match an owner, or the user would see every orphaned agent and intent.
+func IsPlaceholderDID(did string) bool {
+	switch did {
+	case "", "none", "default-id":
+		return true
+	}
+	return false
+}
+
+// Scope limits a query to what the caller may see. AllOrg is the admin view
+// (the whole org); otherwise only what UserDID's user may see — agents they
+// deployed or used, intents they or their agents took part in. A user with
+// no real DID sees nothing.
+type Scope struct {
+	AllOrg  bool
+	UserDID string
+}
+
+// UserCanAccessAgent reports whether the user holding userDID may see
+// agentDID: they deployed it or used it (see user_visible_agents in db.go).
+// An agent with no owner, or whose owner is unknown, is visible only to
+// admins, and a placeholder userDID sees nothing.
+func (d *DB) UserCanAccessAgent(userDID, agentDID string) (bool, error) {
+	var ok bool
+	err := d.conn.QueryRow(
+		`SELECT EXISTS (SELECT 1 FROM user_visible_agents($1) v WHERE v = $2)`,
+		userDID, agentDID,
+	).Scan(&ok)
+	return ok, err
+}
+
+// UserCanAccessIntent reports whether the user holding userDID may see
+// intentID: they, or an agent they deployed, took part in it (see
+// user_intent_ids in db.go).
+func (d *DB) UserCanAccessIntent(userDID, intentID string) (bool, error) {
+	var ok bool
+	err := d.conn.QueryRow(
+		`SELECT EXISTS (SELECT 1 FROM user_intent_ids($1) v WHERE v = $2)`,
+		userDID, intentID,
+	).Scan(&ok)
+	return ok, err
 }
 
 func (d *DB) GetUserPolicy(did string) (string, error) {
@@ -2989,7 +3029,7 @@ func (d *DB) GetAgentsAppsMetricsByUser(userDID, orgID string) (*AgentsAppsMetri
 		return nil, err
 	}
 	if err := d.conn.QueryRow(
-		`SELECT COUNT(*) FROM new_agents WHERE deployer_did IN (SELECT user_did_set($1))`, userDID,
+		`SELECT COUNT(*) FROM new_agents WHERE did IN (SELECT user_visible_agents($1))`, userDID,
 	).Scan(&out.TotalAgents); err != nil {
 		return nil, err
 	}
@@ -3023,7 +3063,7 @@ func (d *DB) GetAgentsAppsMetricsByUser(userDID, orgID string) (*AgentsAppsMetri
 			FROM new_agents a
 			LEFT JOIN new_interactions i
 			       ON i.initiator_did = a.did AND i.organization_id = $2
-			WHERE a.deployer_did IN (SELECT user_did_set($1))
+			WHERE a.did IN (SELECT user_visible_agents($1))
 			GROUP BY a.did
 		) agent_stats`,
 		userDID, orgID,
@@ -3075,7 +3115,7 @@ func (d *DB) getToolsByUser(userDID, orgID string, limit, offset int) ([]*ToolRe
 	return scanToolRows(rows)
 }
 
-func (d *DB) Search(q, orgID string) (*SearchResults, error) {
+func (d *DB) Search(q, orgID string, scope Scope) (*SearchResults, error) {
 	out := &SearchResults{
 		Agents:  []SearchAgentResult{},
 		Apps:    []SearchAppResult{},
@@ -3083,15 +3123,16 @@ func (d *DB) Search(q, orgID string) (*SearchResults, error) {
 	}
 	pattern := "%" + q + "%"
 
-	// Agents — match name or DID, scoped to org.
+	// Agents — match name or DID, scoped to org and to what the caller may see.
 	agentRows, err := d.conn.Query(`
 		SELECT did, COALESCE(name,''), organization_id
 		FROM new_agents
 		WHERE organization_id = $1
 		  AND (name ILIKE $2 OR did ILIKE $2)
+		  AND ($3::bool OR did IN (SELECT user_visible_agents($4)))
 		ORDER BY name ASC
 		LIMIT 20`,
-		orgID, pattern,
+		orgID, pattern, scope.AllOrg, scope.UserDID,
 	)
 	if err != nil {
 		return nil, err
@@ -3133,8 +3174,9 @@ func (d *DB) Search(q, orgID string) (*SearchResults, error) {
 		FROM new_intents
 		WHERE organization_id = $1
 		  AND intent_id = $2
+		  AND ($3::bool OR intent_id IN (SELECT user_intent_ids($4)))
 		LIMIT 5`,
-		orgID, q,
+		orgID, q, scope.AllOrg, scope.UserDID,
 	)
 	if err != nil {
 		return nil, err
@@ -3423,12 +3465,14 @@ func (d *DB) getApplicationsAccessedByActor(intentScopeCTE, actorDID, orgID stri
 	return result, rows.Err()
 }
 
-func (d *DB) GetThreats(orgID string, limit, offset int) ([]*ThreatRecord, int, error) {
+func (d *DB) GetThreats(orgID string, scope Scope, limit, offset int) ([]*ThreatRecord, int, error) {
 	var total int
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
-		WHERE ni.organization_id = $1`, orgID).Scan(&total)
+		WHERE ni.organization_id = $1
+		  AND ($2::bool OR ni.intent_id IN (SELECT user_intent_ids($3)))`,
+		orgID, scope.AllOrg, scope.UserDID).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -3437,9 +3481,10 @@ func (d *DB) GetThreats(orgID string, limit, offset int) ([]*ThreatRecord, int, 
 		FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
 		WHERE ni.organization_id = $1
+		  AND ($2::bool OR ni.intent_id IN (SELECT user_intent_ids($3)))
 		ORDER BY t.time DESC
-		LIMIT $2 OFFSET $3`,
-		orgID, limit, offset,
+		LIMIT $4 OFFSET $5`,
+		orgID, scope.AllOrg, scope.UserDID, limit, offset,
 	)
 	if err != nil {
 		return nil, 0, err
@@ -3557,12 +3602,14 @@ const unknownThreatCodeFilter = `($2 = -1 AND NOT EXISTS (SELECT 1 FROM threat_c
 
 // GetThreatsByCode lists an org's threats with the given code.
 // UnknownThreatCode lists every threat whose code is not in threat_codes.
-func (d *DB) GetThreatsByCode(orgID string, code int) ([]*ThreatRecord, int, error) {
+func (d *DB) GetThreatsByCode(orgID string, code int, scope Scope) ([]*ThreatRecord, int, error) {
 	var total int
 	err := d.conn.QueryRow(`
 		SELECT COUNT(*) FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
-		WHERE ni.organization_id = $1 AND (t.threat_code = $2 OR `+unknownThreatCodeFilter+`)`, orgID, code).Scan(&total)
+		WHERE ni.organization_id = $1 AND (t.threat_code = $2 OR `+unknownThreatCodeFilter+`)
+		  AND ($3::bool OR ni.intent_id IN (SELECT user_intent_ids($4)))`,
+		orgID, code, scope.AllOrg, scope.UserDID).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -3571,8 +3618,9 @@ func (d *DB) GetThreatsByCode(orgID string, code int) ([]*ThreatRecord, int, err
 		FROM threats t
 		JOIN new_intents ni ON t.intent_id = ni.intent_id
 		WHERE ni.organization_id = $1 AND (t.threat_code = $2 OR `+unknownThreatCodeFilter+`)
+		  AND ($3::bool OR ni.intent_id IN (SELECT user_intent_ids($4)))
 		ORDER BY t.time DESC`,
-		orgID, code,
+		orgID, code, scope.AllOrg, scope.UserDID,
 	)
 	if err != nil {
 		return nil, 0, err

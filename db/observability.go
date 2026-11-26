@@ -22,10 +22,10 @@ type ObsHop struct {
 }
 
 // GetObservabilityHops returns every interaction for the org within the given
-// time window. When onlyInitiatorDID is non-empty, results are restricted to
-// interactions whose intent was started by that DID — the non-admin scope
-// for the observability page.
-func (d *DB) GetObservabilityHops(orgID string, since time.Time, onlyInitiatorDID string) ([]*ObsHop, error) {
+// time window. Unless allIntents (the admin view), results are restricted to
+// the intents userDID may see (user_intent_ids) — a user with no real DID
+// gets nothing, never the whole org.
+func (d *DB) GetObservabilityHops(orgID string, since time.Time, allIntents bool, userDID string) ([]*ObsHop, error) {
 	query := `
 		SELECT ni.intent_id, ni.initiator_did, ni.interacted_to_did, ni.time, ni.threat,
 		       COALESCE(t.threat_code, 0), COALESCE(tc.title, '')
@@ -34,9 +34,9 @@ func (d *DB) GetObservabilityHops(orgID string, since time.Time, onlyInitiatorDI
 		LEFT JOIN threat_codes tc ON tc.code = t.threat_code
 		WHERE ni.time >= $1`
 	args := []any{since}
-	if onlyInitiatorDID != "" {
-		query += ` AND ni.intent_id IN (SELECT intent_id FROM new_intents WHERE initiator_did IN (SELECT user_did_set($2)))`
-		args = append(args, onlyInitiatorDID)
+	if !allIntents {
+		query += ` AND ni.intent_id IN (SELECT user_intent_ids($2))`
+		args = append(args, userDID)
 	}
 	query += ` ORDER BY ni.time ASC`
 

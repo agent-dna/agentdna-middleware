@@ -1303,6 +1303,10 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 	var err error
 
 	if intentID != "" {
+		// The queries below already filter by org; this adds the per-user check.
+		if !h.authorizeIntent(c, intentID, orgID) {
+			return
+		}
 		total, err = h.db.CountInteractionsByOrgAndIntent(orgID, intentID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to count interactions: %v", err)})
@@ -1509,7 +1513,7 @@ func (h *Handler) Search(c *gin.Context) {
 	}
 
 	orgID := c.GetString(CtxOrgID)
-	results, err := h.db.Search(q, orgID)
+	results, err := h.db.Search(q, orgID, callerScope(c))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: err.Error()})
 		return
@@ -1890,15 +1894,12 @@ func (h *Handler) UsersList(c *gin.Context) {
 
 func (h *Handler) AgentInteractions(c *gin.Context) {
 	agentDID := c.Query("agentDID")
-	orgID := c.GetString(CtxOrgID)
 	if agentDID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
 		return
 	}
 
-	agentOrgID, err := h.db.GetAgentOrgID(agentDID)
-	if err != nil || agentOrgID != orgID {
-		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+	if !h.authorizeAgent(c, agentDID) {
 		return
 	}
 
@@ -1959,9 +1960,7 @@ func (h *Handler) AgentIntents(c *gin.Context) {
 		return
 	}
 
-	agentOrgID, err := h.db.GetAgentOrgID(agentDID)
-	if err != nil || agentOrgID != orgID {
-		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+	if !h.authorizeAgent(c, agentDID) {
 		return
 	}
 
@@ -2079,7 +2078,6 @@ func buildIntentList(intents []*db.IntentRecord) []gin.H {
 
 func (h *Handler) IntentDiagram(c *gin.Context) {
 	intentID := c.Query("intentID")
-	orgID := c.GetString(CtxOrgID)
 	if intentID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intentID is required"})
 		return
@@ -2090,8 +2088,7 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "intent not found"})
 		return
 	}
-	if intent.OrgID != orgID {
-		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+	if !h.authorizeIntent(c, intentID, intent.OrgID) {
 		return
 	}
 
@@ -2435,9 +2432,7 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 		return
 	}
 
-	agentOrgID, err := h.db.GetAgentOrgID(agentDID)
-	if err != nil || agentOrgID != orgID {
-		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+	if !h.authorizeAgent(c, agentDID) {
 		return
 	}
 
@@ -2529,7 +2524,6 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 
 func (h *Handler) IntentInfo(c *gin.Context) {
 	intentID := c.Query("intentID")
-	orgID := c.GetString(CtxOrgID)
 	if intentID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intentID is required"})
 		return
@@ -2540,8 +2534,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "intent not found"})
 		return
 	}
-	if intent.OrgID != orgID {
-		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+	if !h.authorizeIntent(c, intentID, intent.OrgID) {
 		return
 	}
 
@@ -2675,6 +2668,10 @@ func (h *Handler) UpdateIntentStatus(c *gin.Context) {
 	}
 	if !validIntentReviewStatuses[req.Status] {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "status must be one of Unreviewed, Acknowledged, Flagged"})
+		return
+	}
+	// UpdateIntentReviewStatus filters by org; this adds the per-user check.
+	if !h.authorizeIntent(c, req.IntentID, orgID) {
 		return
 	}
 
@@ -3507,15 +3504,12 @@ func (h *Handler) UploadAgentPolicy(c *gin.Context) {
 // GetAgentPolicy returns the stored policy content for a given agent.
 func (h *Handler) GetAgentPolicy(c *gin.Context) {
 	agentDID := c.Query("agentDID")
-	orgID := c.GetString(CtxOrgID)
 	if agentDID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
 		return
 	}
 
-	agentOrgID, err := h.db.GetAgentOrgID(agentDID)
-	if err != nil || agentOrgID != orgID {
-		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+	if !h.authorizeAgent(c, agentDID) {
 		return
 	}
 
@@ -3584,6 +3578,10 @@ func (h *Handler) GetAgentPolicyHistory(c *gin.Context) {
 		return
 	}
 
+	if !h.authorizeAgent(c, agentDID) {
+		return
+	}
+
 	nftID, err := h.db.GetAgentNFTID(agentDID)
 	if err != nil || nftID == "" {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "agent NFT not found"})
@@ -3613,6 +3611,10 @@ func (h *Handler) GetAgentPolicyUpdate(c *gin.Context) {
 	updateID := c.Query("updateID")
 	if agentDID == "" || updateID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID and updateID are required"})
+		return
+	}
+
+	if !h.authorizeAgent(c, agentDID) {
 		return
 	}
 
@@ -4222,6 +4224,10 @@ func (h *Handler) ThreatByID(c *gin.Context) {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: fmt.Sprintf("threat %s not found", threatID)})
 		return
 	}
+	// A threat is visible to whoever may see its intent.
+	if !h.authorizeIntent(c, threat.IntentID, c.GetString(CtxOrgID)) {
+		return
+	}
 
 	codeInfo, err := h.threatCodeInfo(threat.ThreatCode)
 	if err != nil {
@@ -4382,15 +4388,12 @@ func (h *Handler) fetchAgentLHIScores(agentIDs []string) (map[string][]LHIScoreE
 // the caller's org) and returns its trust-edge scores as-is.
 func (h *Handler) AgentLHIScores(c *gin.Context) {
 	agentDID := c.Query("agentDID")
-	orgID := c.GetString(CtxOrgID)
 	if agentDID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "agentDID is required"})
 		return
 	}
 
-	agentOrgID, err := h.db.GetAgentOrgID(agentDID)
-	if err != nil || agentOrgID != orgID {
-		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+	if !h.authorizeAgent(c, agentDID) {
 		return
 	}
 
@@ -4492,7 +4495,7 @@ func (h *Handler) ThreatEvents(c *gin.Context) {
 	}
 	offset := (page - 1) * limit
 
-	threats, total, err := h.db.GetThreats(orgID, limit, offset)
+	threats, total, err := h.db.GetThreats(orgID, callerScope(c), limit, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch threats: %v", err)})
 		return
@@ -4612,7 +4615,7 @@ func (h *Handler) ThreatDetail(c *gin.Context) {
 		}
 	}
 
-	threats, total, err := h.db.GetThreatsByCode(orgID, code)
+	threats, total, err := h.db.GetThreatsByCode(orgID, code, callerScope(c))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch threats: %v", err)})
 		return

@@ -36,6 +36,12 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.POST("/logout-all", h.LogoutAll)
 	dashboard.GET("/user-profile", h.UserProfile)
 	dashboard.GET("/admin-profile", h.AdminProfile)
+	dashboard.POST("/update-password", h.UpdatePassword)
+	dashboard.POST("/update-profile", h.UpdateProfile)
+
+	// Everything below shows or changes org data: an org user must also have
+	// an API key. The routes above only touch the caller's own account.
+	dashboard = dashboard.Group("", h.RequireAPIKey())
 
 	dashboard.GET("/home-metrics", h.HomeMetrics)
 	dashboard.GET("/interactions-list", h.InteractionsList)
@@ -63,8 +69,6 @@ func Register(r *gin.Engine, h *handler.Handler) {
 	dashboard.POST("/update-credential-status", h.UpdateCredentialStatus)
 	dashboard.POST("/update-intent-status", h.UpdateIntentStatus)
 	dashboard.GET("/intent-diagram", h.IntentDiagram)
-	dashboard.POST("/update-password", h.UpdatePassword)
-	dashboard.POST("/update-profile", h.UpdateProfile)
 	dashboard.GET("/tools-list", h.ToolsList)
 	dashboard.GET("/tool-info", h.ToolInfo)
 	dashboard.GET("/user-info", h.UserInfo)

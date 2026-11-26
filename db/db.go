@@ -549,15 +549,75 @@ func New(dsn string) *DB {
 		// username. The input DID is always included, so agent
 		// DIDs passed through user-scoped queries behave exactly as a plain
 		// "= $1" did before.
+		// A placeholder DID ('', 'none', 'default-id': a user with no real
+		// DID yet) expands to nothing. Otherwise such a user would "own"
+		// every agent and intent whose owner DID is that same placeholder,
+		// i.e. every orphaned record.
 		`CREATE OR REPLACE FUNCTION user_did_set(p_did TEXT) RETURNS SETOF TEXT
 		 LANGUAGE sql STABLE AS $$
-			SELECT unnest(dids) FROM user_dids WHERE dids @> ARRAY[p_did]
+			SELECT d FROM (
+				SELECT unnest(dids) AS d FROM user_dids WHERE dids @> ARRAY[p_did]
+				UNION
+				SELECT a2.did FROM new_admins a1
+				JOIN new_admins a2 ON a2.name = a1.name
+				WHERE a1.did = p_did AND COALESCE(a1.name, '') <> ''
+				UNION
+				SELECT p_did
+			) s
+			WHERE COALESCE(p_did, '') NOT IN ('', 'none', 'default-id')
+			  AND COALESCE(d, '') NOT IN ('', 'none', 'default-id')
+		 $$`,
+		// What an org user may see. Admins see the whole org and never go
+		// through these. Every function takes any one of the user's DIDs.
+		//
+		// user_owned_agents: agents the user deployed (deployer_did, or an
+		// approved deploy_agent request they created).
+		`CREATE OR REPLACE FUNCTION user_owned_agents(p_did TEXT) RETURNS SETOF TEXT
+		 LANGUAGE sql STABLE AS $$
+			SELECT a.did FROM new_agents a
+			WHERE a.deployer_did IN (SELECT user_did_set(p_did))
 			UNION
-			SELECT a2.did FROM new_admins a1
-			JOIN new_admins a2 ON a2.name = a1.name
-			WHERE a1.did = p_did AND COALESCE(a1.name, '') <> ''
+			SELECT r.agent_did FROM new_requests r
+			WHERE r.creator_did IN (SELECT user_did_set(p_did))
+			  AND r.request_type = 'deploy_agent' AND r.status = 'approved'
+			  AND COALESCE(r.agent_did, '') <> ''
+		 $$`,
+		// user_participated_intents: intents the user personally took part
+		// in — started it, or sent or received any of its interactions.
+		`CREATE OR REPLACE FUNCTION user_participated_intents(p_did TEXT) RETURNS SETOF TEXT
+		 LANGUAGE sql STABLE AS $$
+			SELECT ni.intent_id FROM new_intents ni
+			WHERE ni.initiator_did IN (SELECT user_did_set(p_did))
 			UNION
-			SELECT p_did
+			SELECT ix.intent_id FROM new_interactions ix
+			WHERE ix.initiator_did IN (SELECT user_did_set(p_did))
+			   OR ix.interacted_to_did IN (SELECT user_did_set(p_did))
+		 $$`,
+		// user_intent_ids: the intents a user may see — ones they took part
+		// in, plus ones any agent they deployed took part in.
+		`CREATE OR REPLACE FUNCTION user_intent_ids(p_did TEXT) RETURNS SETOF TEXT
+		 LANGUAGE sql STABLE AS $$
+			SELECT user_participated_intents(p_did)
+			UNION
+			SELECT ni.intent_id FROM new_intents ni
+			WHERE ni.initiator_did IN (SELECT user_owned_agents(p_did))
+			UNION
+			SELECT ix.intent_id FROM new_interactions ix
+			WHERE ix.initiator_did IN (SELECT user_owned_agents(p_did))
+			   OR ix.interacted_to_did IN (SELECT user_owned_agents(p_did))
+		 $$`,
+		// user_visible_agents: the agents a user may see — ones they
+		// deployed, plus ones they used: any agent in an intent the user
+		// personally took part in. Agents that only met the user's agents
+		// (another user's agent calling theirs) are not "used" and stay
+		// hidden, as do agents with no owner or an unknown owner.
+		`CREATE OR REPLACE FUNCTION user_visible_agents(p_did TEXT) RETURNS SETOF TEXT
+		 LANGUAGE sql STABLE AS $$
+			SELECT user_owned_agents(p_did)
+			UNION
+			SELECT a.did FROM new_agents a
+			JOIN new_interactions ix ON a.did IN (ix.initiator_did, ix.interacted_to_did)
+			WHERE ix.intent_id IN (SELECT user_participated_intents(p_did))
 		 $$`,
 	} {
 		if _, err := conn.Exec(stmt); err != nil {

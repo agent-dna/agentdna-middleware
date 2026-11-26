@@ -197,7 +197,7 @@ func (h *Handler) SessionAuthMiddleware() gin.HandlerFunc {
 			// DID) gets admin rights, as under the previous JWT check.
 			if _, err := h.db.GetAdminByEmail(email); err == nil {
 				isAdmin = true
-			} else if did != "" && did != "none" {
+			} else if !db.IsPlaceholderDID(did) {
 				if _, err := h.db.GetAdminByDID(did); err == nil {
 					isAdmin = true
 				}
@@ -220,6 +220,86 @@ func (h *Handler) SessionAuthMiddleware() gin.HandlerFunc {
 		c.Set(CtxAccountID, sess.AccountID)
 		c.Next()
 	}
+}
+
+// CodeAPIKeyRequired is the Response.Code sent when a logged-in user has no
+// API key yet, so the dashboard can show "get an API key" instead of a
+// generic error.
+const CodeAPIKeyRequired = "API_KEY_REQUIRED"
+
+// RequireAPIKey runs after SessionAuthMiddleware and blocks org users who
+// have no API key from every data endpoint: logging in alone must not reveal
+// any agent, intent or org information. Admins are not affected.
+func (h *Handler) RequireAPIKey() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetBool(CtxIsAdmin) || c.GetString(CtxAPIKey) != "" {
+			c.Next()
+			return
+		}
+		log.Printf("[session] %s %s blocked: account=%q has no API key",
+			c.Request.Method, c.Request.URL.Path, c.GetString(CtxAccountID))
+		c.AbortWithStatusJSON(http.StatusForbidden, Response{
+			Status:  false,
+			Code:    CodeAPIKeyRequired,
+			Message: "an API key is required to view this information",
+		})
+	}
+}
+
+// authorizeAgent checks the caller may see agentDID and answers 403 itself
+// when not. Admins see every agent in the org; a user only sees agents they
+// own or were given access to, so an agent with no owner (or an owner who
+// can't be found) is admin-only.
+func (h *Handler) authorizeAgent(c *gin.Context, agentDID string) bool {
+	agentOrgID, err := h.db.GetAgentOrgID(agentDID)
+	if err != nil || agentOrgID != c.GetString(CtxOrgID) {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+		return false
+	}
+	if c.GetBool(CtxIsAdmin) {
+		return true
+	}
+	ok, err := h.db.UserCanAccessAgent(c.GetString(CtxDID), agentDID)
+	if err != nil {
+		log.Printf("[authz] agent access check agent=%q user=%q failed: %v", agentDID, c.GetString(CtxDID), err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to check agent access"})
+		return false
+	}
+	if !ok {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+		return false
+	}
+	return true
+}
+
+// callerScope is the db.Scope for the logged-in caller: the whole org for an
+// admin, otherwise only what their user may see.
+func callerScope(c *gin.Context) db.Scope {
+	return db.Scope{AllOrg: c.GetBool(CtxIsAdmin), UserDID: c.GetString(CtxDID)}
+}
+
+// authorizeIntent checks the caller may see the intent and answers 403
+// itself when not. Admins see every intent in the org; a user only sees
+// intents they took part in, or that an agent they deployed took part in.
+func (h *Handler) authorizeIntent(c *gin.Context, intentID, intentOrgID string) bool {
+	if intentOrgID != c.GetString(CtxOrgID) {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+		return false
+	}
+	if c.GetBool(CtxIsAdmin) {
+		return true
+	}
+	ok, err := h.db.UserCanAccessIntent(c.GetString(CtxDID), intentID)
+	if err != nil {
+		log.Printf("[authz] intent access check intent=%q user=%q failed: %v", intentID, c.GetString(CtxDID), err)
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: "failed to check intent access"})
+		return false
+	}
+	if !ok {
+		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+		return false
+	}
+	return true
 }
 
 // rejectSession ends a session whose account no longer exists.
@@ -278,12 +358,13 @@ func (h *Handler) Session(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"email":     c.GetString(CtxEmail),
-			"name":      c.GetString(CtxName),
-			"did":       c.GetString(CtxDID),
-			"org_id":    c.GetString(CtxOrgID),
-			"is_admin":  c.GetBool(CtxIsAdmin),
-			"expiresAt": sess.ExpiresAt.UTC().Format(time.RFC3339),
+			"email":       c.GetString(CtxEmail),
+			"name":        c.GetString(CtxName),
+			"did":         c.GetString(CtxDID),
+			"org_id":      c.GetString(CtxOrgID),
+			"is_admin":    c.GetBool(CtxIsAdmin),
+			"has_api_key": c.GetString(CtxAPIKey) != "",
+			"expiresAt":   sess.ExpiresAt.UTC().Format(time.RFC3339),
 		},
 	})
 }

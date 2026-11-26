@@ -239,7 +239,6 @@ func buildIntentAuthEvidence(
 //	GET /dashboard/v1/intent-auth-evidence?intentID=<intentID>
 func (h *Handler) IntentAuthEvidence(c *gin.Context) {
 	intentID := c.Query("intentID")
-	orgID := c.GetString(CtxOrgID)
 	if intentID == "" {
 		c.JSON(http.StatusBadRequest, Response{Status: false, Message: "intentID is required"})
 		return
@@ -250,8 +249,7 @@ func (h *Handler) IntentAuthEvidence(c *gin.Context) {
 		c.JSON(http.StatusNotFound, Response{Status: false, Message: "intent not found"})
 		return
 	}
-	if intent.OrgID != orgID {
-		c.JSON(http.StatusForbidden, Response{Status: false, Message: "not authorized"})
+	if !h.authorizeIntent(c, intentID, intent.OrgID) {
 		return
 	}
 

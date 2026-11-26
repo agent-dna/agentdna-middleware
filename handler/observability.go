@@ -205,17 +205,17 @@ type obsContext struct {
 	intentInitiator map[string]string // intent_id -> initiator_did, for every intent touched by the hops above
 }
 
-// loadObsContext fetches hops for the org (scoped to scopeInitiatorDID when
-// non-empty — the non-admin case), classifies each by registry lookup, drops
+// loadObsContext fetches hops for the org (for a non-admin, only the intents
+// callerDID may see), classifies each by registry lookup, drops
 // anything that doesn't pass the status filter or classify as
 // user_agent/agent_app, and resolves the intent-initiator map needed to
 // attribute agent->app hops back to a user.
-func (h *Handler) loadObsContext(c *gin.Context, scopeInitiatorDID string) (*obsContext, error) {
+func (h *Handler) loadObsContext(c *gin.Context, isAdmin bool, callerDID string) (*obsContext, error) {
 	orgID := c.GetString(CtxOrgID)
 	rangeLabel, since := obsParseRange(c)
 	status := obsParseStatus(c)
 
-	hops, err := h.db.GetObservabilityHops(orgID, since, scopeInitiatorDID)
+	hops, err := h.db.GetObservabilityHops(orgID, since, isAdmin, callerDID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch hops: %w", err)
 	}
@@ -231,8 +231,8 @@ func (h *Handler) loadObsContext(c *gin.Context, scopeInitiatorDID string) (*obs
 	if err != nil {
 		return nil, fmt.Errorf("fetch app registry: %w", err)
 	}
-	log.Printf("[observability] path=%s orgID=%q scopeInitiatorDID=%q range=%s(since=%s) status=%s rawHops=%d registrySizes(users=%d,agents=%d,apps=%d)",
-		c.Request.URL.Path, orgID, scopeInitiatorDID, rangeLabel, since.UTC().Format(time.RFC3339), status,
+	log.Printf("[observability] path=%s orgID=%q isAdmin=%v callerDID=%q range=%s(since=%s) status=%s rawHops=%d registrySizes(users=%d,agents=%d,apps=%d)",
+		c.Request.URL.Path, orgID, isAdmin, callerDID, rangeLabel, since.UTC().Format(time.RFC3339), status,
 		len(hops), len(users), len(agents), len(apps))
 
 	octx := &obsContext{orgID: orgID, users: users, agents: agents, apps: apps}
@@ -291,15 +291,6 @@ func (h *Handler) loadObsContext(c *gin.Context, scopeInitiatorDID string) (*obs
 	octx.intentInitiator = initiators
 
 	return octx, nil
-}
-
-// obsScopeDID returns the DID to restrict hops to (non-admin) or "" (admin,
-// no restriction).
-func obsScopeDID(isAdmin bool, callerDID string) string {
-	if isAdmin {
-		return ""
-	}
-	return callerDID
 }
 
 // ---- GateEdge ---------------------------------------------------------
@@ -565,7 +556,7 @@ func (h *Handler) ObservabilitySummary(c *gin.Context) {
 		return
 	}
 	rangeLabel, _ := obsParseRange(c)
-	octx, err := h.loadObsContext(c, obsScopeDID(isAdmin, callerDID))
+	octx, err := h.loadObsContext(c, isAdmin, callerDID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to load observability data: %v", err)})
 		return
@@ -605,7 +596,7 @@ func (h *Handler) ObservabilityGraph(c *gin.Context) {
 	if !ok {
 		return
 	}
-	octx, err := h.loadObsContext(c, obsScopeDID(isAdmin, callerDID))
+	octx, err := h.loadObsContext(c, isAdmin, callerDID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to load observability data: %v", err)})
 		return
@@ -685,7 +676,7 @@ func (h *Handler) ObservabilityUsers(c *gin.Context) {
 	if !ok {
 		return
 	}
-	octx, err := h.loadObsContext(c, obsScopeDID(isAdmin, callerDID))
+	octx, err := h.loadObsContext(c, isAdmin, callerDID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to load observability data: %v", err)})
 		return
@@ -789,7 +780,7 @@ func (h *Handler) ObservabilityUserFlow(c *gin.Context) {
 		return
 	}
 
-	octx, err := h.loadObsContext(c, obsScopeDID(isAdmin, callerDID))
+	octx, err := h.loadObsContext(c, isAdmin, callerDID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to load observability data: %v", err)})
 		return
@@ -891,7 +882,7 @@ func (h *Handler) ObservabilityAgentFlow(c *gin.Context) {
 		return
 	}
 
-	octx, err := h.loadObsContext(c, obsScopeDID(isAdmin, callerDID))
+	octx, err := h.loadObsContext(c, isAdmin, callerDID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to load observability data: %v", err)})
 		return
@@ -1106,7 +1097,7 @@ func (h *Handler) ObservabilityAppFlow(c *gin.Context) {
 		return
 	}
 
-	octx, err := h.loadObsContext(c, obsScopeDID(isAdmin, callerDID))
+	octx, err := h.loadObsContext(c, isAdmin, callerDID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to load observability data: %v", err)})
 		return
@@ -1326,7 +1317,7 @@ func (h *Handler) ObservabilityIntents(c *gin.Context) {
 		return
 	}
 
-	octx, err := h.loadObsContext(c, obsScopeDID(isAdmin, callerDID))
+	octx, err := h.loadObsContext(c, isAdmin, callerDID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to load observability data: %v", err)})
 		return
@@ -1584,7 +1575,7 @@ func (h *Handler) ObservabilityPaths(c *gin.Context) {
 		}
 	}
 
-	octx, err := h.loadObsContext(c, obsScopeDID(isAdmin, callerDID))
+	octx, err := h.loadObsContext(c, isAdmin, callerDID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to load observability data: %v", err)})
 		return
