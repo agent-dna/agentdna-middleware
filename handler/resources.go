@@ -113,6 +113,11 @@ func (h *Handler) ResourceInfo(c *gin.Context) {
 		return
 	}
 
+	intentIDs := make([]string, 0, len(intents))
+	for _, i := range intents {
+		intentIDs = append(intentIDs, i.IntentID)
+	}
+	warnings := h.intentWarnings(intentIDs)
 	intentList := make([]gin.H, 0, len(intents))
 	for _, i := range intents {
 		var startedAt any
@@ -135,6 +140,7 @@ func (h *Handler) ResourceInfo(c *gin.Context) {
 			"reviewStatus":   i.ReviewStatus,
 			"flowType":       i.FlowType,
 			"threatDetected": i.ThreatDetected,
+			"warnings":       warnings[i.IntentID],
 			"startedAt":      startedAt,
 			"credentialIDs":  credentialIDs,
 			"urls":           urls,
@@ -210,6 +216,7 @@ func (h *Handler) UpdateResourceTrustStatus(c *gin.Context) {
 		updatedBy = c.GetString(CtxDID)
 	}
 	log.Printf("[resources] trust_status resource_id=%q trust_status=%s by=%q", resource.ID, resource.TrustStatus, updatedBy)
+	h.recomputeWarnings(nil, resource.ID, "")
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
 		"resourceID":  resource.ID,

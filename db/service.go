@@ -601,7 +601,7 @@ func (d *DB) GetInteractionsByUser(userDID, orgID string, limit, offset int) ([]
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, ''), warning_codes
 		FROM new_interactions
 		WHERE ($2 = '' OR organization_id = $2) AND intent_id IN (SELECT intent_id FROM user_intents)
 		ORDER BY time DESC
@@ -631,7 +631,7 @@ func (d *DB) GetThreatsByUser(userDID, orgID string, limit, offset int) ([]*Inte
 		       ni.initiator_did, COALESCE(ni.initiator_name, ''),
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
 		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
-		       COALESCE(ni.signature, ''), COALESCE(ni.threat_id, ''),
+		       COALESCE(ni.signature, ''), COALESCE(ni.threat_id, ''), ni.warning_codes,
 		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Unreviewed')
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
@@ -696,7 +696,7 @@ func (d *DB) GetInteractionsByOrg(orgID string, limit, offset int) ([]*Interacti
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, ''), warning_codes
 		FROM new_interactions
 		WHERE organization_id = $1
 		ORDER BY time DESC
@@ -731,7 +731,7 @@ func (d *DB) GetInteractionsByOrgAndIntent(orgID, intentID string, limit, offset
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, ''), warning_codes
 		FROM new_interactions
 		WHERE organization_id = $1 AND intent_id = $2
 		ORDER BY time ASC
@@ -759,7 +759,7 @@ func (d *DB) GetThreatsByOrg(orgID string, limit, offset int) ([]*InteractionRec
 		       ni.initiator_did, COALESCE(ni.initiator_name, ''),
 		       ni.interacted_to_did, COALESCE(ni.interacted_to_name, ''),
 		       COALESCE(ni.type, ''), COALESCE(ni.direction, ''), ni.threat, ni.intent_id, ni.time, COALESCE(t.message, ''),
-		       COALESCE(ni.signature, ''), COALESCE(ni.threat_id, ''),
+		       COALESCE(ni.signature, ''), COALESCE(ni.threat_id, ''), ni.warning_codes,
 		       COALESCE(t.threat_code, 0), COALESCE(NULLIF(tc.title, ''), 'Unknown Threat'), COALESCE(nint.review_status, 'Unreviewed')
 		FROM new_interactions ni
 		LEFT JOIN threats t ON t.id = ni.threat_id
@@ -2107,7 +2107,7 @@ func scanInteractionNewRows(rows *sql.Rows) ([]*InteractionRecord, error) {
 			&r.From, &r.FromName,
 			&r.To, &r.ToName,
 			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
-			&r.Signature, &r.ThreatID,
+			&r.Signature, &r.ThreatID, pq.Array(&r.WarningCodes),
 		); err != nil {
 			return nil, err
 		}
@@ -2129,7 +2129,7 @@ func scanInteractionNewRowsWithTitle(rows *sql.Rows) ([]*InteractionRecord, erro
 			&r.From, &r.FromName,
 			&r.To, &r.ToName,
 			&r.Type, &r.Direction, &threatInt, &r.IntentID, &r.Time, &r.Message,
-			&r.Signature, &r.ThreatID,
+			&r.Signature, &r.ThreatID, pq.Array(&r.WarningCodes),
 			&r.ThreatCode, &r.ThreatTitle, &r.ReviewStatus,
 		); err != nil {
 			return nil, err
@@ -2146,7 +2146,7 @@ func (d *DB) GetInteractionsByAgent(agentDID string, limit, offset int) ([]*Inte
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, ''), warning_codes
 		FROM new_interactions
 		WHERE initiator_did = $1
 		ORDER BY time DESC
@@ -2485,7 +2485,7 @@ func (d *DB) GetInteractionsByIntent(intentID string) ([]*InteractionRecord, err
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, ''), warning_codes
 		FROM new_interactions WHERE intent_id = $1 ORDER BY time ASC`,
 		intentID,
 	)
@@ -2777,7 +2777,7 @@ func (d *DB) GetInteractionsByTool(toolDID, orgID string, limit, offset int) ([]
 		       initiator_did, COALESCE(initiator_name, ''),
 		       interacted_to_did, COALESCE(interacted_to_name, ''),
 		       COALESCE(type, ''), COALESCE(direction, ''), threat, intent_id, time, COALESCE(message, ''),
-		       COALESCE(signature, ''), COALESCE(threat_id, '')
+		       COALESCE(signature, ''), COALESCE(threat_id, ''), warning_codes
 		FROM new_interactions
 		WHERE interacted_to_did = $1 AND organization_id = $2
 		ORDER BY time DESC

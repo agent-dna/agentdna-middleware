@@ -184,6 +184,11 @@ func (h *Handler) CredentialInfo(c *gin.Context) {
 		})
 	}
 
+	intentIDs := make([]string, 0, len(intents))
+	for _, i := range intents {
+		intentIDs = append(intentIDs, i.IntentID)
+	}
+	warnings := h.intentWarnings(intentIDs)
 	intentList := make([]gin.H, 0, len(intents))
 	for _, i := range intents {
 		intentList = append(intentList, gin.H{
@@ -193,6 +198,7 @@ func (h *Handler) CredentialInfo(c *gin.Context) {
 			"status":         i.Status,
 			"reviewStatus":   i.ReviewStatus,
 			"threatDetected": i.ThreatDetected,
+			"warnings":       warnings[i.IntentID],
 			"startedAt":      timeOrNil(i.StartedAt),
 			"requestCount":   i.RequestCount,
 			"lastUsedAt":     timeOrNil(i.LastUsedAt),
@@ -276,6 +282,7 @@ func (h *Handler) UpdateCredentialStatus(c *gin.Context) {
 		return
 	}
 	log.Printf("[credentials] status credential_id=%q status=%s by=%q reason=%q", req.CredentialID, cs.Status, updatedBy, cs.StatusReason)
+	h.recomputeWarnings(nil, "", req.CredentialID)
 
 	c.JSON(http.StatusOK, Response{Status: true, Data: gin.H{
 		"credentialID": req.CredentialID,

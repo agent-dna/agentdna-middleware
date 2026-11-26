@@ -1444,11 +1444,18 @@ func (h *Handler) ObservabilityIntents(c *gin.Context) {
 	total := len(results)
 	pageResults := obsSlicePage(results, page, pageSize)
 
+	pageIDs := make([]string, 0, len(pageResults))
+	for _, r := range pageResults {
+		pageIDs = append(pageIDs, r.intentID)
+	}
+	warnings := h.intentWarnings(pageIDs)
+
 	list := make([]gin.H, 0, len(pageResults))
 	for _, r := range pageResults {
 		list = append(list, gin.H{
 			"intentID":          r.intentID,
 			"intentTitle":       r.title,
+			"warnings":          warnings[r.intentID],
 			"outcome":           r.outcome,
 			"policy":            r.policy,
 			"flags":             r.flags,
@@ -1521,6 +1528,7 @@ func (h *Handler) obsFullIntentDetail(intentID, title string) gin.H {
 			"direction":     i.Direction,
 			"threat":        i.Threat,
 			"threatID":      i.ThreatID,
+			"warnings":      h.warningsJSON(i.WarningCodes),
 			"time":          i.Time,
 			"message":       i.Message,
 			"signature":     i.Signature,
@@ -1537,6 +1545,7 @@ func (h *Handler) obsFullIntentDetail(intentID, title string) gin.H {
 		"status":             intent.Status,
 		"reviewStatus":       intent.ReviewStatus,
 		"threatDetected":     threatDetected,
+		"warnings":           h.intentWarnings([]string{intent.IntentID})[intent.IntentID],
 		"flowType":           intent.FlowType,
 		"executor":           intent.Executor,
 		"chainDepth":         intent.ChainDepth,

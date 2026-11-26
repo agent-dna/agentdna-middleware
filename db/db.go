@@ -82,6 +82,7 @@ type InteractionRecord struct {
 	Signature     string
 	ReviewStatus  string
 	Time          time.Time
+	WarningCodes  []int64 // 51xx codes, see RecomputeWarnings
 }
 
 type ThreatRecord struct {
@@ -663,6 +664,13 @@ func New(dsn string) *DB {
 	// column holding a JSON-encoded []string, marshaled/unmarshaled in Go.
 	conn.Exec(`ALTER TABLE new_tools ADD COLUMN IF NOT EXISTS agents_list TEXT DEFAULT '[]'`)
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS threat_id TEXT NOT NULL DEFAULT ''`)
+	// warning_codes: the 51xx codes that currently apply to this interaction,
+	// computed by RecomputeWarnings from its auth evidence, the destinations'
+	// trust status and the credentials' status. Rebuilt whole on every
+	// recompute, so a code that stops applying disappears.
+	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS warning_codes INT[] NOT NULL DEFAULT '{}'`)
+	// RecomputeWarnings looks evidence up by credential.
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_auth_evidence_credential ON auth_evidence (credential_id)`)
 	conn.Exec(`CREATE TABLE IF NOT EXISTS apps (
 		did        TEXT PRIMARY KEY,
 		name       TEXT NOT NULL DEFAULT '',

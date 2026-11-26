@@ -252,6 +252,12 @@ func (f *FakeRubix) serve(w http.ResponseWriter, r *http.Request) {
 // the outcome so scenarios can cover found / missing / malformed / failed.
 func newFakeCBAC() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The same server stands in for the admin server (ADMIN_SERVICE_URL),
+		// which app registration calls before storing a tool: accept it.
+		if strings.HasPrefix(r.URL.Path, "/agent-admin/") {
+			writeJSON(w, map[string]any{"status": true, "message": "ok", "data": nil})
+			return
+		}
 		hash := strings.TrimPrefix(r.URL.Path, "/decisions/by-hash/")
 		switch {
 		case strings.HasPrefix(hash, "cbac-ok"):
@@ -397,6 +403,11 @@ type Harness struct {
 	user         SeedUser
 	toolDID      string
 	threatTitles map[int]string
+
+	// An admin dashboard session, created on first use (see wAdmin).
+	adminOnce sync.Once
+	admin     *Dashboard
+	adminErr  error
 }
 
 func setup(ctx context.Context, cfg Config) (*Harness, error) {
@@ -438,6 +449,7 @@ func setup(ctx context.Context, cfg Config) (*Harness, error) {
 		"ADMIN_SERVICE_URL":     h.cbac.URL, // unused by txn flows; points somewhere harmless
 		"CORS_ALLOWED_ORIGINS":  "http://localhost:3000",
 		"SESSION_COOKIE_SECURE": "false",
+		"DURATION_CREDENTIAL":   "90d", // warning 5108 (W07)
 	})
 	if err != nil {
 		return h, err

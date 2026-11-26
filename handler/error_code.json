@@ -6,7 +6,16 @@
   { "code": 2003, "title": "COCA Verification Failed (Boundary)", "severity": "Medium", "description": "Boundary-tier COCA identity check failed" },
   { "code": 1002, "title": "Testing Error", "severity": "High", "description": "Testing-only error path triggered in agent execution" },
   { "code": 1001, "title": "Whitelist Error", "severity": "Critical", "description": "Request blocked due to whitelist policy" },
-
+  
+  { "code": 5101, "title": "Call to a new host / unknown", "severity": "Low", "description": "Prompt injection makes a tool send the user's token or data to an attacker URL" },
+  { "code": 5102, "title": "Token rejected", "severity": "Low", "description": "A stolen or expired token, or an agent reaching beyond its access" },
+  { "code": 5103, "title": "Identity switched mid-run", "severity": "Low", "description": "An agent picks up someone else's token mid workflow" },
+  { "code": 5104, "title": "No auth or weak auth", "severity": "Low", "description": "A tool backend server left open, or Basic auth with a password" },
+  { "code": 5105, "title": "One key serves everyone", "severity": "Low", "description": "A GitHub MCP server on one org PAT, so users can read repos they can't access themselves" },
+  { "code": 5106, "title": "Personal token in a shared agent", "severity": "Low", "description": "A developer's own token is left in a deployed agent" },
+  { "code": 5107, "title": "Stale key still in use", "severity": "Low", "description": "A key revoked at offboarding is still in an agent's config and keeps failing" },
+  { "code": 5108, "title": "Key never rotated", "severity": "Low", "description": "A SOC 2 key-rotation finding, backed by evidence from real runs" },
+  
   { "code": 3001, "title": "Guard: Intended Action Empty", "severity": "Medium", "description": "No intended action was provided to the policy guard" },
   { "code": 3002, "title": "Guard: Policy Lookup Failed", "severity": "Medium", "description": "Policy lookup failed while evaluating the guard" },
   { "code": 3003, "title": "Guard: No Policy Available", "severity": "Medium", "description": "No policy is configured for this agent/tool pair" },
@@ -38,5 +47,6 @@
   { "code": 9102, "title": "Unrecognized Response", "severity": "High", "description": "CBAC returned a 200 with no usable decision" },
   { "code": 9103, "title": "Transport Failed", "severity": "High", "description": "Failed to reach the CBAC service" },
   { "code": 9104, "title": "Verdict Without Code", "severity": "High", "description": "CBAC returned a decision with no incident code" }
+
 
 ]

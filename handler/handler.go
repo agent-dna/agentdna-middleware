@@ -95,7 +95,9 @@ type Handler struct {
 	mailer              *email.Mailer
 	otpStore            sync.Map
 	emailQueue          chan email.Message
-	unknownThreat       db.ThreatCodeRecord // error_code.json's entry without a code
+	unknownThreat       db.ThreatCodeRecord         // error_code.json's entry without a code
+	threatCodes         map[int]db.ThreatCodeRecord // error_code.json by code
+	credentialMaxAge    time.Duration               // DURATION_CREDENTIAL, for warning 5108
 }
 
 func New(database *db.DB, backendURL *url.URL, session SessionConfig, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
@@ -120,7 +122,12 @@ func New(database *db.DB, backendURL *url.URL, session SessionConfig, orgID, adm
 		log.Fatalf("[threat-codes] sync: %v", err)
 	}
 	h.unknownThreat = unknown
+	h.threatCodes = make(map[int]db.ThreatCodeRecord, len(codes))
+	for _, c := range codes {
+		h.threatCodes[c.Code] = c
+	}
 	log.Printf("[threat-codes] loaded %d codes from error_code.json", len(codes))
+	h.credentialMaxAge = credentialMaxAgeFromEnv()
 	// Capture blockchain transaction provenance from the upstream responses.
 	proxy.ModifyResponse = h.captureRubixResponse
 	proxy.ErrorHandler = h.proxyError
@@ -763,7 +770,7 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo, data *intentWorkflowData
 	guardMessageBySig := map[string]string{}
 	for idx, env := range allEnvelopes {
 		msg := extractPayloadText(env.Payload)
-		threat := env.Code != 0 && env.Code != 1000
+		threat := isTxnThreatCode(env.Code)
 
 		// threats.interaction_id is keyed by the envelope's own hash rather
 		// than idx: idx is only this call's local position in its own DAG
@@ -990,15 +997,21 @@ func (h *Handler) handleIntentWorkflow(nftInfo NFTInfo, data *intentWorkflowData
 	// Server_out evidence for these hops usually arrived before them, when
 	// there was no intent to record it against. Record it now.
 	if branch != nil {
+		signatures := make([]string, 0, len(branch.InsertedKeys))
 		for _, k := range branch.InsertedKeys {
 			if k.Signature == "" {
 				continue
 			}
+			signatures = append(signatures, k.Signature)
 			if n, err := h.db.RecordResourcesForRequest(k.Signature); err != nil {
 				log.Printf("[resources] intent=%s signature=%s FAILED: %v", intentID, k.Signature, err)
 			} else if n > 0 {
 				log.Printf("[resources] intent=%s signature=%s recorded %d access(es)", intentID, k.Signature, n)
 			}
+		}
+		// Same for warnings: evidence that arrived first is only matched now.
+		if len(signatures) > 0 {
+			h.recomputeWarnings(signatures, "", "")
 		}
 	}
 
@@ -1345,6 +1358,7 @@ func (h *Handler) InteractionsList(c *gin.Context) {
 			"direction":     i.Direction,
 			"threat":        i.Threat,
 			"threatID":      i.ThreatID,
+			"warnings":      h.warningsJSON(i.WarningCodes),
 			"intentID":      i.IntentID,
 			"time":          i.Time,
 			"message":       i.Message,
@@ -1418,6 +1432,7 @@ func (h *Handler) ThreatsList(c *gin.Context) {
 			"direction":     t.Direction,
 			"threat":        t.Threat,
 			"threatID":      t.ThreatID,
+			"warnings":      h.warningsJSON(t.WarningCodes),
 			"threatCode":    t.ThreatCode,
 			"threatTitle":   t.ThreatTitle,
 			"intentID":      t.IntentID,
@@ -1529,11 +1544,12 @@ func (h *Handler) Search(c *gin.Context) {
 		Name string `json:"name"`
 	}
 	type intentOut struct {
-		IntentID       string `json:"intentID"`
-		FlowType       string `json:"flowType"`
-		Status         string `json:"status"`
-		ThreatDetected bool   `json:"threatDetected"`
-		StartedAt      string `json:"startedAt"`
+		IntentID       string  `json:"intentID"`
+		FlowType       string  `json:"flowType"`
+		Status         string  `json:"status"`
+		ThreatDetected bool    `json:"threatDetected"`
+		Warnings       []gin.H `json:"warnings"`
+		StartedAt      string  `json:"startedAt"`
 	}
 
 	agents := make([]agentOut, 0, len(results.Agents))
@@ -1544,6 +1560,11 @@ func (h *Handler) Search(c *gin.Context) {
 	for _, a := range results.Apps {
 		apps = append(apps, appOut{DID: a.DID, Name: a.Name})
 	}
+	intentIDs := make([]string, 0, len(results.Intents))
+	for _, i := range results.Intents {
+		intentIDs = append(intentIDs, i.IntentID)
+	}
+	warnings := h.intentWarnings(intentIDs)
 	intents := make([]intentOut, 0, len(results.Intents))
 	for _, i := range results.Intents {
 		intents = append(intents, intentOut{
@@ -1551,6 +1572,7 @@ func (h *Handler) Search(c *gin.Context) {
 			FlowType:       i.FlowType,
 			Status:         i.Status,
 			ThreatDetected: i.ThreatDetected,
+			Warnings:       warnings[i.IntentID],
 			StartedAt:      i.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	}
@@ -1693,7 +1715,7 @@ func (h *Handler) IntentList(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"intentsList": buildIntentList(intents),
+			"intentsList": h.buildIntentList(intents),
 			"total":       total,
 			"page":        page,
 			"pageSize":    pageSize,
@@ -1934,6 +1956,7 @@ func (h *Handler) AgentInteractions(c *gin.Context) {
 			"direction":     i.Direction,
 			"threat":        i.Threat,
 			"threatID":      i.ThreatID,
+			"warnings":      h.warningsJSON(i.WarningCodes),
 			"intentID":      i.IntentID,
 			"time":          i.Time,
 			"message":       i.Message,
@@ -1986,7 +2009,7 @@ func (h *Handler) AgentIntents(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"intentsList": buildIntentList(intents),
+			"intentsList": h.buildIntentList(intents),
 			"total":       total,
 			"page":        page,
 			"pageSize":    pageSize,
@@ -2025,7 +2048,7 @@ func (h *Handler) UserIntents(c *gin.Context) {
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
-			"intentsList": buildIntentList(intents),
+			"intentsList": h.buildIntentList(intents),
 			"total":       total,
 			"page":        page,
 			"pageSize":    pageSize,
@@ -2042,10 +2065,17 @@ func firstNWords(s string, n int) string {
 	return strings.Join(words[:n], " ") + "..."
 }
 
-func buildIntentList(intents []*db.IntentRecord) []gin.H {
+func (h *Handler) buildIntentList(intents []*db.IntentRecord) []gin.H {
+	ids := make([]string, 0, len(intents))
+	for _, i := range intents {
+		ids = append(ids, i.IntentID)
+	}
+	warnings := h.intentWarnings(ids)
+
 	list := make([]gin.H, 0, len(intents))
 	for _, i := range intents {
 		entry := gin.H{
+			"warnings":           warnings[i.IntentID],
 			"intentID":           i.IntentID,
 			"title":              firstNWords(i.Title, 5),
 			"titleFull":          i.Title,
@@ -2099,18 +2129,19 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 	}
 
 	type interactionOut struct {
-		InteractionID string `json:"interactionID"`
-		Initiator     string `json:"initiator"`
-		InitiatorName string `json:"initiatorName"`
-		To            string `json:"to"`
-		ToName        string `json:"toName"`
-		Type          string `json:"type"`
-		Message       string `json:"message"`
-		IntentID      string `json:"intentID"`
-		Threat        bool   `json:"threat"`
-		ThreatID      string `json:"threatID"`
-		Epoch         int64  `json:"epoch"`
-		Signature     string `json:"signature"`
+		InteractionID string  `json:"interactionID"`
+		Initiator     string  `json:"initiator"`
+		InitiatorName string  `json:"initiatorName"`
+		To            string  `json:"to"`
+		ToName        string  `json:"toName"`
+		Type          string  `json:"type"`
+		Message       string  `json:"message"`
+		IntentID      string  `json:"intentID"`
+		Threat        bool    `json:"threat"`
+		ThreatID      string  `json:"threatID"`
+		Warnings      []gin.H `json:"warnings"`
+		Epoch         int64   `json:"epoch"`
+		Signature     string  `json:"signature"`
 	}
 
 	list := make([]interactionOut, 0, len(interactions))
@@ -2126,6 +2157,7 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 			IntentID:      ix.IntentID,
 			Threat:        ix.Threat,
 			ThreatID:      ix.ThreatID,
+			Warnings:      h.warningsJSON(ix.WarningCodes),
 			Epoch:         ix.Time.Unix(),
 			Signature:     ix.Signature,
 		})
@@ -2138,6 +2170,7 @@ func (h *Handler) IntentDiagram(c *gin.Context) {
 		"flowType":          intent.FlowType,
 		"status":            intent.Status,
 		"threatDetected":    intent.ThreatDetected,
+		"warnings":          h.intentWarnings([]string{intent.IntentID})[intent.IntentID],
 		"chainDepth":        intent.ChainDepth,
 		"interactionsCount": intent.InteractionsCount,
 		"agentsCount":       intent.AgentsCount,
@@ -2500,9 +2533,25 @@ func (h *Handler) AgentInfo(c *gin.Context) {
 		return
 	}
 
+	// Warnings on the interactions this agent initiated, the same set
+	// totalThreats counts over.
+	warningCounts, err := h.db.GetWarningCountsByInitiator(agentDID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{Status: false, Message: fmt.Sprintf("failed to fetch agent warnings: %v", err)})
+		return
+	}
+	totalWarnings := 0
+	for _, w := range warningCounts {
+		totalWarnings += w.Count
+	}
+
 	c.JSON(http.StatusOK, Response{
 		Status: true,
 		Data: gin.H{
+			"warnings": gin.H{
+				"total": totalWarnings,
+				"list":  h.warningCountsJSON(warningCounts),
+			},
 			"agentDID":               agent.AgentDID,
 			"agentName":              agent.AgentName,
 			"createdAt":              agent.CreatedAt,
@@ -2602,6 +2651,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 			"direction":     i.Direction,
 			"threat":        i.Threat,
 			"threatID":      i.ThreatID,
+			"warnings":      h.warningsJSON(i.WarningCodes),
 			"time":          i.Time,
 			"message":       i.Message,
 			"signature":     i.Signature,
@@ -2617,6 +2667,7 @@ func (h *Handler) IntentInfo(c *gin.Context) {
 		"status":             intent.Status,
 		"reviewStatus":       intent.ReviewStatus,
 		"threatDetected":     threatDetected,
+		"warnings":           h.intentWarnings([]string{intent.IntentID})[intent.IntentID],
 		"flowType":           intent.FlowType,
 		"executor":           intent.Executor,
 		"chainDepth":         intent.ChainDepth,
@@ -2849,6 +2900,7 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 			"type":          i.Type,
 			"threat":        i.Threat,
 			"threatID":      i.ThreatID,
+			"warnings":      h.warningsJSON(i.WarningCodes),
 			"intentID":      i.IntentID,
 			"message":       i.Message,
 			"signature":     i.Signature,
@@ -2882,6 +2934,7 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 			"toName":        i.ToName,
 			"type":          i.Type,
 			"threat":        i.Threat,
+			"warnings":      h.warningsJSON(i.WarningCodes),
 			"intentID":      i.IntentID,
 			"message":       i.Message,
 			"signature":     i.Signature,
@@ -3008,7 +3061,7 @@ func (h *Handler) writeAccountInfo(c *gin.Context, orgID, userID string, user *d
 				"totalPages": (totalInteractions + pageSize - 1) / pageSize,
 			},
 			"intents": gin.H{
-				"list":       buildIntentList(intents),
+				"list":       h.buildIntentList(intents),
 				"total":      totalIntents,
 				"page":       intentsPage,
 				"pageSize":   pageSize,
@@ -3093,6 +3146,7 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 			"type":          i.Type,
 			"threat":        i.Threat,
 			"threatID":      i.ThreatID,
+			"warnings":      h.warningsJSON(i.WarningCodes),
 			"intentID":      i.IntentID,
 			"message":       i.Message,
 			"signature":     i.Signature,
@@ -3131,7 +3185,7 @@ func (h *Handler) ToolInfo(c *gin.Context) {
 				"totalPages": (totalInteractions + pageSize - 1) / pageSize,
 			},
 			"intents": gin.H{
-				"list":       buildIntentList(intents),
+				"list":       h.buildIntentList(intents),
 				"total":      totalIntents,
 				"page":       intentsPage,
 				"pageSize":   pageSize,

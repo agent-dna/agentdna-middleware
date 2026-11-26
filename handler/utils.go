@@ -238,7 +238,7 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID, exec
 	for i, ed := range edges {
 		fromDID := ed.parent.From
 		toDID := ed.child.From
-		threat := ed.parent.Code != 0 && ed.parent.Code != 1000
+		threat := isTxnThreatCode(ed.parent.Code)
 		result = append(result, interactionExtract{
 			FromDID:   fromDID,
 			ToDID:     toDID,
@@ -257,7 +257,7 @@ func extractInteractionsFromEnvelopes(root *workflowEnvelope, initiatorDID, exec
 	// submitted the tx). Always added, even when root.From == executorDID — in
 	// that case it's a self-loop (from == to == executorDID), so the provenance
 	// line's final "to" is always the executor.
-	threat := root.Code != 0 && root.Code != 1000
+	threat := isTxnThreatCode(root.Code)
 	result = append(result, interactionExtract{
 		FromDID:   root.From,
 		ToDID:     executorDID,

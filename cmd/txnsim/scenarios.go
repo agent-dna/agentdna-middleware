@@ -11,7 +11,7 @@ import (
 )
 
 func allScenarios() []Scenario {
-	return []Scenario{
+	return append([]Scenario{
 		{"H01", "happy", "agent_nft registers and updates an agent", scAgentRegistration},
 		{"H02", "happy", "simple intent: user → agent → app, confirmed", scSimpleIntent},
 		{"H03", "happy", "dashboard shows the confirmed intent to its user", scDashboardVisibility},
@@ -54,7 +54,7 @@ func allScenarios() []Scenario {
 
 		{"C01", "concurrency", "30 different intents in parallel", scParallelIntents},
 		{"C02", "concurrency", "8 forks of one intent in parallel", scParallelForks},
-	}
+	}, warningScenarios()...)
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
