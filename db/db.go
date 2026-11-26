@@ -787,6 +787,29 @@ func New(dsn string) *DB {
 			ORDER BY length(rb.path_prefix) DESC
 			LIMIT 1
 		 ) b ON TRUE`,
+		// resource_for_url("POST https://atlasisin.com/jira/t1/x")
+		//   -> the resource that URL groups under, with its trust status.
+		// The same match as resource_access_groups, for a raw destination
+		// (auth_evidence) instead of a stored access. An empty destination
+		// gives resource_id ''.
+		`CREATE OR REPLACE FUNCTION resource_for_url(raw TEXT,
+			OUT resource_id TEXT, OUT resource_name TEXT, OUT trust_status TEXT)
+		 LANGUAGE sql STABLE AS $$
+			SELECT COALESCE(b.host || b.path_prefix, p.host),
+			       COALESCE(b.name, p.host),
+			       COALESCE(b.trust_status, 'Unreviewed')
+			FROM resource_url_parts(raw) p
+			LEFT JOIN LATERAL (
+				SELECT rb.host, rb.path_prefix, rb.name, rb.trust_status
+				FROM resource_bases rb
+				WHERE rb.host = p.host
+				  AND (rb.path_prefix = ''
+				       OR p.path = rb.path_prefix
+				       OR left(p.path, length(rb.path_prefix) + 1) = rb.path_prefix || '/')
+				ORDER BY length(rb.path_prefix) DESC
+				LIMIT 1
+			) b ON TRUE
+		 $$`,
 	} {
 		if _, err := conn.Exec(stmt); err != nil {
 			log.Printf("[migrate] resources: %v", err)

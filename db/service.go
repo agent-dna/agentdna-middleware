@@ -4376,26 +4376,31 @@ func (d *DB) GetCredentialResources(id string) ([]*CredentialResource, error) {
 	return out, rows.Err()
 }
 
-// CredentialDestination is one destination, exactly as the observer reported
-// it (e.g. "PUT https://graph.microsoft.com/v1.0/me/drive/..."), that a
-// credential was sent to.
+// CredentialDestination is one resource a credential was sent to, grouped by
+// resource_for_url (the same grouping warning 5105 counts), with the raw
+// destinations the observer reported under it in URLs.
 type CredentialDestination struct {
-	Destination  string
+	ResourceID   string
+	Name         string
+	TrustStatus  string
+	URLs         []string
 	RequestCount int
 	IntentCount  int
 	LastUsedAt   sql.NullTime
 }
 
-// GetCredentialDestinations returns every destination credential id was sent
+// GetCredentialDestinations returns every resource credential id was sent
 // to, most recently used first. Read straight from auth_evidence, so it
 // includes requests whose interaction has not landed yet (IntentCount 0).
 func (d *DB) GetCredentialDestinations(id string) ([]*CredentialDestination, error) {
 	rows, err := d.conn.Query(credentialUsesCTE+`
-		SELECT u.destination, COUNT(DISTINCT u.request_id), COUNT(DISTINCT u.intent_id), MAX(u.used_at)
+		SELECT r.resource_id, r.resource_name, r.trust_status, ARRAY_AGG(DISTINCT u.destination),
+		       COUNT(DISTINCT u.request_id), COUNT(DISTINCT u.intent_id), MAX(u.used_at)
 		FROM uses u
-		WHERE u.destination <> ''
-		GROUP BY u.destination
-		ORDER BY MAX(u.used_at) DESC NULLS LAST, u.destination`,
+		CROSS JOIN LATERAL resource_for_url(u.destination) r
+		WHERE u.source = 'server_out' AND u.destination <> '' AND r.resource_id <> ''
+		GROUP BY r.resource_id, r.resource_name, r.trust_status
+		ORDER BY MAX(u.used_at) DESC NULLS LAST, r.resource_id`,
 		id,
 	)
 	if err != nil {
@@ -4405,7 +4410,8 @@ func (d *DB) GetCredentialDestinations(id string) ([]*CredentialDestination, err
 	out := []*CredentialDestination{}
 	for rows.Next() {
 		r := &CredentialDestination{}
-		if err := rows.Scan(&r.Destination, &r.RequestCount, &r.IntentCount, &r.LastUsedAt); err != nil {
+		if err := rows.Scan(&r.ResourceID, &r.Name, &r.TrustStatus, pq.Array(&r.URLs),
+			&r.RequestCount, &r.IntentCount, &r.LastUsedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

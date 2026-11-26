@@ -169,8 +169,15 @@ func (h *Handler) CredentialInfo(c *gin.Context) {
 	}
 	destinationList := make([]gin.H, 0, len(destinations))
 	for _, d := range destinations {
+		urls := d.URLs
+		if urls == nil {
+			urls = []string{}
+		}
 		destinationList = append(destinationList, gin.H{
-			"destination":  d.Destination,
+			"resourceID":   d.ResourceID,
+			"name":         d.Name,
+			"trustStatus":  d.TrustStatus,
+			"urls":         urls,
 			"requestCount": d.RequestCount,
 			"intentCount":  d.IntentCount,
 			"lastUsedAt":   timeOrNil(d.LastUsedAt),
