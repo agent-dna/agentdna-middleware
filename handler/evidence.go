@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"agentdna-ratelimit-auth/db"
@@ -73,6 +74,7 @@ func (h *Handler) StoreAuthEvidence(c *gin.Context) {
 
 	stored := 0
 	var storedRequests []string // for one warnings recompute after the batch
+	var rejectedCreds []string  // keys with a newly stored rejection, checked for auto-flagging
 	for idx, in := range body.Records {
 		log.Printf("[auth-evidence] store: record[%d] request_id=%q source=%q run_id=%q auth_method=%q credential_id=%q identity_id=%s identity_name=%s auth_status=%q key_version=%q destination=%q observed_at=%s",
 			idx, in.RequestID, in.Source, in.RunID, in.AuthMethod, in.CredentialID, logStrPtr(in.IdentityID), logStrPtr(in.IdentityName),
@@ -104,12 +106,19 @@ func (h *Handler) StoreAuthEvidence(c *gin.Context) {
 			log.Printf("[auth-evidence] store: record[%d] request_id=%q stored", idx, in.RequestID)
 			stored++
 			storedRequests = append(storedRequests, record.RequestID)
+			if record.CredentialID != "" && strings.EqualFold(strings.TrimSpace(record.AuthStatus), "rejected") {
+				rejectedCreds = append(rejectedCreds, record.CredentialID)
+			}
 			if record.Source == SourceServerOut {
 				h.recordResourceAccess(idx, record)
 			}
 		}
 	}
 	log.Printf("[auth-evidence] store: stored %d of %d record(s) org=%s", stored, len(body.Records), user.OrgID)
+
+	// A key over the rejection limit is flagged first, so the recompute below
+	// already sees it as flagged (5107).
+	h.flagCredentialsOnRejections(rejectedCreds)
 
 	// Any source, not only server_out: credential rules need every record.
 	// When the interaction has not landed yet this finds nothing, and the

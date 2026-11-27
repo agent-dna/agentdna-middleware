@@ -223,3 +223,52 @@ func (d *DB) RecomputeWarnings(signatures []string, resourceID, credentialID str
 	}
 	return int(changed), nil
 }
+
+// AutoFlaggedBy is the updated_by a credential gets when FlagCredentialOnRejections
+// flags it, so the dashboard can tell it apart from an admin's change.
+const AutoFlaggedBy = "system"
+
+// FlagCredentialOnRejections flags credential id once more than limit of its
+// requests were rejected, which in turn gives its interactions warning 5107.
+// It reports whether it flagged the key now, and how many rejections it counted.
+//
+// Rejections are counted per request (a request seen as rejected by both the
+// gateway and the server counts once), and only since the key's status was
+// last set. So when an admin sets a flagged key back to active, the count
+// starts again rather than flagging it on the next rejection.
+//
+// Only an active key (or one with no status yet) is flagged. A key already
+// flagged or compromised is left as it is. The status write and the check
+// happen in one statement, so concurrent batches flag a key at most once.
+func (d *DB) FlagCredentialOnRejections(id string, limit int) (flagged bool, rejections int, err error) {
+	if id == "" || limit <= 0 {
+		return false, 0, nil
+	}
+	err = d.conn.QueryRow(`
+		WITH cur AS (
+			SELECT status, updated_at FROM credentials WHERE credential_id = $1
+		), n AS (
+			SELECT COUNT(DISTINCT e.request_id)::int AS rejections
+			FROM auth_evidence e
+			WHERE e.credential_id = $1
+			  AND lower(btrim(COALESCE(e.auth_status, ''))) = 'rejected'
+			  AND (NOT EXISTS (SELECT 1 FROM cur) OR e.observed_at > (SELECT updated_at FROM cur))
+		), ins AS (
+			INSERT INTO credentials (credential_id, status, reason, updated_by, updated_at)
+			SELECT $1, 'flagged',
+			       format('Automatically flagged: %s rejected requests since the last status change (limit %s).', n.rejections, $2::int),
+			       $3, NOW()
+			FROM n
+			WHERE n.rejections > $2::int
+			  AND COALESCE((SELECT status FROM cur), 'active') = 'active'
+			ON CONFLICT (credential_id) DO UPDATE SET
+				status = EXCLUDED.status, reason = EXCLUDED.reason,
+				updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at
+				WHERE credentials.status = 'active'
+			RETURNING 1
+		)
+		SELECT EXISTS (SELECT 1 FROM ins), (SELECT rejections FROM n)`,
+		id, limit, AutoFlaggedBy,
+	).Scan(&flagged, &rejections)
+	return flagged, rejections, err
+}

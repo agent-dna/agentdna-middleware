@@ -98,6 +98,9 @@ type Handler struct {
 	unknownThreat       db.ThreatCodeRecord         // error_code.json's entry without a code
 	threatCodes         map[int]db.ThreatCodeRecord // error_code.json by code
 	credentialMaxAge    time.Duration               // DURATION_CREDENTIAL, for warning 5108
+	// CREDENTIAL_REJECTION_LIMIT: more rejected requests than this flags a
+	// key automatically (so 5107). 0 is off.
+	credentialRejectionLimit int
 }
 
 func New(database *db.DB, backendURL *url.URL, session SessionConfig, orgID, adminServiceURL, cbacServiceURL, createAgentEndpoint, updateAgentEndpoint string) *Handler {
@@ -128,6 +131,7 @@ func New(database *db.DB, backendURL *url.URL, session SessionConfig, orgID, adm
 	}
 	log.Printf("[threat-codes] loaded %d codes from error_code.json", len(codes))
 	h.credentialMaxAge = credentialMaxAgeFromEnv()
+	h.credentialRejectionLimit = credentialRejectionLimitFromEnv()
 	// Capture blockchain transaction provenance from the upstream responses.
 	proxy.ModifyResponse = h.captureRubixResponse
 	proxy.ErrorHandler = h.proxyError

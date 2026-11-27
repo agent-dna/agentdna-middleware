@@ -80,3 +80,16 @@ func TestIsTxnThreatCode(t *testing.T) {
 		}
 	}
 }
+
+func TestParseCredentialRejectionLimit(t *testing.T) {
+	for raw, want := range map[string]int{"": 0, "0": 0, "5": 5, " 12 ": 12} {
+		if got, err := ParseCredentialRejectionLimit(raw); err != nil || got != want {
+			t.Errorf("ParseCredentialRejectionLimit(%q) = %v, %v; want %v", raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"abc", "-1", "2.5", "5x"} {
+		if _, err := ParseCredentialRejectionLimit(raw); err == nil {
+			t.Errorf("ParseCredentialRejectionLimit(%q): want error", raw)
+		}
+	}
+}

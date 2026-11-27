@@ -117,6 +117,56 @@ func ParseCredentialMaxAge(raw string) (time.Duration, error) {
 	return d, nil
 }
 
+// ParseCredentialRejectionLimit reads CREDENTIAL_REJECTION_LIMIT: a key with
+// more rejected requests than this is flagged automatically (and so gets
+// 5107). Unset or 0 turns auto-flagging off.
+func ParseCredentialRejectionLimit(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("CREDENTIAL_REJECTION_LIMIT %q: want a whole number like 5 (0 or empty turns it off)", raw)
+	}
+	return n, nil
+}
+
+func credentialRejectionLimitFromEnv() int {
+	n, err := ParseCredentialRejectionLimit(os.Getenv("CREDENTIAL_REJECTION_LIMIT"))
+	if err != nil {
+		log.Fatalf("[warnings] %v", err)
+	}
+	if n == 0 {
+		log.Printf("[warnings] CREDENTIAL_REJECTION_LIMIT unset, keys are not flagged automatically")
+	}
+	return n
+}
+
+// flagCredentialsOnRejections flags each key that has gone over the rejection
+// limit, then recomputes its warnings so 5107 lands on every interaction that
+// used it. A failure is logged, not returned: the evidence is already stored.
+func (h *Handler) flagCredentialsOnRejections(credentialIDs []string) {
+	if h.credentialRejectionLimit <= 0 {
+		return
+	}
+	seen := map[string]bool{}
+	for _, id := range credentialIDs {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		flagged, n, err := h.db.FlagCredentialOnRejections(id, h.credentialRejectionLimit)
+		switch {
+		case err != nil:
+			log.Printf("[credentials] auto-flag credential_id=%q FAILED: %v", id, err)
+		case flagged:
+			log.Printf("[credentials] auto-flagged credential_id=%q rejections=%d limit=%d", id, n, h.credentialRejectionLimit)
+			h.recomputeWarnings(nil, "", id)
+		}
+	}
+}
+
 func credentialMaxAgeFromEnv() time.Duration {
 	d, err := ParseCredentialMaxAge(os.Getenv("DURATION_CREDENTIAL"))
 	if err != nil {
