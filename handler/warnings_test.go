@@ -29,7 +29,8 @@ func TestComputeWarnings(t *testing.T) {
 		{"unreviewed destination", []db.WarningFact{{Time: now, Destination: "GET https://a.com", TrustStatus: "Unreviewed"}}, []int64{5101}},
 		{"flagged destination", []db.WarningFact{{Time: now, Destination: "GET https://a.com", TrustStatus: "Flagged"}}, []int64{5101}},
 		{"no destination ignores trust status", []db.WarningFact{{Time: now, TrustStatus: "Unreviewed"}}, []int64{}},
-		{"credential on two resources", []db.WarningFact{{Time: now, CredentialID: "c1", CredentialResourceCount: 2}}, []int64{5105}},
+		// 5105 is disabled for now: a key on several resources gives no warning.
+		{"credential on two resources", []db.WarningFact{{Time: now, CredentialID: "c1", CredentialResourceCount: 2}}, []int64{}},
 		{"compromised credential", []db.WarningFact{{Time: now, CredentialID: "c1", CredentialStatus: "compromised", CredentialResourceCount: 1}}, []int64{5107}},
 		{"flagged credential", []db.WarningFact{{Time: now, CredentialID: "c1", CredentialStatus: "flagged", CredentialResourceCount: 1}}, []int64{5107}},
 		{"old credential", []db.WarningFact{{Time: now, CredentialID: "c1", CredentialStatus: "active", CredentialFirstUse: firstUse(91)}}, []int64{5108}},
@@ -37,7 +38,7 @@ func TestComputeWarnings(t *testing.T) {
 		{"several rules across rows, deduped and sorted", []db.WarningFact{
 			{Time: now, Destination: "GET https://a.com", TrustStatus: "Trusted", CredentialID: "c1", CredentialStatus: "flagged", CredentialResourceCount: 3},
 			{Time: now, Destination: "GET https://b.com", TrustStatus: "Unreviewed", CredentialID: "c1", CredentialStatus: "flagged", CredentialResourceCount: 3},
-		}, []int64{5101, 5105, 5107}},
+		}, []int64{5101, 5107}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

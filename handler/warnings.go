@@ -22,7 +22,7 @@ const (
 	warnTokenRejected        = 5102 // token_activity: not implemented yet
 	warnIdentitySwitched     = 5103 // token_activity: not implemented yet
 	warnWeakAuth             = 5104 // token_activity: not implemented yet
-	warnSharedKey            = 5105 // credential sent to more than one resource
+	warnSharedKey            = 5105 // credential sent to more than one resource: DISABLED for now, see ComputeWarnings
 	warnPersonalToken        = 5106 // not implemented yet
 	warnBadCredential        = 5107 // credential is flagged or compromised
 	warnKeyNeverRotated      = 5108 // credential older than DURATION_CREDENTIAL
@@ -55,9 +55,14 @@ func ComputeWarnings(facts []db.WarningFact, maxAge time.Duration) []int64 {
 		if f.CredentialID == "" {
 			continue
 		}
-		if f.CredentialResourceCount > 1 {
-			set[warnSharedKey] = true
-		}
+		// 5105 is disabled for now: not tracked, so never set and never
+		// counted in an intent's warnings. db.New also strips any 5105
+		// stored before. To turn it back on, restore this rule and drop that
+		// cleanup in db.New.
+		//
+		// if f.CredentialResourceCount > 1 {
+		// 	set[warnSharedKey] = true
+		// }
 		if f.CredentialStatus == "flagged" || f.CredentialStatus == "compromised" {
 			set[warnBadCredential] = true
 		}

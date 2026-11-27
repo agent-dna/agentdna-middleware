@@ -306,14 +306,15 @@ func buildSeed() ([]intent, []evidence) {
 }
 
 // expected warning codes per interaction id; anything not listed expects none.
+// 5105 (shared key) is disabled for now, so intent 03 only keeps 5101 and
+// intent 05 has three of its four codes.
 var expected = map[string][]int64{
 	"seedw-intent-02-untrusted-2":          {5101},
 	"seedw-intent-02-untrusted-5":          {5101},
-	"seedw-intent-03-shared-key-2":         {5105},
-	"seedw-intent-03-shared-key-5":         {5101, 5105},
+	"seedw-intent-03-shared-key-5":         {5101},
 	"seedw-intent-04-bad-creds-2":          {5107},
 	"seedw-intent-04-bad-creds-5":          {5101, 5107},
-	"seedw-intent-05-all-four-2":           {5101, 5105, 5107, 5108},
+	"seedw-intent-05-all-four-2":           {5101, 5107, 5108},
 	"seedw-intent-06-threat-and-warning-2": {5101},
 	"seedw-intent-07-messy-input-2":        {5101},
 	"seedw-intent-07-messy-input-3":        {5101},

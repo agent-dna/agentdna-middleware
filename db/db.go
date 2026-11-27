@@ -669,6 +669,10 @@ func New(dsn string) *DB {
 	// trust status and the credentials' status. Rebuilt whole on every
 	// recompute, so a code that stops applying disappears.
 	conn.Exec(`ALTER TABLE new_interactions ADD COLUMN IF NOT EXISTS warning_codes INT[] NOT NULL DEFAULT '{}'`)
+	// Warning 5105 (shared key) is disabled for now (handler.ComputeWarnings).
+	// Strip it from interactions computed before, so intents stop counting it.
+	// Remove this when 5105 is turned back on.
+	conn.Exec(`UPDATE new_interactions SET warning_codes = array_remove(warning_codes, 5105) WHERE 5105 = ANY(warning_codes)`)
 	// RecomputeWarnings looks evidence up by credential.
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_auth_evidence_credential ON auth_evidence (credential_id)`)
 	conn.Exec(`CREATE TABLE IF NOT EXISTS apps (

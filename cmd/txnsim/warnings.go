@@ -28,7 +28,8 @@ func warningScenarios() []Scenario {
 		{"W02", "warnings", "intent before the evidence: late evidence still sets 5101", scWarnIntentFirst},
 		{"W03", "warnings", "admin trust changes add and clear 5101, and only for that resource", scWarnTrustChanges},
 		{"W04", "warnings", "path-prefix trust: only paths under a Flagged prefix warn", scWarnPathPrefix},
-		{"W05", "warnings", "a key reaching a second resource marks its earlier intent too (5105)", scWarnSharedKey},
+		// W05 is off while 5105 (shared key) is disabled; re-add it with the rule.
+		// {"W05", "warnings", "a key reaching a second resource marks its earlier intent too (5105)", scWarnSharedKey},
 		{"W06", "warnings", "credential status changes add and clear 5107, and only for that key", scWarnCredentialStatus},
 		{"W07", "warnings", "a key first seen longer ago than DURATION_CREDENTIAL gives 5108", scWarnOldKey},
 		{"W08", "warnings", "messy evidence: odd spellings, NULLs, empty, invalid and repeated records", scWarnMessyEvidence},
